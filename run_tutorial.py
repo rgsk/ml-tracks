@@ -46,7 +46,10 @@ def main():
         print(f"{i}. {description}")
     
     try:
-        choice = int(input("\nEnter your choice (0-5): "))
+        if len(sys.argv) > 1:
+            choice = int(sys.argv[1])
+        else:
+            choice = int(input("\nEnter your choice (0-5): "))
         
         if choice == 0:
             for filename, description in tutorials:

@@ -9,6 +9,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
 print("=== PyTorch Neural Networks ===")
 
@@ -50,7 +51,7 @@ print("\n3. Activation Functions:")
 x = torch.linspace(-3, 3, 100)
 activations = {
     'ReLU': F.relu(x),
-    'Sigmoid': F.sigmoid(x), 
+    'Sigmoid': torch.sigmoid(x),
     'Tanh': F.tanh(x),
     'LeakyReLU': F.leaky_relu(x, negative_slope=0.1),
     'Softmax': F.softmax(x.unsqueeze(0), dim=1).squeeze(0)
@@ -131,12 +132,13 @@ with torch.no_grad():
 # 6. Model saving and loading
 print("\n6. Model Saving and Loading:")
 # Save the model
-torch.save(model.state_dict(), '/Users/hanfang/Coding/pytorch-practice/xor_model.pth')
+_model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'xor_model.pth')
+torch.save(model.state_dict(), _model_path)
 print("Model saved to xor_model.pth")
 
 # Load the model
 new_model = XORNet()
-new_model.load_state_dict(torch.load('/Users/hanfang/Coding/pytorch-practice/xor_model.pth'))
+new_model.load_state_dict(torch.load(_model_path))
 new_model.eval()
 
 # Verify loaded model works
