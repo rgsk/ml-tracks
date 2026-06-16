@@ -1,0 +1,6 @@
+If it started at, say, 50, you'd have a bug (bad init, wrong reshape, exploding logits). If it started at 0.1, your targets are leaking into the input. 
+explain this with example
+
+
+cross entropy custom implementation for reference
+
