@@ -2,5 +2,4 @@ If it started at, say, 50, you'd have a bug (bad init, wrong reshape, exploding 
 explain this with example
 
 
-cross entropy custom implementation for reference
 
