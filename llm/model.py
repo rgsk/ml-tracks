@@ -1,9 +1,11 @@
 """
-GPT model, built bottom-up.
+GPT model.
 
-Current stage: embeddings + a projection to vocab logits, no attention yet —
-effectively a "neural bigram with positions". It can learn token frequencies
-but cannot mix information across positions; attention (next) fixes that.
+Full architecture:
+    idx -> token_embedding + position_embedding
+        -> n_layer transformer Blocks (attention + feedforward)
+        -> final LayerNorm
+        -> lm_head -> logits over the vocab
 
 Shape vocabulary used throughout:
     B = batch_size, T = block_size (time/sequence), C = n_embd (channels)
@@ -16,6 +18,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import GPTConfig
+from transformer import Block
 
 
 class GPT(nn.Module):
@@ -26,6 +29,11 @@ class GPT(nn.Module):
         # one learned vector per vocab id, and per position in the context
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+
+        # n_layer transformer blocks, then a final LayerNorm before the head
+        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        self.ln_f = nn.LayerNorm(config.n_embd)
+
         # project the C-dim representation to vocab logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
 
@@ -40,6 +48,10 @@ class GPT(nn.Module):
         pos = torch.arange(T, device=idx.device)                  # (T,)
         pos_emb = self.position_embedding(pos)                    # (T, C)
         x = tok_emb + pos_emb                                     # broadcast -> (B, T, C)
+
+        x = self.blocks(x)                                        # (B, T, C)
+        x = self.ln_f(x)                                          # (B, T, C)
+
         logits = self.lm_head(x)                                  # (B, T, vocab_size)
 
         # cross_entropy wants (N, vocab) and (N,), so collapse B and T
@@ -78,7 +90,7 @@ class GPT(nn.Module):
 if __name__ == "__main__":
     torch.manual_seed(1337)
 
-    cfg = GPTConfig(vocab_size=65, block_size=8, n_embd=32)
+    cfg = GPTConfig(vocab_size=65, block_size=8, n_embd=32, n_head=4, n_layer=3)
     model = GPT(cfg)
 
     B, T = 4, cfg.block_size
@@ -106,6 +118,17 @@ if __name__ == "__main__":
     import math
     expected = math.log(cfg.vocab_size)
     print(f"loss = {loss.item():.4f}  (random-init expectation ≈ {expected:.4f})")
+
+    # causality must hold end-to-end through the whole model: changing a future
+    # input token must not change the logits at earlier positions.
+    model.eval()
+    base = torch.randint(0, cfg.vocab_size, (1, cfg.block_size))
+    perturbed = base.clone()
+    perturbed[0, -1] = (base[0, -1] + 1) % cfg.vocab_size  # change last token
+    l1, _ = model(base)
+    l2, _ = model(perturbed)
+    assert torch.allclose(l1[:, :-1], l2[:, :-1], atol=1e-5), \
+        "causality violated in the full GPT!"
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params = {n_params}")

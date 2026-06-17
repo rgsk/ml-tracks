@@ -17,14 +17,17 @@ from config import GPTConfig
 from data import load_data, get_batch
 from model import GPT
 
-# --- hyperparameters (small, so it runs fast on CPU) ---
-BLOCK_SIZE = 32
+# --- hyperparameters (small, so it runs in a few minutes on CPU) ---
+BLOCK_SIZE = 64
 BATCH_SIZE = 32
-N_EMBD = 64
+N_EMBD = 96
+N_HEAD = 4
+N_LAYER = 4
+DROPOUT = 0.1
 MAX_ITERS = 3000
 EVAL_INTERVAL = 300
 EVAL_ITERS = 100
-LEARNING_RATE = 1e-3
+LEARNING_RATE = 3e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
@@ -63,8 +66,13 @@ def main():
         vocab_size=tokenizer.vocab_size,
         block_size=BLOCK_SIZE,
         n_embd=N_EMBD,
+        n_head=N_HEAD,
+        n_layer=N_LAYER,
+        dropout=DROPOUT,
     )
     model = GPT(cfg).to(DEVICE)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"training on {DEVICE} | {n_params/1e6:.2f}M params")
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     for step in range(MAX_ITERS):
