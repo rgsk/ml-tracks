@@ -20,6 +20,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import GPTConfig
 from data import load_data, get_batch
 from lr_schedule import get_lr
+from mixed_precision import amp_train_step
 from model import GPT
 from optimizer import configure_optimizers
 
@@ -39,6 +40,7 @@ LEARNING_RATE = 3e-4     # peak LR (the schedule warms up to this, then decays)
 WARMUP_ITERS = 100       # linear warmup length
 MIN_LR = 3e-5            # cosine-decay floor (~LEARNING_RATE / 10, the usual ratio)
 DECAY_LR = True          # set False to use a flat LEARNING_RATE
+DTYPE = "bfloat16"       # "bfloat16" (no scaler) | "float16" (GradScaler) | "float32" (off)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # two distinct checkpoints, two distinct jobs (see --resume below):
@@ -103,9 +105,19 @@ def main():
     )
     model = GPT(cfg).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"training on {DEVICE} | {n_params/1e6:.2f}M params")
+    print(f"training on {DEVICE} | {n_params/1e6:.2f}M params | dtype {DTYPE}")
     lr = args.lr if args.lr is not None else LEARNING_RATE
     optimizer = configure_optimizers(model, weight_decay=WEIGHT_DECAY, learning_rate=lr)
+
+    # mixed precision: autocast the forward to 16-bit. The GradScaler is only needed
+    # for float16 (underflow) — disabled for bfloat16/float32, making it a no-op.
+    device_type = "cuda" if DEVICE.startswith("cuda") else "cpu"
+    amp_dtype = {
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
+    }[DTYPE]
+    scaler = torch.amp.GradScaler(device_type, enabled=(DTYPE == "float16"))
 
     # a --lr override means "hold this fixed LR" — it turns the schedule OFF, else
     # the cosine curve would just overwrite the override on every step.
@@ -158,15 +170,11 @@ def main():
                 save_checkpoint(BEST_PATH, model, optimizer, step, cfg, best_val=best_val)
             save_checkpoint(LAST_PATH, model, optimizer, step, cfg, best_val=best_val)
 
+        # one mixed-precision step: autocast forward -> scaled backward -> unscale ->
+        # grad clip -> step -> update. (bf16/fp32 -> scaler is a no-op; fp16 -> active.)
         xb, yb = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
-        _, loss = model(xb, yb)
-        optimizer.zero_grad(set_to_none=True)   # grads accumulate by default; clear them
-        loss.backward()
-        # clip AFTER backward (grads exist) and BEFORE step (it reads them): caps a
-        # single bad batch's update so one spike can't blow the weights to NaN.
-        if GRAD_CLIP:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        optimizer.step()
+        amp_train_step(model, xb, yb, optimizer, scaler, amp_dtype=amp_dtype,
+                       device_type=device_type, grad_clip=GRAD_CLIP)
 
     # sample from the trained model, starting from a single newline/token id 0.
     # temperature 0.8 sharpens slightly (less rambly than 1.0); top_k 40 clips the
