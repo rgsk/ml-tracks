@@ -19,6 +19,7 @@ import torch
 from checkpoint import load_checkpoint, save_checkpoint
 from config import GPTConfig
 from data import load_data, get_batch
+from lr_schedule import get_lr
 from model import GPT
 
 # --- hyperparameters (small, so it runs in a few minutes on CPU) ---
@@ -32,7 +33,10 @@ MAX_ITERS = 3000
 EVAL_INTERVAL = 300
 EVAL_ITERS = 100
 GRAD_CLIP = 1.0          # max global grad norm; 0 disables clipping
-LEARNING_RATE = 3e-4
+LEARNING_RATE = 3e-4     # peak LR (the schedule warms up to this, then decays)
+WARMUP_ITERS = 100       # linear warmup length
+MIN_LR = 3e-5            # cosine-decay floor (~LEARNING_RATE / 10, the usual ratio)
+DECAY_LR = True          # set False to use a flat LEARNING_RATE
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # two distinct checkpoints, two distinct jobs (see --resume below):
@@ -101,6 +105,10 @@ def main():
     lr = args.lr if args.lr is not None else LEARNING_RATE
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
 
+    # a --lr override means "hold this fixed LR" — it turns the schedule OFF, else
+    # the cosine curve would just overwrite the override on every step.
+    decay_lr = DECAY_LR and args.lr is None
+
     # resume: restore weights + optimizer + where we left off + the best val so
     # far (so a later run doesn't overwrite a better checkpoint with a worse one).
     #   --resume        -> last.pt: continue an interrupted run from its newest state
@@ -124,10 +132,23 @@ def main():
     os.makedirs(CKPT_DIR, exist_ok=True)
 
     for step in range(start_step, MAX_ITERS):
+        # set this step's LR (warmup -> cosine decay) before the optimizer reads it.
+        # the schedule is a function of `step`, so it's deterministic across resume.
+        # when decay_lr is off we leave the optimizer's LR alone, preserving a
+        # --lr override (don't overwrite a deliberately-set constant LR).
+        if decay_lr:
+            lr_now = get_lr(step, warmup_steps=WARMUP_ITERS, max_steps=MAX_ITERS,
+                            max_lr=LEARNING_RATE, min_lr=MIN_LR)
+            for group in optimizer.param_groups:
+                group["lr"] = lr_now
+        else:
+            lr_now = optimizer.param_groups[0]["lr"]
+
         # periodic eval (and a final read on the last step)
         if step % EVAL_INTERVAL == 0 or step == MAX_ITERS - 1:
             losses = estimate_loss(model, train_data, val_data)
-            print(f"step {step:5d} | train {losses['train']:.4f} | val {losses['val']:.4f}")
+            print(f"step {step:5d} | lr {lr_now:.2e} | "
+                  f"train {losses['train']:.4f} | val {losses['val']:.4f}")
             # best.pt only when val improves (model selection); last.pt every time
             # (so an interrupted run resumes from its newest state, not the best one).
             if losses["val"] < best_val:
