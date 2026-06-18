@@ -31,6 +31,7 @@ DROPOUT = 0.1
 MAX_ITERS = 3000
 EVAL_INTERVAL = 300
 EVAL_ITERS = 100
+GRAD_CLIP = 1.0          # max global grad norm; 0 disables clipping
 LEARNING_RATE = 3e-4
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -138,6 +139,10 @@ def main():
         _, loss = model(xb, yb)
         optimizer.zero_grad(set_to_none=True)   # grads accumulate by default; clear them
         loss.backward()
+        # clip AFTER backward (grads exist) and BEFORE step (it reads them): caps a
+        # single bad batch's update so one spike can't blow the weights to NaN.
+        if GRAD_CLIP:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
 
     # sample from the trained model, starting from a single newline/token id 0.

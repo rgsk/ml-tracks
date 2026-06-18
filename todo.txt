@@ -3,3 +3,5 @@ explain this with example
 
 
 why cross_entropy is better than cross_entropy_simple
+
+multinomial from scratch
