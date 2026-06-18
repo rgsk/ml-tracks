@@ -21,6 +21,7 @@ from config import GPTConfig
 from data import load_data, get_batch
 from lr_schedule import get_lr
 from model import GPT
+from optimizer import configure_optimizers
 
 # --- hyperparameters (small, so it runs in a few minutes on CPU) ---
 BLOCK_SIZE = 64
@@ -33,6 +34,7 @@ MAX_ITERS = 3000
 EVAL_INTERVAL = 300
 EVAL_ITERS = 100
 GRAD_CLIP = 1.0          # max global grad norm; 0 disables clipping
+WEIGHT_DECAY = 0.1       # applied to >=2-D weights only (see configure_optimizers)
 LEARNING_RATE = 3e-4     # peak LR (the schedule warms up to this, then decays)
 WARMUP_ITERS = 100       # linear warmup length
 MIN_LR = 3e-5            # cosine-decay floor (~LEARNING_RATE / 10, the usual ratio)
@@ -103,7 +105,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"training on {DEVICE} | {n_params/1e6:.2f}M params")
     lr = args.lr if args.lr is not None else LEARNING_RATE
-    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    optimizer = configure_optimizers(model, weight_decay=WEIGHT_DECAY, learning_rate=lr)
 
     # a --lr override means "hold this fixed LR" — it turns the schedule OFF, else
     # the cosine curve would just overwrite the override on every step.
