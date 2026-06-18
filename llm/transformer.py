@@ -62,11 +62,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         self.ffwd = FeedForward(config)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache=None):
         # pre-norm + residual, twice. Note: x + sublayer(ln(x)), NOT ln(x + ...).
-        x = x + self.attn(self.ln1(x))
+        # attention returns its updated KV cache, which we thread back out so the
+        # caller (GPT) can keep one cache per layer across generation steps.
+        attn_out, new_cache = self.attn(self.ln1(x), kv_cache)
+        x = x + attn_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x, new_cache
 
 
 # ---------------------------------------------------------------------------
@@ -101,11 +104,13 @@ if __name__ == "__main__":
     block = Block(cfg)
     block.eval()
 
-    bout = block(x)
+    bout, _ = block(x)
     assert bout.shape == (B, T, cfg.n_embd), f"bad block shape {bout.shape}"
 
     # the block contains attention, so it must STILL be causal end-to-end
-    assert torch.allclose(block(x)[:, :-1], block(x2)[:, :-1], atol=1e-6), \
+    b1, _ = block(x)
+    b2, _ = block(x2)
+    assert torch.allclose(b1[:, :-1], b2[:, :-1], atol=1e-6), \
         "causality violated in Block!"
 
     print("block out shape:", tuple(bout.shape))

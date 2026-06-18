@@ -30,28 +30,45 @@ class GPT(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
         self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
 
-        # n_layer transformer blocks, then a final LayerNorm before the head
-        self.blocks = nn.Sequential(*[Block(config) for _ in range(config.n_layer)])
+        # n_layer transformer blocks, then a final LayerNorm before the head.
+        # ModuleList (not Sequential) so we can thread a per-layer KV cache and a
+        # position offset through the stack; state_dict keys (blocks.0, ...) are
+        # identical to Sequential, so existing checkpoints still load.
+        self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])
         self.ln_f = nn.LayerNorm(config.n_embd)
 
         # project the C-dim representation to vocab logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
 
-    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None):
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
+                kv_caches=None, use_cache: bool = False):
         """idx: (B, T) token ids. targets: (B, T) or None.
 
-        Returns (logits, loss); loss is None when targets is None.
+        Returns (logits, loss) normally, or (logits, loss, new_caches) when
+        use_cache=True. kv_caches is a list (one (k, v) per layer) from a previous
+        step; when present, idx is just the NEW token(s) and the cache supplies the
+        history — so the position embedding must start at the cached length, not 0.
         """
         B, T = idx.shape
 
+        # absolute position of the first new token = how many positions are cached
+        past_len = 0
+        if kv_caches is not None and kv_caches[0] is not None:
+            past_len = kv_caches[0][0].size(2)                    # cache k: (B, nh, T_past, hs)
+
         tok_emb = self.token_embedding(idx)                       # (B, T, C)
-        pos = torch.arange(T, device=idx.device)                  # (T,)
+        pos = torch.arange(past_len, past_len + T, device=idx.device)  # absolute positions
         pos_emb = self.position_embedding(pos)                    # (T, C)
         x = tok_emb + pos_emb                                     # broadcast -> (B, T, C)
 
-        x = self.blocks(x)                                        # (B, T, C)
-        x = self.ln_f(x)                                          # (B, T, C)
+        new_caches = [] if use_cache else None
+        for i, block in enumerate(self.blocks):
+            layer_cache = kv_caches[i] if kv_caches is not None else None
+            x, nc = block(x, layer_cache)                         # (B, T, C), updated cache
+            if use_cache:
+                new_caches.append(nc)
 
+        x = self.ln_f(x)                                          # (B, T, C)
         logits = self.lm_head(x)                                  # (B, T, vocab_size)
 
         # cross_entropy wants (N, vocab) and (N,), so collapse B and T
@@ -62,11 +79,14 @@ class GPT(nn.Module):
                 targets.view(B * T),
             )
 
+        if use_cache:
+            return logits, loss, new_caches
         return logits, loss
 
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
-                 temperature: float = 1.0, top_k: int | None = None) -> torch.Tensor:
+                 temperature: float = 1.0, top_k: int | None = None,
+                 use_cache: bool = False) -> torch.Tensor:
         """Autoregressively extend idx by max_new_tokens.
 
         idx: (B, T) current context. Returns (B, T + max_new_tokens). Each new
@@ -84,11 +104,38 @@ class GPT(nn.Module):
         thousands of tiny-probability tokens together hold enough mass to
         occasionally emit garbage. top_k and temperature compose: clip to the top
         k, then temperature reshapes the distribution over just those survivors.
+
+        use_cache: KV-cache the past K/V instead of recomputing the whole context
+        each step — O(T) per token instead of O(T^2). The first step processes the
+        full prompt to fill the cache; later steps feed only the newest token. The
+        cache stores absolute positions, so total length can't exceed block_size
+        (the limit of learned absolute position embeddings — relative schemes like
+        RoPE are partly motivated by lifting exactly this restriction).
         """
+        if use_cache:
+            # the cache holds absolute positions and can't slide, so the whole
+            # sequence (prompt + everything generated) must fit in block_size.
+            # Fail fast with a clear message instead of an opaque index error when
+            # position_embedding / tril run off the end mid-generation.
+            total = idx.size(1) + max_new_tokens
+            assert total <= self.config.block_size, (
+                f"use_cache needs prompt+max_new_tokens ({idx.size(1)}+{max_new_tokens}"
+                f"={total}) <= block_size ({self.config.block_size}); the absolute-"
+                f"position cache can't exceed it. Use use_cache=False to crop+recompute."
+            )
+
+        kv_caches = None
         for _ in range(max_new_tokens):
-            # crop to block_size: position_embedding only has block_size rows
-            idx_cond = idx[:, -self.config.block_size:]
-            logits, _ = self(idx_cond)                          # (B, T, vocab)
+            if use_cache:
+                # first step: feed the whole prompt to build the cache; afterward
+                # just the last token (its K/V is appended to the running cache).
+                idx_cond = idx if kv_caches is None else idx[:, -1:]
+                logits, _, kv_caches = self(idx_cond, kv_caches=kv_caches, use_cache=True)
+            else:
+                # no cache: re-feed the (cropped) context every step. crop to
+                # block_size since position_embedding only has block_size rows.
+                idx_cond = idx[:, -self.config.block_size:]
+                logits, _ = self(idx_cond)                      # (B, T, vocab)
             logits = logits[:, -1, :]                           # (B, vocab) last step
 
             if temperature == 0:
@@ -199,6 +246,23 @@ if __name__ == "__main__":
         tok = model.generate(ctx, max_new_tokens=1, temperature=1.5, top_k=k)[0, -1].item()
         assert tok in allowed, f"sampled {tok} outside the top-{k} set {allowed}"
     print(f"top-{k}: 300/300 samples stayed within the allowed set ✅")
+
+    # --- KV-cache ------------------------------------------------------------
+    # Cached generation must produce the EXACT same tokens as the non-cached path.
+    # Use greedy (temperature=0) so it's deterministic, and stay within block_size
+    # (the cache holds absolute positions, so total length can't exceed it).
+    n_new = cfg.block_size - 1
+    plain = model.generate(g_start, max_new_tokens=n_new, temperature=0.0, use_cache=False)
+    cached = model.generate(g_start, max_new_tokens=n_new, temperature=0.0, use_cache=True)
+    assert torch.equal(plain, cached), "KV-cache changed the generated tokens!"
+    print(f"KV-cache: cached generation == non-cached, {n_new} tokens ✅")
+
+    # overflowing block_size with the cache must fail fast (not an opaque index error)
+    try:
+        model.generate(g_start, max_new_tokens=cfg.block_size, use_cache=True)
+        raise SystemExit("expected an assertion: cache cannot exceed block_size")
+    except AssertionError:
+        print("KV-cache: refuses to exceed block_size ✅")
 
     # sanity: untrained loss ≈ -ln(1/vocab_size) = ln(vocab_size)
     import math

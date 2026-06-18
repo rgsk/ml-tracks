@@ -118,7 +118,13 @@ class CausalSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, kv_cache=None):
+        """x: (B, T, C). kv_cache: optional (past_k, past_v), each (B, nh, T_past, hs).
+
+        Returns (out, new_cache). During incremental generation T is 1 (just the
+        new token) and the cache supplies all the past K/V, so we never recompute
+        them — that's the whole point of the cache.
+        """
         B, T, C = x.shape
         nh, hs = self.n_head, self.head_size
 
@@ -131,9 +137,27 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
+        # KV cache: prepend the cached past K/V (computed in earlier steps) to the
+        # K/V for the new token(s), along the TIME axis. q still holds only the new
+        # token(s); k/v now hold ALL positions. Return the updated cache.
+        if kv_cache is not None:
+            past_k, past_v = kv_cache
+            k = torch.cat([past_k, k], dim=2)   # (B, nh, T_past + T, hs)
+            v = torch.cat([past_v, v], dim=2)
+        new_cache = (k, v)
+
+        T_k = k.size(2)              # total keys (past + new)
+        T_past = T_k - T             # number of cached positions (0 if no cache)
+
         # batched over (B, nh): scores -> mask -> softmax -> weighted values
-        wei = q @ k.transpose(-2, -1) * hs ** -0.5               # (B, nh, T, T)
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float("-inf"))
+        wei = q @ k.transpose(-2, -1) * hs ** -0.5               # (B, nh, T, T_k)
+
+        # offset-aware causal mask: query row i is at absolute position T_past + i
+        # and may attend keys 0..(T_past + i), so slice the tril by the queries'
+        # absolute row range. Incremental case (T=1) -> a single all-ones row (the
+        # frontier token sees every cached key), so the mask is a no-op there.
+        wei = wei.masked_fill(self.tril[T_past:T_k, :T_k] == 0, float("-inf"))
+
         wei = F.softmax(wei, dim=-1)
         wei = self.attn_dropout(wei)
         out = wei @ v                                            # (B, nh, T, hs)
@@ -142,7 +166,7 @@ class CausalSelfAttention(nn.Module):
         # .contiguous() before .view (the .view-vs-.reshape gotcha)
         out = out.transpose(1, 2).contiguous().view(B, T, C)
         out = self.resid_dropout(self.proj(out))
-        return out
+        return out, new_cache
 
 
 # ---------------------------------------------------------------------------
@@ -199,10 +223,11 @@ if __name__ == "__main__":
     csa = CausalSelfAttention(cfg)
     csa.eval()
 
-    cout = csa(x)
+    cout, _ = csa(x)
     assert cout.shape == (B, T, cfg.n_embd), f"bad csa shape {cout.shape}"
 
-    c1, c2 = csa(x), csa(x2)
+    c1, _ = csa(x)
+    c2, _ = csa(x2)
     assert torch.allclose(c1[:, :-1], c2[:, :-1], atol=1e-6), \
         "causality violated in fused attention!"
 
@@ -216,3 +241,19 @@ if __name__ == "__main__":
 
     print("csa out shape:", tuple(cout.shape))
     print(f"fused attention works ✅  (params match explicit: {n_csa})")
+
+    # --- KV-cache: incremental (one token at a time) must equal the full forward ---
+    # Process the whole sequence at once...
+    full_out, _ = csa(x)
+    # ...then feed it one token at a time, carrying the cache forward each step.
+    cache, inc_steps = None, []
+    for t in range(T):
+        out_t, cache = csa(x[:, t:t+1, :], cache)
+        inc_steps.append(out_t)
+    inc_out = torch.cat(inc_steps, dim=1)
+    assert inc_out.shape == full_out.shape, f"bad incremental shape {inc_out.shape}"
+    assert torch.allclose(full_out, inc_out, atol=1e-5), \
+        "KV-cache incremental output != full-sequence output!"
+    # the cache should hold all T keys/values after the loop
+    assert cache[0].shape == (B, cfg.n_head, T, head_size), f"bad cache shape {cache[0].shape}"
+    print("KV-cache: incremental == full forward ✅")
