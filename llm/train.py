@@ -140,9 +140,11 @@ def main():
         loss.backward()
         optimizer.step()
 
-    # sample from the trained model, starting from a single newline/token id 0
+    # sample from the trained model, starting from a single newline/token id 0.
+    # temperature 0.8 sharpens slightly (less rambly than 1.0); top_k 40 clips the
+    # noisy tail so it can't emit junk characters — the usual readable-sample combo.
     context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
-    out = model.generate(context, max_new_tokens=500)[0].tolist()
+    out = model.generate(context, max_new_tokens=500, temperature=0.8, top_k=40)[0].tolist()
     print(tokenizer.decode(out))
 
 
