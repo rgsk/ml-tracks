@@ -19,8 +19,8 @@ import torch
 from checkpoint import load_checkpoint, save_checkpoint
 from config import GPTConfig
 from data import load_data, get_batch
+from grad_accum import grad_accum_step
 from lr_schedule import get_lr
-from mixed_precision import amp_train_step
 from model import GPT
 from optimizer import configure_optimizers
 
@@ -35,6 +35,7 @@ MAX_ITERS = 3000
 EVAL_INTERVAL = 300
 EVAL_ITERS = 100
 GRAD_CLIP = 1.0          # max global grad norm; 0 disables clipping
+GRAD_ACCUM_STEPS = 1     # micro-batches summed per optimizer step (1 = no accumulation)
 WEIGHT_DECAY = 0.1       # applied to >=2-D weights only (see configure_optimizers)
 LEARNING_RATE = 3e-4     # peak LR (the schedule warms up to this, then decays)
 WARMUP_ITERS = 100       # linear warmup length
@@ -170,11 +171,13 @@ def main():
                 save_checkpoint(BEST_PATH, model, optimizer, step, cfg, best_val=best_val)
             save_checkpoint(LAST_PATH, model, optimizer, step, cfg, best_val=best_val)
 
-        # one mixed-precision step: autocast forward -> scaled backward -> unscale ->
-        # grad clip -> step -> update. (bf16/fp32 -> scaler is a no-op; fp16 -> active.)
-        xb, yb = get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
-        amp_train_step(model, xb, yb, optimizer, scaler, amp_dtype=amp_dtype,
-                       device_type=device_type, grad_clip=GRAD_CLIP)
+        # one optimizer step over GRAD_ACCUM_STEPS micro-batches (=1 -> a single
+        # batch). Each micro-batch forward is autocast; grads accumulate, then one
+        # unscale -> clip -> step -> update. Effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS.
+        micro = [get_batch(train_data, BLOCK_SIZE, BATCH_SIZE, DEVICE)
+                 for _ in range(GRAD_ACCUM_STEPS)]
+        grad_accum_step(model, micro, optimizer, scaler, amp_dtype=amp_dtype,
+                        device_type=device_type, grad_clip=GRAD_CLIP)
 
     # sample from the trained model, starting from a single newline/token id 0.
     # temperature 0.8 sharpens slightly (less rambly than 1.0); top_k 40 clips the
