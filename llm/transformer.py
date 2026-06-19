@@ -26,10 +26,14 @@ class FeedForward(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         # expand 4x (more capacity), GELU (GPT-2's smooth activation), project back
+        down = nn.Linear(4 * config.n_embd, config.n_embd)
+        # down writes back INTO the residual stream; flag it for scaled init (see
+        # GPT._init_weights) — same treatment as attention's output projection.
+        down.RESIDUAL_PROJ = True
         self.net = nn.Sequential(
             nn.Linear(config.n_embd, 4 * config.n_embd),
             nn.GELU(),
-            nn.Linear(4 * config.n_embd, config.n_embd),
+            down,
             nn.Dropout(config.dropout),
         )
 

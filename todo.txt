@@ -8,3 +8,18 @@ why cross_entropy is better than cross_entropy_simple
 claude code latex support check
 
 Weights & Biases
+
+
+
+Look at the model.py output:
+
+
+loss = 18.2361  (random-init expectation ≈ 4.1744)
+Before tying that loss was ~4.17 (≈ ln(65)). Tying broke the init, and this is a real, classic gotcha:
+
+nn.Embedding.weight initializes as N(0, 1) — std ≈ 1.0
+nn.Linear.weight initializes as U(-1/√C, 1/√C) — std ≈ 0.05 for C=32
+When you alias them, the output projection now uses the big N(0,1) weights → huge logits → wildly overconfident wrong predictions → loss far above ln(vocab). It's not a bug in your tying; it's that the two layers wanted different init scales and tying forces one.
+
+
+scaling each by 1/√(2·n_layer) keeps the stream's variance ~flat with depth.

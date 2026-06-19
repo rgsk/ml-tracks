@@ -47,6 +47,33 @@ class GPT(nn.Module):
         if config.tie_weights:
             self.lm_head.weight = self.token_embedding.weight
 
+        # GPT-2 weight init on every submodule. Must run AFTER tying so the shared
+        # embedding/lm_head tensor ends up at the 0.02 scale (not nn.Embedding's
+        # default N(0,1), which would otherwise make the output logits explode).
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module: nn.Module) -> None:
+        """GPT-2 init scheme, called on every submodule via self.apply.
+
+        Overrides PyTorch's per-layer defaults so (a) the tied lm_head doesn't
+        inherit the embedding's N(0,1) scale, and (b) the residual stream stays
+        ~unit-variance through depth. LayerNorms are left at their defaults
+        (weight=1, bias=0), which is already what GPT-2 wants.
+        """
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            # layers that write back into the residual stream are scaled down by
+            # 1/sqrt(2*n_layer): each block adds to the stream TWICE (attn + ffwd),
+            # so over n_layer blocks the variance would grow ~linearly with the
+            # number of adds. Shrinking each contributing projection keeps it flat.
+            if getattr(module, "RESIDUAL_PROJ", False):
+                std *= (2 * self.config.n_layer) ** -0.5
+            nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 kv_caches=None, use_cache: bool = False):
         """idx: (B, T) token ids. targets: (B, T) or None.
@@ -271,10 +298,18 @@ if __name__ == "__main__":
     except AssertionError:
         print("KV-cache: refuses to exceed block_size ✅")
 
-    # sanity: untrained loss ≈ -ln(1/vocab_size) = ln(vocab_size)
+    # sanity: with proper init the untrained loss ≈ -ln(1/vocab_size) = ln(vocab).
+    # Logits should start ~uniform, so cross-entropy ≈ ln(vocab). A loss far above
+    # this means the init is wrong — e.g. weight tying leaking nn.Embedding's
+    # N(0,1) scale into the output projection, which blows the logits up.
     import math
     expected = math.log(cfg.vocab_size)
     print(f"loss = {loss.item():.4f}  (random-init expectation ≈ {expected:.4f})")
+    assert abs(loss.item() - expected) < 0.5, (
+        f"init loss {loss.item():.2f} is far from ln(vocab)={expected:.2f} — is "
+        "_init_weights implemented? Without it, tying leaks the embedding's N(0,1) "
+        "scale into the output projection and the logits explode."
+    )
 
     # causality must hold end-to-end through the whole model: changing a future
     # input token must not change the logits at earlier positions.

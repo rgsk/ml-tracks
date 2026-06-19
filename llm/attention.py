@@ -110,6 +110,9 @@ class CausalSelfAttention(nn.Module):
         # one projection producing Q, K, V stacked (C -> 3C); split in forward
         self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.proj = nn.Linear(config.n_embd, config.n_embd)
+        # proj writes back INTO the residual stream; flag it so GPT's weight init
+        # scales it by 1/sqrt(2*n_layer) (nanoGPT calls this NANOGPT_SCALE_INIT).
+        self.proj.RESIDUAL_PROJ = True
 
         self.register_buffer(
             "tril",
