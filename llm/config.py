@@ -19,3 +19,4 @@ class GPTConfig:
     n_head: int = 6           # number of attention heads
     n_layer: int = 6          # number of transformer blocks
     dropout: float = 0.2
+    tie_weights: bool = True  # share one (V,C) tensor for token_embedding & lm_head (GPT-2 style)

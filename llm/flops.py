@@ -18,6 +18,10 @@ Three interview-classic estimates, all derivable from the config alone:
      - lm_head            n_embd * vocab_size + vocab_size  (a real matmul)
    In big models the per-block matmuls (attn + the 4x MLP) dominate; in tiny
    models the embedding tables do.
+       WEIGHT TYING (config.tie_weights): lm_head.weight and token_embedding are
+   one shared (V,C) tensor, so it's counted ONCE — the head's only extra param is
+   its (V,) bias. This trims V*C from the param count but not from the FLOPs (see
+   below): the lm_head matmul still runs, the shared matrix just pulls double duty.
 
 2. FLOPs PER TOKEN — the famous "6N" rule. A matmul that uses a weight does one
    multiply + one add per element = 2 FLOPs per parameter per token. So:
@@ -53,9 +57,11 @@ def num_params(config: GPTConfig, *, embedding: bool = True) -> int:
     """Analytic parameter count from the config.
 
     embedding=True  -> the full model count (matches sum(p.numel())).
-    embedding=False -> subtract the token + position embedding tables. This is
-                       the N to feed the 6N FLOPs rule (lookups do no matmul
-                       FLOPs). The lm_head is a matmul, so it is NOT subtracted.
+    embedding=False -> the N to feed the 6N FLOPs rule (lookups do no matmul
+                       FLOPs, the lm_head matmul does). Untied, that's the count
+                       minus both embedding tables. Tied, the token table IS the
+                       lm_head weight, so only the position table is subtracted —
+                       N (and thus flops_per_token) comes out identical either way.
     """
     V, T, C = config.vocab_size, config.block_size, config.n_embd
     L = config.n_layer
@@ -72,12 +78,28 @@ def num_params(config: GPTConfig, *, embedding: bool = True) -> int:
     per_block = ln1 + ln2 + attn + ffwd
 
     ln_f = 2 * C
-    lm_head = C * V + V                                  # a real matmul (C->V)
+
+    # lm_head is a Linear(C->V): a (V,C) weight + a (V,) bias. With WEIGHT TYING
+    # its weight IS token_embedding.weight, and tok_emb already counts that (V,C)
+    # tensor — so the head adds only its bias, never counting V*C twice.
+    if config.tie_weights:
+        lm_head = V             # tied: weight already in tok_emb; only the (V,) bias is new
+    else:
+        lm_head = C * V + V     # untied: its own (V,C) weight + (V,) bias
 
     total = tok_emb + pos_emb + L * per_block + ln_f + lm_head
+
     if not embedding:
-        # drop the two lookup tables (no matmul FLOPs); keep lm_head
-        total -= tok_emb + pos_emb
+        # N for the 6N rule = params that do MATMUL work; lookups do none.
+        #   untied -> drop BOTH lookup tables; the lm_head matmul weight is its
+        #             own tensor and stays in N.
+        #   tied   -> the shared (V,C) tensor is ALSO the lm_head matmul weight,
+        #             so it still does matmul FLOPs: keep it, drop only pos_emb.
+        #             (Tying saves storage, NOT FLOPs — the matmul is unchanged.)
+        if config.tie_weights:
+            total -= pos_emb                # token table doubles as the lm_head weight -> keep it
+        else:
+            total -= tok_emb + pos_emb
     return total
 
 
@@ -91,6 +113,8 @@ def flops_per_token(config: GPTConfig) -> int:
 
     # 6N: every non-embedding param does one multiply-add (2 FLOPs) on the
     # forward pass and ~twice that on the backward = 6 FLOPs/param/token.
+    # N already folds in weight tying (see num_params): tying changes storage,
+    # not the matmul work, so this value is identical tied vs untied.
     N = num_params(config, embedding=False)
     matmul_flops = 6 * N
 
@@ -141,11 +165,30 @@ if __name__ == "__main__":
     real2 = sum(p.numel() for p in GPT(cfg2).parameters())
     assert num_params(cfg2) == real2, f"{num_params(cfg2)} != {real2}"
 
-    # non-embedding count subtracts exactly the two lookup tables
-    emb = (cfg.vocab_size + cfg.block_size) * cfg.n_embd
-    assert num_params(cfg, embedding=False) == real - emb, "non-embedding subtraction wrong"
-    print(f"non-embedding params: {num_params(cfg, embedding=False)} "
-          f"(dropped {emb} embedding params)")
+    # non-embedding count = the N fed to 6N. What it drops depends on tying:
+    #   untied -> both lookup tables (token + position)
+    #   tied   -> only the position table; the token table doubles as the
+    #             lm_head matmul weight, so it stays in N.
+    pos = cfg.block_size * cfg.n_embd
+    both = (cfg.vocab_size + cfg.block_size) * cfg.n_embd
+    drop = pos if cfg.tie_weights else both
+    assert num_params(cfg, embedding=False) == real - drop, "non-embedding subtraction wrong"
+    print(f"non-embedding params: {num_params(cfg, embedding=False)} (dropped {drop})")
+
+    # --- weight tying: storage shrinks, FLOPs do NOT -------------------------
+    from dataclasses import replace
+    tied = replace(cfg, tie_weights=True)
+    untied = replace(cfg, tie_weights=False)
+    # analytic counts must match the real models in BOTH modes...
+    assert num_params(tied) == sum(p.numel() for p in GPT(tied).parameters())
+    assert num_params(untied) == sum(p.numel() for p in GPT(untied).parameters())
+    # ...and tying saves exactly one shared (V,C) weight matrix.
+    assert num_params(untied) - num_params(tied) == cfg.vocab_size * cfg.n_embd, \
+        "tying should save exactly one V*C weight matrix"
+    # but the matmul work is identical -> flops/token must be byte-for-byte equal.
+    assert flops_per_token(tied) == flops_per_token(untied), "tying must not change FLOPs"
+    print(f"weight tying: saves {cfg.vocab_size * cfg.n_embd} params, "
+          f"flops/token unchanged ({flops_per_token(tied)}) ✅")
 
     # --- 2. FLOPs per token --------------------------------------------------
     fpt = flops_per_token(cfg)
@@ -184,5 +227,5 @@ if __name__ == "__main__":
     # --- sanity: a GPT-2-124M-ish config lands near the famous numbers --------
     gpt2 = GPTConfig(vocab_size=50257, block_size=1024, n_embd=768, n_head=12, n_layer=12)
     p = num_params(gpt2)
-    print(f"GPT-2(124M)-shaped config: {p:,} params  (~124M expected, sans weight-tying diff)")
+    print(f"GPT-2(124M)-shaped config: {p:,} params  (weight tying ON -> matches the real ~124M)")
     print("all checks passed ✅")

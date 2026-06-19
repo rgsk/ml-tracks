@@ -40,6 +40,13 @@ class GPT(nn.Module):
         # project the C-dim representation to vocab logits
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size)
 
+        # WEIGHT TYING (GPT-2): the token embedding (V,C) and the lm_head weight
+        # (out,in)=(V,C) are inverse views of the SAME id<->vector map, so GPT-2
+        # shares ONE tensor for both — saving V*C params and tying their grads.
+        # The alias means parameters() counts that (V,C) matrix only once.
+        if config.tie_weights:
+            self.lm_head.weight = self.token_embedding.weight
+
     def forward(self, idx: torch.Tensor, targets: torch.Tensor | None = None,
                 kv_caches=None, use_cache: bool = False):
         """idx: (B, T) token ids. targets: (B, T) or None.
@@ -279,6 +286,12 @@ if __name__ == "__main__":
     l2, _ = model(perturbed)
     assert torch.allclose(l1[:, :-1], l2[:, :-1], atol=1e-5), \
         "causality violated in the full GPT!"
+
+    # weight tying: when on, lm_head and token_embedding must be ONE shared tensor
+    if cfg.tie_weights:
+        assert model.lm_head.weight is model.token_embedding.weight, \
+            "tie_weights=True but lm_head.weight is a separate tensor (did you copy instead of alias?)"
+        print("weight tying: lm_head.weight is token_embedding.weight ✅")
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"params = {n_params}")
