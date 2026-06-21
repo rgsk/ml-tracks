@@ -24,6 +24,7 @@ import os
 
 import torch
 
+from bpe import BPETokenizer
 from tokenizer import CharTokenizer
 
 # resolve input.txt relative to THIS file, so it works from any cwd
@@ -31,21 +32,56 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 DATA_PATH = os.path.join(_HERE, "input.txt")
 
 
-def load_data(path: str = DATA_PATH, train_frac: float = 0.9):
+def load_data(path: str = DATA_PATH, train_frac: float = 0.9,
+              tokenizer: str = "char", bpe_vocab_size: int = 1024):
     """Read corpus, build tokenizer, encode, split into train/val tensors.
 
-    Returns (tokenizer, train_data, val_data), where the data tensors are
-    1-D LongTensors of token ids. The split is by position, not shuffled, so
-    the val region stays genuinely unseen (no sequence leakage into train).
+    `tokenizer` is "char" (one token per character) or "bpe" (byte-level BPE,
+    what GPT-2 uses). Returns (tokenizer, train_data, val_data) — 1-D LongTensors
+    of token ids. The split is by position, not shuffled, so the val region stays
+    genuinely unseen (no sequence leakage into train).
+
+    BPE training + encoding the full corpus is slow (pure-Python, ~minutes), so
+    the merges AND the encoded ids are cached to disk keyed by vocab size; later
+    runs just load them.
     """
     with open(path, "r", encoding="utf-8") as f:
         text = f.read()
 
-    tokenizer = CharTokenizer(text)
-    data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
+    if tokenizer == "char":
+        tok = CharTokenizer(text)
+        ids = tok.encode(text)
+    elif tokenizer == "bpe":
+        tok, ids = _load_or_build_bpe(text, bpe_vocab_size)
+    else:
+        raise ValueError(f"unknown tokenizer {tokenizer!r} (use 'char' or 'bpe')")
+
+    data = torch.tensor(ids, dtype=torch.long)
     n = int(train_frac * len(data))
     train_data, val_data = data[:n], data[n:]
-    return tokenizer, train_data, val_data
+    return tok, train_data, val_data
+
+
+def _load_or_build_bpe(text: str, vocab_size: int):
+    """Return (BPETokenizer, encoded_ids), training + encoding once then caching."""
+    cache_dir = os.path.join(_HERE, "artifacts", "tokenizer")
+    os.makedirs(cache_dir, exist_ok=True)
+    model_path = os.path.join(cache_dir, f"bpe_v{vocab_size}.json")
+    ids_path = os.path.join(cache_dir, f"bpe_v{vocab_size}_ids.pt")
+
+    if os.path.exists(model_path) and os.path.exists(ids_path):
+        tok = BPETokenizer.load(model_path)
+        ids = torch.load(ids_path).tolist()
+        return tok, ids
+
+    print(f"[data] training BPE (vocab {vocab_size}) + encoding corpus — one-time, ~minutes...")
+    tok = BPETokenizer()
+    tok.train(text, vocab_size=vocab_size)
+    ids = tok.encode(text)
+    tok.save(model_path)
+    torch.save(torch.tensor(ids, dtype=torch.long), ids_path)
+    print(f"[data] cached to {os.path.basename(model_path)} / {os.path.basename(ids_path)}")
+    return tok, ids
 
 
 def get_batch(data: torch.Tensor, block_size: int, batch_size: int,

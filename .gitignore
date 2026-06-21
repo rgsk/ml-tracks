@@ -2,3 +2,6 @@ practice/
 .venv
 __pycache__
 checkpoints/
+
+# generated files: training checkpoints + tokenizer cache (rebuilt on demand)
+artifacts/

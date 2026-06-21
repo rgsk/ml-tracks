@@ -12,19 +12,22 @@ Fill in the TODOs, then run `python llm/train.py`.
 from __future__ import annotations
 
 import argparse
+import math
 import os
 
 import torch
 
 from checkpoint import load_checkpoint, save_checkpoint
 from config import GPTConfig
-from data import load_data, get_batch
+from data import DATA_PATH, load_data, get_batch
 from grad_accum import grad_accum_step
 from lr_schedule import get_lr
 from model import GPT
 from optimizer import configure_optimizers
 
 # --- hyperparameters (small, so it runs in a few minutes on CPU) ---
+TOKENIZER = "bpe"       # "char" (one token/char) | "bpe" (byte-level, GPT-2 style)
+BPE_VOCAB_SIZE = 1024    # only used when TOKENIZER == "bpe"
 BLOCK_SIZE = 64
 BATCH_SIZE = 32
 N_EMBD = 96
@@ -44,12 +47,10 @@ DECAY_LR = True          # set False to use a flat LEARNING_RATE
 DTYPE = "bfloat16"       # "bfloat16" (no scaler) | "float16" (GradScaler) | "float32" (off)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# two distinct checkpoints, two distinct jobs (see --resume below):
-#   last.pt — newest state, for resuming an interrupted run (fault tolerance)
-#   best.pt — lowest-val snapshot, for inference, or a warm restart at lower LR
-CKPT_DIR = "checkpoints"
-LAST_PATH = os.path.join(CKPT_DIR, "last.pt")
-BEST_PATH = os.path.join(CKPT_DIR, "best.pt")
+# generated files (checkpoints, tokenizer cache) live under artifacts/, anchored
+# to this package dir so paths are stable no matter where the script is launched.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+ARTIFACTS_DIR = os.path.join(_HERE, "artifacts")
 
 
 @torch.no_grad()
@@ -87,13 +88,42 @@ def main():
         help="override the learning rate; needed because loading the optimizer "
              "state restores the *saved* LR (use with --resume best to fine-tune)",
     )
+    parser.add_argument(
+        "--tokenizer", choices=["char", "bpe"], default=TOKENIZER,
+        help="char = one token/char; bpe = byte-level BPE (GPT-2 style)",
+    )
+    parser.add_argument(
+        "--bpe-vocab", type=int, default=BPE_VOCAB_SIZE,
+        help="vocab size for the BPE tokenizer (only used with --tokenizer bpe)",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(1337)
 
+    # char and bpe runs use different vocab sizes (incompatible checkpoints), so
+    # keep their checkpoints in separate dirs — and so a comparison run of one
+    # never clobbers the other's best.pt.
+    tag = args.tokenizer if args.tokenizer == "char" else f"bpe{args.bpe_vocab}"
+    ckpt_dir = os.path.join(ARTIFACTS_DIR, "checkpoints", tag)
+    last_path = os.path.join(ckpt_dir, "last.pt")
+    best_path = os.path.join(ckpt_dir, "best.pt")
+
     # 1. data + tokenizer. NOTE: vocab_size for the config comes from the
     #    tokenizer, not a magic number.
-    tokenizer, train_data, val_data = load_data()
+    tokenizer, train_data, val_data = load_data(
+        tokenizer=args.tokenizer, bpe_vocab_size=args.bpe_vocab
+    )
+
+    # bits-per-byte makes losses comparable ACROSS tokenizers: cross-entropy is
+    # nats *per token*, but char and bpe have different tokens, so per-token loss
+    # isn't apples-to-apples. Normalizing by the raw byte count is the standard
+    # cross-tokenizer LM metric. tokens_per_byte < 1 for BPE (it compresses).
+    num_bytes = os.path.getsize(DATA_PATH)
+    num_tokens = len(train_data) + len(val_data)
+    tokens_per_byte = num_tokens / num_bytes
+    print(f"tokenizer {args.tokenizer} | vocab {tokenizer.vocab_size} | "
+          f"{num_tokens:,} tokens for {num_bytes:,} bytes "
+          f"({1/tokens_per_byte:.2f} bytes/token)")
 
     # config's vocab_size comes from the tokenizer, not a magic number
     cfg = GPTConfig(
@@ -131,7 +161,7 @@ def main():
     start_step = 0
     best_val = float("inf")
     if args.resume is not None:
-        path = LAST_PATH if args.resume == "last" else BEST_PATH
+        path = last_path if args.resume == "last" else best_path
         if os.path.exists(path):
             meta = load_checkpoint(path, model, optimizer, map_location=DEVICE)
             start_step = meta["step"] + 1          # +1: don't redo the saved step
@@ -144,7 +174,7 @@ def main():
             print(f"resumed from {path} @ step {meta['step']} "
                   f"(best val {best_val:.4f}, lr {optimizer.param_groups[0]['lr']:g})")
 
-    os.makedirs(CKPT_DIR, exist_ok=True)
+    os.makedirs(ckpt_dir, exist_ok=True)
 
     for step in range(start_step, MAX_ITERS):
         # set this step's LR (warmup -> cosine decay) before the optimizer reads it.
@@ -162,14 +192,17 @@ def main():
         # periodic eval (and a final read on the last step)
         if step % EVAL_INTERVAL == 0 or step == MAX_ITERS - 1:
             losses = estimate_loss(model, train_data, val_data)
+            # val_bpb: nats/token -> bits/byte (the cross-tokenizer-comparable number)
+            val_bpb = losses["val"] * tokens_per_byte / math.log(2)
             print(f"step {step:5d} | lr {lr_now:.2e} | "
-                  f"train {losses['train']:.4f} | val {losses['val']:.4f}")
+                  f"train {losses['train']:.4f} | val {losses['val']:.4f} | "
+                  f"val bits/byte {val_bpb:.4f}")
             # best.pt only when val improves (model selection); last.pt every time
             # (so an interrupted run resumes from its newest state, not the best one).
             if losses["val"] < best_val:
                 best_val = losses["val"]
-                save_checkpoint(BEST_PATH, model, optimizer, step, cfg, best_val=best_val)
-            save_checkpoint(LAST_PATH, model, optimizer, step, cfg, best_val=best_val)
+                save_checkpoint(best_path, model, optimizer, step, cfg, best_val=best_val)
+            save_checkpoint(last_path, model, optimizer, step, cfg, best_val=best_val)
 
         # one optimizer step over GRAD_ACCUM_STEPS micro-batches (=1 -> a single
         # batch). Each micro-batch forward is autocast; grads accumulate, then one
@@ -179,10 +212,11 @@ def main():
         grad_accum_step(model, micro, optimizer, scaler, amp_dtype=amp_dtype,
                         device_type=device_type, grad_clip=GRAD_CLIP)
 
-    # sample from the trained model, starting from a single newline/token id 0.
-    # temperature 0.8 sharpens slightly (less rambly than 1.0); top_k 40 clips the
-    # noisy tail so it can't emit junk characters — the usual readable-sample combo.
-    context = torch.zeros((1, 1), dtype=torch.long, device=DEVICE)
+    # sample from the trained model, seeding with a newline. (id 0 is a newline
+    # under the char tokenizer but a null byte under BPE, so encode("\n") instead
+    # of a hardcoded 0 to seed both correctly.) temperature 0.8 sharpens slightly
+    # (less rambly than 1.0); top_k 40 clips the noisy tail — the readable-sample combo.
+    context = torch.tensor([tokenizer.encode("\n")], dtype=torch.long, device=DEVICE)
     out = model.generate(context, max_new_tokens=500, temperature=0.8, top_k=40)[0].tolist()
     print(tokenizer.decode(out))
 
