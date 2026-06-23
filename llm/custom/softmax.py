@@ -53,6 +53,7 @@ def log_softmax(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     logsumexp = torch.logsumexp(z, dim, keepdim=True)
     return z - logsumexp
 
+# see llm/experiments/softmax_backward_derivation.ipynb 
 def softmax_backward(grad_out: torch.Tensor, y: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Backward pass. Given y = softmax(x) (the FORWARD output) and grad_out =
     dL/dy, return dL/dx.
