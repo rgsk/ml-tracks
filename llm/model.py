@@ -120,6 +120,7 @@ class GPT(nn.Module):
     @torch.no_grad()
     def generate(self, idx: torch.Tensor, max_new_tokens: int,
                  temperature: float = 1.0, top_k: int | None = None,
+                 top_p: float | None = None,
                  use_cache: bool = False) -> torch.Tensor:
         """Autoregressively extend idx by max_new_tokens.
 
@@ -138,6 +139,14 @@ class GPT(nn.Module):
         thousands of tiny-probability tokens together hold enough mass to
         occasionally emit garbage. top_k and temperature compose: clip to the top
         k, then temperature reshapes the distribution over just those survivors.
+
+        top_p (nucleus sampling, if set) keeps the smallest set of tokens whose
+        cumulative probability reaches p (e.g. 0.9), then renormalizes and samples
+        from just those. Unlike top_k's FIXED cutoff, the nucleus ADAPTS to the
+        model's confidence: when one token is very likely the set is tiny, when the
+        model is unsure the set widens. Thresholds on cumulative PROBABILITY, so it
+        runs after softmax (top_k thresholds logits, before). All three compose:
+        temperature -> top_k -> softmax -> top_p -> sample.
 
         use_cache: KV-cache the past K/V instead of recomputing the whole context
         each step — O(T) per token instead of O(T^2). The first step processes the
@@ -191,11 +200,33 @@ class GPT(nn.Module):
                     logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))
 
                 probs = F.softmax(logits, dim=-1)               # (B, vocab)
+
+                if top_p is not None:
+                    # NUCLEUS SAMPLING — zero out everything OUTSIDE the smallest
+                    # set of tokens whose cumulative probability reaches top_p,
+                    # then renormalize so the survivors sum to 1 again. Sort by prob
+                    # so the nucleus is a prefix; keep the original indices to put
+                    # the mask back in vocab order.
+                    sorted_probs, sorted_idx = probs.sort(descending=True, dim=-1)
+                    
+                    cumprobs = sorted_probs.cumsum(dim=-1)       # (B, vocab) running mass
+                    # remove a token once the mass BEFORE it already reached p. The
+                    # prefix shift (cumprobs - sorted_probs, NOT cumprobs) keeps the
+                    # first token that crosses p, and never removes the top-1 token
+                    # (its prefix mass is 0, and 0 > p is False for any p > 0).
+                    sorted_remove = (cumprobs - sorted_probs) > top_p
+
+                    # scatter the sorted-space mask back to original vocab order
+                    remove = torch.zeros_like(sorted_remove).scatter(
+                        -1, sorted_idx, sorted_remove
+                    )
+                    probs = probs.masked_fill(remove, 0.0)
+                    probs = probs / probs.sum(dim=-1, keepdim=True)  # renormalize
+
                 next_id = torch.multinomial(probs, num_samples=1)  # (B, 1)
 
             idx = torch.cat((idx, next_id), dim=1)
         return idx
-
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +311,35 @@ if __name__ == "__main__":
         tok = model.generate(ctx, max_new_tokens=1, temperature=1.5, top_k=k)[0, -1].item()
         assert tok in allowed, f"sampled {tok} outside the top-{k} set {allowed}"
     print(f"top-{k}: 300/300 samples stayed within the allowed set ✅")
+
+    # --- top-p (nucleus) -----------------------------------------------------
+    # 1. p -> 0+ keeps only the single most-probable token, so sampling is
+    #    deterministic = greedy (the prefix-shift guarantees the top-1 survives).
+    got_p = model.generate(g_start, max_new_tokens=30, temperature=1.0, top_p=1e-8)
+    assert torch.equal(ref, got_p), "top_p->0 should collapse to greedy decoding"
+
+    # 2. p = 1.0 removes nothing, so it must match plain sampling token-for-token
+    #    under the same seed (renormalization is a no-op when nothing is masked).
+    torch.manual_seed(0)
+    plain_s = model.generate(ctx, max_new_tokens=15, temperature=1.0)
+    torch.manual_seed(0)
+    full_p = model.generate(ctx, max_new_tokens=15, temperature=1.0, top_p=1.0)
+    assert torch.equal(plain_s, full_p), "top_p=1.0 should equal unfiltered sampling"
+
+    # 3. membership: every sampled token must lie in the nucleus for that context.
+    #    Build the nucleus by hand (sort, cumsum, prefix-shift) and assert each draw
+    #    is a member — and that the nucleus is a STRICT subset (something was cut).
+    p = 0.9
+    probs0 = F.softmax(model(ctx)[0][:, -1, :], dim=-1)
+    sp, si = probs0.sort(descending=True, dim=-1)
+    keep = (sp.cumsum(-1) - sp) <= p                 # prefix-shift: top-1 always kept
+    nucleus = set(si[0][keep[0]].tolist())
+    assert 0 < len(nucleus) < cfg.vocab_size, f"degenerate nucleus size {len(nucleus)}"
+    torch.manual_seed(0)
+    for _ in range(300):
+        tok = model.generate(ctx, max_new_tokens=1, temperature=1.0, top_p=p)[0, -1].item()
+        assert tok in nucleus, f"sampled {tok} outside the nucleus {nucleus}"
+    print(f"top-p={p}: nucleus={len(nucleus)}/{cfg.vocab_size} tokens, 300/300 samples inside ✅")
 
     # --- KV-cache ------------------------------------------------------------
     # Cached generation must produce the EXACT same tokens as the non-cached path.
