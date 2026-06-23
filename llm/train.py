@@ -47,6 +47,11 @@ DECAY_LR = True          # set False to use a flat LEARNING_RATE
 DTYPE = "bfloat16"       # "bfloat16" (no scaler) | "float16" (GradScaler) | "float32" (off)
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# sampling knobs for the final generation after training (None disables a filter)
+TEMPERATURE = 0.8        # <1 sharpens toward greedy, >1 flattens; 0 = greedy argmax
+TOP_K = 40               # keep only the k highest-logit tokens
+TOP_P = 0.95             # nucleus: keep the smallest set with sum of probabilities >= p
+
 # generated files (checkpoints, tokenizer cache) live under artifacts/, anchored
 # to this package dir so paths are stable no matter where the script is launched.
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -214,10 +219,12 @@ def main():
 
     # sample from the trained model, seeding with a newline. (id 0 is a newline
     # under the char tokenizer but a null byte under BPE, so encode("\n") instead
-    # of a hardcoded 0 to seed both correctly.) temperature 0.8 sharpens slightly
-    # (less rambly than 1.0); top_k 40 clips the noisy tail — the readable-sample combo.
+    # of a hardcoded 0 to seed both correctly.) temperature sharpens slightly (less
+    # rambly than 1.0); top_k clips the noisy tail to a fixed count; top_p then
+    # trims within those to the nucleus, adapting to the model's confidence.
     context = torch.tensor([tokenizer.encode("\n")], dtype=torch.long, device=DEVICE)
-    out = model.generate(context, max_new_tokens=500, temperature=0.8, top_k=40)[0].tolist()
+    out = model.generate(context, max_new_tokens=500,
+                         temperature=TEMPERATURE, top_k=TOP_K, top_p=TOP_P)[0].tolist()
     print(tokenizer.decode(out))
 
 
