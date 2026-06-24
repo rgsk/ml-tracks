@@ -2,10 +2,7 @@ If it started at, say, 50, you'd have a bug (bad init, wrong reshape, exploding 
 explain this with example
 
 
-why cross_entropy is better than cross_entropy_simple
-
-
 Weights & Biases
 
 
-
+understand gqa tests
