@@ -1,0 +1,15 @@
+[project]
+name = "pytorch-practice"
+version = "0.1.0"
+description = "From-scratch ML interview prep: LLM (llm/) and RL (rl/) tracks."
+requires-python = ">=3.12"
+
+# Direct dependencies only — declare INTENT here. uv resolves the full transitive
+# tree (nvidia-*, jupyter internals, etc.) into uv.lock. Never hand-edit the lock.
+dependencies = [
+    "torch>=2.12",
+    "numpy>=2.4",
+    "matplotlib>=3.9",
+    "gymnasium[classic-control]>=1.0",  # RL environments (CartPole, etc.)
+    "ipykernel>=7.0",                   # Jupyter notebooks (.ipynb worksheets)
+]

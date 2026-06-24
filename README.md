@@ -75,17 +75,27 @@ The runner provides an interactive menu to:
 - Run all tutorials sequentially
 - Run individual tutorial parts
 
-## Requirements
+## Environment & dependencies
+
+This project uses [**uv**](https://docs.astral.sh/uv/) for dependency management.
+Direct deps are declared in `pyproject.toml`; the full pinned tree lives in
+`uv.lock` (committed). PyTorch comes from PyPI, whose default Linux wheel is the
+CUDA-13 build (`torch.version.cuda == "13.0"`) — no custom index needed.
 
 ```bash
-pip install torch torchvision numpy matplotlib
+# One-time: reproduce the exact environment into .venv/ (gitignored)
+uv sync
+
+# Run anything inside the managed env (no manual `activate` needed)
+uv run python llm/gqa.py
+uv run python 01_tensor_basics.py
+
+# Add a new dependency (updates pyproject.toml + uv.lock together)
+uv add some-package
 ```
 
-For CUDA support (optional):
-```bash
-# Install CUDA-enabled PyTorch
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118
-```
+Rule of thumb: declare **intent** (your direct deps) in `pyproject.toml`; let uv
+own the transitive closure in `uv.lock`. Never hand-edit the lockfile.
 
 ## Interview Preparation Focus
 
