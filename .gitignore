@@ -5,3 +5,4 @@ checkpoints/
 
 # generated files: training checkpoints + tokenizer cache (rebuilt on demand)
 artifacts/
+outputs/
