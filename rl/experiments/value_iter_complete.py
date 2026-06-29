@@ -214,7 +214,16 @@ def exp_sealed_gamma1():
                     max_iters=15)
 
 
+def exp_sealed_gamma1_init50():
+    _banner("SEALED POCKET @ gamma=1.0, V init -50: pocket DIVERGES from -50 down",
+            "  -> no fixed point at gamma=1; reachable cells still converge",
+            "  (capped at 8 sweeps)")
+    value_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=1.0,
+                    v_init=-50.0, max_iters=15)
+
+
 def run_experiments():
+    pass
     # comment/uncomment the experiments you want to run
     # exp_a()
     # exp_b()
@@ -224,7 +233,8 @@ def run_experiments():
     # exp_b_init50_gamma1()
     # exp_sealed_gamma09()
     # exp_sealed_gamma09_init50()
-    exp_sealed_gamma1()
+    # exp_sealed_gamma1()
+    exp_sealed_gamma1_init50()
 
 
 @contextlib.contextmanager
