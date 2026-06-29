@@ -134,11 +134,12 @@ def q_from_v(env: GridWorld, V: np.ndarray, s: int, gamma: float) -> np.ndarray:
 
     Returns an array of shape (nA,).
     """
+    # `done` needs no special case: terminal states self-loop with reward 0 and
+    # keep V=0, so gamma*V[s'] is already 0 for them.
     q = np.zeros(env.nA)
-    # TODO: for each action a, walk env.P[s][a] (a list of (prob, s_next, reward,
-    #       done) tuples) and accumulate  q[a] += prob * (reward + gamma * V[s_next]).
-    # HINT: `done` needs no special case here — terminal states self-loop with
-    #       reward 0 and keep V=0, so gamma*V[s'] is already 0 for them.
+    for a in range(env.nA):
+        for prob, ns, r, done in env.P[s][a]:
+            q[a] += prob * (r + gamma * V[ns])
     return q
 
 
@@ -151,16 +152,17 @@ def policy_evaluation(env: GridWorld, policy: np.ndarray, gamma: float,
     `policy` is a stochastic matrix of shape (nS, nA) whose rows sum to 1.
     Returns V of shape (nS,).
     """
+    # In-place sweep (reads the freshly-updated V) — converges a touch faster
+    # than a synchronous copy.
     V = np.zeros(env.nS)
-    # TODO: loop until convergence:
-    #   delta = 0
-    #   for each state s:
-    #       v_old = V[s]
-    #       V[s]  = policy[s] @ q_from_v(env, V, s, gamma)   # dot over actions
-    #       delta = max(delta, abs(v_old - V[s]))
-    #   break once delta < theta
-    # HINT: this is an "in-place" sweep (reads the freshly-updated V) — that's fine
-    #       and actually converges a touch faster than a synchronous copy.
+    while True:
+        delta = 0.0
+        for s in range(env.nS):
+            v_old = V[s]
+            V[s] = policy[s] @ q_from_v(env, V, s, gamma)
+            delta = max(delta, abs(v_old - V[s]))
+        if delta < theta:
+            break
     return V
 
 
@@ -170,8 +172,9 @@ def policy_improvement(env: GridWorld, V: np.ndarray, gamma: float) -> np.ndarra
     Returns a DETERMINISTIC policy encoded as a one-hot matrix of shape (nS, nA).
     """
     policy = np.zeros((env.nS, env.nA))
-    # TODO: for each state s, pick a* = argmax_a q_from_v(env, V, s, gamma) and set
-    #       policy[s, a*] = 1.0
+    for s in range(env.nS):
+        best_a = int(np.argmax(q_from_v(env, V, s, gamma)))
+        policy[s, best_a] = 1.0
     return policy
 
 
@@ -183,12 +186,12 @@ def policy_iteration(env: GridWorld, gamma: float,
     """
     policy = np.ones((env.nS, env.nA)) / env.nA   # start from uniform-random
     V = np.zeros(env.nS)
-    # TODO: loop:
-    #   V          = policy_evaluation(env, policy, gamma, theta)
-    #   new_policy = policy_improvement(env, V, gamma)
-    #   if the greedy ACTION is unchanged in every state: break       (stable => optimal)
-    #   policy = new_policy
-    # HINT: compare argmax(policy, axis=1) with argmax(new_policy, axis=1).
+    while True:
+        V = policy_evaluation(env, policy, gamma, theta)
+        new_policy = policy_improvement(env, V, gamma)
+        if (np.argmax(policy, axis=1) == np.argmax(new_policy, axis=1)).all():
+            break
+        policy = new_policy
     return policy, V
 
 
@@ -201,15 +204,17 @@ def value_iteration(env: GridWorld, gamma: float,
     Returns (policy, V).
     """
     V = np.zeros(env.nS)
-    # TODO: loop until convergence:
-    #   delta = 0
-    #   for each state s:
-    #       v_old = V[s]
-    #       V[s]  = max over actions of q_from_v(env, V, s, gamma)
-    #       delta = max(delta, abs(v_old - V[s]))
-    #   break once delta < theta
-    # then: policy = policy_improvement(env, V, gamma)
     policy = np.zeros((env.nS, env.nA))
+
+    while True:
+        delta = 0.0
+        for s in range(env.nS):
+            v_old = V[s]
+            V[s] = np.max(q_from_v(env, V, s, gamma))
+            delta = max(delta, abs(v_old - V[s]))
+        if delta < theta:
+            break
+    policy = policy_improvement(env, V, gamma)
     return policy, V
 
 
