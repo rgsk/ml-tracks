@@ -1,371 +1,468 @@
 """
-Value iteration on SIMPLE deterministic gridworlds — watch V propagate step by step.
+WALKTHROUGH: Monte Carlo & TD(0) prediction (exercise 3), built one layer at a time.
 
-Default grid:
+The shift from exercise 2: we LOSE the model. There, the DP algorithms read
+env.P[s][a] — the exact transition probabilities and rewards. A real agent never
+gets that. It can only ACT and OBSERVE: from state s take action a, and the world
+returns ONE sample (s', r) drawn from the hidden p(.|s,a).
 
-    col:   0    1    2    3
-        +----+----+----+----+
- row 0  | .  | .  | .  | +1 |
-        +----+----+----+----+
- row 1  | .  | #  | .  |  . |
-        +----+----+----+----+
- row 2  | .  | .  | .  | .  |
-        +----+----+----+----+
+So everything here is built on a stream of samples instead of a known model. We
+build it up in layers (run each, watch the output):
 
-Rules (kept deliberately minimal so the value updates are obvious):
-  - Deterministic: the intended action ALWAYS works (no slip).
-  - Reward depends on where you LAND: goal_reward into the goal, else step_reward.
-  - The goal is terminal/absorbing: once there you stop (V = 0 there).
-  - Bumping a wall or the edge leaves you in place.
+  1. the experience stream — a gym-like Sampler (reset/step), and the punchline
+     that makes model-free learning possible: enough samples ARE the model.
+  2. generate_episode — roll a whole trajectory under a policy.
+  3. returns G_t — turn a trajectory into the numbers we average (Monte Carlo).
+  4. mc_prediction — first-visit MC; watch V converge to the truth.
+  5. td0_prediction — the bootstrap; the TD error; online learning.
+  6. MC vs TD — the bias/variance payoff, side by side.
 
-    Bellman optimality backup:  V(s) <- max_a [ r(s,a,s') + gamma * V(s') ]
+Ground truth for grading comes from exercise 2's exact linear solve.
 """
 
 import argparse
 import contextlib
+import importlib.util
+import pathlib
 import sys
-from dataclasses import dataclass, field
 
-GAMMA = 0.9
+import numpy as np
 
-UP, RIGHT, DOWN, LEFT = (-1, 0), (0, 1), (1, 0), (0, -1)
-ACTIONS = [UP, RIGHT, DOWN, LEFT]
-ARROWS = {UP: "↑", RIGHT: "→", DOWN: "↓", LEFT: "←"}
-
-
-@dataclass(frozen=True)
-class Grid:
-    rows: int
-    cols: int
-    goal: tuple
-    walls: frozenset = field(default_factory=frozenset)
+# Reuse exercise 2's gridworld (the MDP model) + its exact ground-truth solver.
+# (Module name starts with a digit, so load it by path rather than `import`.)
+_spec = importlib.util.spec_from_file_location(
+    "mdp_dp", pathlib.Path(__file__).with_name("02_mdp_dp.py"))
+mdp_dp = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(mdp_dp)
+GridWorld = mdp_dp.GridWorld
+_ARROWS = mdp_dp._ARROWS
 
 
-DEFAULT = Grid(rows=3, cols=4, goal=(0, 3), walls=frozenset({(1, 1)}))
-
-# A bigger grid with a 2-cell pocket (P) fully sealed by walls (#): the agent can
-# wander between the two P cells but can NEVER reach the +1 goal from there.
+# ---------------------------------------------------------------------------
+# LAYER 1: the experience stream.
 #
-#     . . . . . +1
-#     . . . . . .
-#     . . # # . .
-#     . # P P # .
-#     . . # # . .
-SEALED = Grid(
-    rows=5, cols=6, goal=(0, 5),
-    walls=frozenset({(2, 2), (2, 3), (4, 2), (4, 3), (3, 1), (3, 4)}),
-)
-POCKET = {(3, 2), (3, 3)}        # the unreachable cells, for annotation only
+# The Sampler wraps the MDP and exposes ONLY reset()/step(a). Internally it draws
+# from env.P — but the learning algorithms never get to peek at P, they just see
+# the (s', r) that comes back. That keyhole is the entire premise of model-free RL.
+# ---------------------------------------------------------------------------
 
+class Sampler:
+    """Gym-like view of the MDP: reset() to a start state, step(a) for one sample."""
 
-def step(grid, cell, action, step_reward=0.0, goal_reward=1.0):
-    """Deterministic transition. Returns (next_cell, reward).
+    def __init__(self, env, rng):
+        self.env = env
+        self.rng = rng
+        self._nonterminal = [s for s, cell in enumerate(env.states)
+                             if cell not in env.terminals]
+        self.s = None
 
-    Reward depends on where you LAND: `goal_reward` for entering the goal,
-    otherwise `step_reward`. Walls/edges => stay put.
-    """
-    r, c = cell[0] + action[0], cell[1] + action[1]
-    nxt = (r, c)
-    if not (0 <= r < grid.rows and 0 <= c < grid.cols) or nxt in grid.walls:
-        nxt = cell                       # bumped a wall/edge: stay
-    reward = goal_reward if nxt == grid.goal else step_reward
-    return nxt, reward
+    def reset(self):
+        """Exploring start: begin at a uniformly random NON-terminal state, so every
+        state eventually gets sampled (a fixed start + fixed policy would only ever
+        trace one path)."""
+        self.s = int(self.rng.choice(self._nonterminal))
+        return self.s
 
+    def step(self, a):
+        """One sampled transition from the current state. Returns (s', r, done).
 
-def is_terminal(grid, cell):
-    return cell == grid.goal
-
-
-def cells(grid):
-    """All non-wall cells (the states)."""
-    return [(r, c) for r in range(grid.rows) for c in range(grid.cols)
-            if (r, c) not in grid.walls]
-
-
-def show(grid, V, title):
-    """Pretty-print the value function laid out on the grid."""
-    print(title)
-    for r in range(grid.rows):
-        row = []
-        for c in range(grid.cols):
-            if (r, c) in grid.walls:
-                row.append("   ##  ")
-            else:
-                row.append(f"{V[(r, c)]:+6.2f} ")
-        print(" ".join(row))
-    print()
-
-
-def show_policy(grid, V, step_reward, goal_reward, gamma=GAMMA):
-    """Read the greedy action off V: in each cell point to the best neighbor."""
-    print("greedy policy (argmax_a [r + gamma*V(s')]):")
-    for r in range(grid.rows):
-        row = []
-        for c in range(grid.cols):
-            cell = (r, c)
-            if cell in grid.walls:
-                row.append("#")
-            elif is_terminal(grid, cell):
-                row.append("+1")
-            else:
-                def q(a, cell=cell):
-                    nxt, reward = step(grid, cell, a, step_reward, goal_reward)
-                    return reward + gamma * V[nxt]
-                best_a = max(ACTIONS, key=q)
-                row.append(ARROWS[best_a])
-        print("  ".join(f"{x:>2}" for x in row))
-    print()
-
-
-def render_policy(grid, policy, title="policy:"):
-    """Draw arrows: the most-likely action in each cell (argmax of pi(.|s)).
-
-    `policy` is stochastic: {cell: {action: prob}}.
-    """
-    print(title)
-    for r in range(grid.rows):
-        row = []
-        for c in range(grid.cols):
-            cell = (r, c)
-            if cell in grid.walls:
-                row.append("#")
-            elif is_terminal(grid, cell):
-                row.append("+1")
-            else:
-                row.append(ARROWS[max(policy[cell], key=policy[cell].get)])
-        print("  ".join(f"{x:>2}" for x in row))
-    print()
-
-
-def value_iteration(grid=DEFAULT, step_reward=0.0, goal_reward=1.0, gamma=GAMMA,
-                    theta=1e-6, v_init=0.0, max_iters=1000, verbose=True):
-    # Non-terminal cells start at v_init; the GOAL is pinned at 0 (it's absorbing
-    # — its true value really IS 0, a boundary condition, not a guess).
-    V = {cell: (0.0 if is_terminal(grid, cell) else v_init) for cell in cells(grid)}
-    if verbose:
-        show(grid, V, f"iter 0 (initial V = {v_init} on non-terminals, 0 at goal):")
-
-    for it in range(1, max_iters + 1):
-        newV = dict(V)                   # synchronous: backups read the OLD V
-        delta = 0.0
-        for cell in cells(grid):
-            if is_terminal(grid, cell):
-                continue                 # terminal value pinned at 0
-            q = []
-            for a in ACTIONS:
-                nxt, reward = step(grid, cell, a, step_reward, goal_reward)
-                q.append(reward + gamma * V[nxt])
-            best = max(q)
-            newV[cell] = best
-            delta = max(delta, abs(best - V[cell]))
-        V = newV
-        if verbose:
-            show(grid, V, f"iter {it}  (max change this sweep = {delta:.4f}):")
-        if delta < theta:
-            print(f"converged after {it} sweeps (delta {delta:.2e} < {theta}).\n")
-            break
-    else:
-        print(f"did NOT converge in {max_iters} sweeps "
-              f"(delta still {delta:.4f} — diverging on unreachable cells).\n")
-
-    show_policy(grid, V, step_reward, goal_reward, gamma)
-    return V
-
-
-def policy_evaluation(grid, policy, step_reward, goal_reward, gamma,
-                      theta=1e-6, max_iters=1000):
-    """Compute V^pi for a (possibly STOCHASTIC) policy {cell: {action: prob}} by
-    sweeping the EXPECTATION backup until V settles:
-
-        V(s) <- sum_a pi(a|s) [ r(s,a) + gamma * V(s') ]
-    """
-    V = {cell: 0.0 for cell in cells(grid)}
-    for _ in range(max_iters):
-        newV = dict(V)                # synchronous: backups read the OLD V
-        delta = 0.0
-        for cell in cells(grid):
-            if is_terminal(grid, cell):
-                continue
-            v_new = 0.0
-            for a, prob in policy[cell].items():
-                nxt, reward = step(grid, cell, a, step_reward, goal_reward)
-                v_new += prob * (reward + gamma * V[nxt])
-            delta = max(delta, abs(v_new - V[cell]))
-            newV[cell] = v_new
-        V = newV
-        if delta < theta:
-            break
-    return V
-
-
-def greedy_policy(grid, V, step_reward, goal_reward, gamma):
-    """One-step-lookahead improvement: deterministic policy {cell: {best_a: 1.0}}."""
-    policy = {}
-    for cell in cells(grid):
-        if is_terminal(grid, cell):
-            continue
-
-        def q(a, cell=cell):
-            nxt, reward = step(grid, cell, a, step_reward, goal_reward)
-            return reward + gamma * V[nxt]
-        policy[cell] = {max(ACTIONS, key=q): 1.0}
-    return policy
-
-
-def _greedy_actions(policy):
-    """argmax action per cell — for comparing policies / rendering."""
-    return {c: max(d, key=d.get) for c, d in policy.items()}
-
-
-def policy_iteration(grid=DEFAULT, step_reward=0.0, goal_reward=1.0, gamma=GAMMA,
-                     theta=1e-6, max_iters=1000, start="up", verbose=True):
-    """Alternate EVALUATE (V^pi) and IMPROVE (greedy) until the policy stops
-    changing. Provably converges to pi* — usually in very few outer rounds.
-
-    `start` sets the initial policy:
-        "up"      -> deterministic all-UP (deliberately suboptimal; round-1 V^pi
-                     is all zeros since no cell ever reaches the goal).
-        "uniform" -> uniform random (0.25 each); round-1 V^pi is the RANDOM-WALK
-                     value (nonzero everywhere) — a richer signal that usually
-                     converges in fewer rounds.
-    """
-    nonterm = [c for c in cells(grid) if not is_terminal(grid, c)]
-    if start == "uniform":
-        policy = {c: {a: 1.0 / len(ACTIONS) for a in ACTIONS} for c in nonterm}
-    else:
-        policy = {c: {UP: 1.0} for c in nonterm}
-    if verbose:
-        if start == "uniform":
-            print("round 0: initial policy = UNIFORM RANDOM (0.25 each action)\n")
-        else:
-            render_policy(grid, policy, "round 0: initial policy (all UP):")
-
-    V = {}
-    for it in range(1, max_iters + 1):
-        V = policy_evaluation(grid, policy, step_reward, goal_reward, gamma, theta)
-        new_policy = greedy_policy(grid, V, step_reward, goal_reward, gamma)
-        acts, new_acts = _greedy_actions(policy), _greedy_actions(new_policy)
-        changed = sum(new_acts[c] != acts[c] for c in new_acts)
-        if verbose:
-            show(grid, V, f"round {it}: V^pi for the current policy")
-            render_policy(grid, new_policy,
-                          f"round {it}: improved (greedy) policy "
-                          f"[{changed} action(s) changed]:")
-        if changed == 0:
-            print(f"policy stable after {it} round(s) — optimal pi*.\n")
-            break
-        policy = new_policy
-    return policy, V
+        The ENV rolls its OWN dice — which action actually fires after the slip —
+        then applies deterministic movement. It never builds a probability table;
+        the agent just sees the single (s', r) that falls out. (Reuses the same
+        _move + noise that exercise 2's model was built from, so the sampled
+        dynamics match env.P exactly — by construction, not by luck.)
+        """
+        env = self.env
+        cell = env.states[self.s]
+        # slip: intended action w.p. 1-noise, each perpendicular w.p. noise/2.
+        actual = int(self.rng.choice([a, (a + 1) % 4, (a - 1) % 4],
+                                     p=[1 - env.noise, env.noise / 2, env.noise / 2]))
+        nxt = env._move(cell, actual)            # wall/edge bounce lives in _move
+        reward = env.terminals.get(nxt, env.step_reward)
+        done = nxt in env.terminals
+        self.s = env.s2i[nxt]
+        return self.s, reward, done
 
 
 def _banner(*lines):
-    print("=" * 60)
+    print("=" * 64)
     for line in lines:
         print(line)
-    print("=" * 60)
+    print("=" * 64)
 
 
-def value_iteration_experiments():
-    def exp_a():
-        _banner("VARIATION A: +1 for reaching goal, 0 per step")
-        value_iteration(step_reward=0.0, goal_reward=1.0)
+def exp_samples_are_the_model(cell=(2, 0), action=mdp_dp.UP, n=20000, seed=0):
+    """Take action `a` from one state `n` times; tally where we land + mean reward,
+    and compare to the model env.P[s][a]. They must agree — counting recovers the
+    probabilities DP simply read off. THIS is why model-free prediction can work.
+    """
+    env = GridWorld()
+    rng = np.random.default_rng(seed)
+    sampler = Sampler(env, rng)
+    s = env.s2i[cell]
 
-    def exp_b():
-        _banner("VARIATION B: -1 per step, 0 for reaching goal")
-        value_iteration(step_reward=-1.0, goal_reward=0.0)
+    _banner(f"LAYER 1: samples ARE the model    "
+            f"(from {cell}, action {_ARROWS[action]}, n={n})")
 
-    def exp_b_init50():
-        _banner("VARIATION B', SAME but V initialized at -50 (still converges to V*)")
-        value_iteration(step_reward=-1.0, goal_reward=0.0, v_init=-50.0)
+    # --- the model (what exercise 2 would just read) ---
+    print("MODEL  env.P[s][a]  (prob | next cell | reward):")
+    model_p = {}
+    model_rbar = 0.0
+    for (p, ns, r, _done) in env.P[s][action]:
+        model_p[ns] = p
+        model_rbar += p * r
+        print(f"   {p:5.2f}  ->  {env.states[ns]!s:7}  r={r:+.2f}")
+    print(f"   expected immediate reward E[r] = {model_rbar:+.4f}\n")
 
-    def exp_a_gamma1():
-        _banner("VARIATION A @ gamma=1: +1 goal, 0 step, NO discount",
-                "  -> dawdling is free; V=1 everywhere, policy degenerates")
-        value_iteration(step_reward=0.0, goal_reward=1.0, gamma=1.0)
-
-    def exp_b_gamma1():
-        _banner("VARIATION B @ gamma=1: -1 step, 0 goal, NO discount",
-                "  -> step cost still forces shortest path; V = -(steps to goal)")
-        value_iteration(step_reward=-1.0, goal_reward=0.0, gamma=1.0)
-
-    def exp_b_init50_gamma1():
-        _banner("VARIATION B' @ gamma=1: same, V init -50, NO discount",
-                "  -> even with gamma=1 (no contraction) the goal anchor still",
-                "     locks the true values one ring per sweep")
-        value_iteration(step_reward=-1.0, goal_reward=0.0, gamma=1.0, v_init=-50.0)
-
-    def exp_sealed_gamma09():
-        _banner("SEALED POCKET @ gamma=0.9: trapped cells converge to -10")
-        value_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=0.9)
-
-    def exp_sealed_gamma09_init50():
-        _banner("SEALED POCKET @ gamma=0.9, V init -50: pocket still settles to -10",
-                "  -> init -50 is BELOW the trapped value, so the pocket climbs UP to -10")
-        value_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=0.9,
-                        v_init=-50.0)
-
-    def exp_sealed_gamma1():
-        _banner("SEALED POCKET @ gamma=1.0: trapped cells DIVERGE (never converge)",
-                "  (capped at 8 sweeps so we can watch -1 pile up)")
-        value_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=1.0,
-                        max_iters=15)
-
-    def exp_sealed_gamma1_init50():
-        _banner("SEALED POCKET @ gamma=1.0, V init -50: pocket DIVERGES from -50 down",
-                "  -> no fixed point at gamma=1; reachable cells still converge",
-                "  (capped at 8 sweeps)")
-        value_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=1.0,
-                        v_init=-50.0, max_iters=15)
-
-    # comment/uncomment the experiments you want to run
-    # exp_a()
-    # exp_b()
-    # exp_b_init50()
-    # exp_a_gamma1()
-    # exp_b_gamma1()
-    # exp_b_init50_gamma1()
-    # exp_sealed_gamma09()
-    # exp_sealed_gamma09_init50()
-    # exp_sealed_gamma1()
-    exp_sealed_gamma1_init50()
+    # --- the samples (all the agent is actually allowed to see) ---
+    counts = np.zeros(env.nS)
+    rsum = 0.0
+    for _ in range(n):
+        sampler.s = s                       # force the same start each draw
+        ns, r, _done = sampler.step(action)
+        counts[ns] += 1
+        rsum += r
+    print("SAMPLES  empirical frequency over n draws:")
+    for ns in sorted(model_p, key=lambda x: -model_p[x]):
+        freq = counts[ns] / n
+        print(f"   {freq:5.2f}  ->  {env.states[ns]!s:7}   "
+              f"(model {model_p[ns]:.2f}, off by {abs(freq - model_p[ns]):.3f})")
+    print(f"   sample mean reward = {rsum / n:+.4f}  "
+          f"(model {model_rbar:+.4f})\n")
 
 
-def policy_iteration_experiments():
-    def exp_a():
-        _banner("POLICY ITERATION, VARIATION A: +1 goal, 0 step",
-                "  -> evaluate V^pi, act greedily, repeat; converges to pi* fast")
-        policy_iteration(step_reward=0.0, goal_reward=1.0)
+# ---------------------------------------------------------------------------
+# LAYER 2: generate_episode — roll a FULL trajectory under a policy.
+#
+# reset(), then repeatedly: pick a ~ pi(.|s), step it, record the transition, until
+# done. This is the unit MC and TD both consume. Two rollouts of the same policy can
+# differ (action sampling + slip are both random).
+# ---------------------------------------------------------------------------
 
-    def exp_b():
-        _banner("POLICY ITERATION, VARIATION B: -1 step, 0 goal")
-        policy_iteration(step_reward=-1.0, goal_reward=0.0)
+def generate_episode(sampler, policy, rng, max_steps=1000):
+    """Roll ONE episode following `policy` (stochastic matrix (nS, nA)).
+    Returns the experience as a list of transitions [(s, r, s_next, done), ...]."""
+    episode = []
+    s = sampler.reset()
+    for _ in range(max_steps):
+        a = int(rng.choice(sampler.env.nA, p=policy[s]))
+        ns, r, done = sampler.step(a)
+        episode.append((s, r, ns, done))
+        s = ns
+        if done:
+            break
+    return episode
 
-    def exp_sealed():
-        _banner("POLICY ITERATION, SEALED POCKET @ gamma=0.9",
-                "  -> reachable cells find pi*; pocket settles to the -10 trap")
-        policy_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=0.9)
 
-    def exp_a_uniform():
-        _banner("POLICY ITERATION A from UNIFORM-RANDOM start (0.25 each action)",
-                "  -> round-1 V^pi is the RANDOM-WALK value (not zeros);",
-                "     richer signal => converges in fewer rounds than all-UP")
-        policy_iteration(step_reward=0.0, goal_reward=1.0, start="uniform")
+def _greedy_arrows(env, policy):
+    """argmax action arrow per state, for showing what policy we're rolling under."""
+    return {s: _ARROWS[int(np.argmax(policy[s]))] for s in range(env.nS)}
 
-    # comment/uncomment the experiments you want to run
-    exp_a()
-    # exp_b()
-    # exp_sealed()
-    exp_a_uniform()
+
+def exp_one_episode(num_episodes=4, seed=1):
+    """Roll a few episodes under the OPTIMAL policy and print each as a path of
+    cells with the reward collected on each move. Watch lengths/paths vary."""
+    env = GridWorld()
+    rng = np.random.default_rng(seed)
+    sampler = Sampler(env, rng)
+    opt_policy, _ = mdp_dp.value_iteration(env, env.gamma)
+    arrows = _greedy_arrows(env, opt_policy)
+
+    _banner(f"LAYER 2: generate_episode under the OPTIMAL policy "
+            f"({num_episodes} rollouts)")
+    for k in range(num_episodes):
+        ep = generate_episode(sampler, opt_policy, rng)
+        start = env.states[ep[0][0]]
+        total = sum(r for (_s, r, _ns, _d) in ep)
+        # render the path: start cell, then each (intended action) -> landing cell
+        parts = [f"{start}"]
+        for (s, r, ns, _d) in ep:
+            parts.append(f" --{arrows[s]}{r:+.2f}--> {env.states[ns]}")
+        print(f"ep {k}:  len={len(ep):2d}  return(undiscounted)={total:+.2f}")
+        print("   " + "".join(parts) + "\n")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 3: returns G_t — turn a trajectory into the numbers MC averages.
+#
+# G_t = r_{t+1} + gamma*r_{t+2} + ... ; computed in ONE backward sweep:
+#   G = 0; for t = T-1..0:  G = r_{t+1} + gamma*G    (this G is G_t)
+# ---------------------------------------------------------------------------
+
+def returns_from_episode(episode, gamma):
+    """Discounted return G_t for every step, via one O(T) backward sweep.
+    Returns a list aligned with `episode`: returns[t] is the return of state s_t."""
+    G = 0.0
+    out = [0.0] * len(episode)
+    for t in range(len(episode) - 1, -1, -1):
+        r = episode[t][1]
+        G = r + gamma * G
+        out[t] = G
+    return out
+
+
+def exp_returns(seed=1):
+    """Print one episode with its per-step return G_t, and verify the backward
+    sweep equals the brute-force forward discounted sum."""
+    env = GridWorld()
+    gamma = env.gamma
+    rng = np.random.default_rng(seed)
+    sampler = Sampler(env, rng)
+    opt_policy, _ = mdp_dp.value_iteration(env, gamma)
+
+    # roll a handful, show the LONGEST so the backward sweep spans several steps.
+    ep = max((generate_episode(sampler, opt_policy, rng) for _ in range(8)),
+             key=len)
+    G = returns_from_episode(ep, gamma)
+
+    _banner(f"LAYER 3: returns G_t  (gamma={gamma}, episode len {len(ep)})")
+    print(" t | s_t    r_{t+1} |   G_t  (= r + gamma*G_{t+1})")
+    print("---+----------------+------------------------------")
+    for t, (s, r, _ns, _d) in enumerate(ep):
+        print(f"{t:2d} | {str(env.states[s]):6} {r:+.2f}  | {G[t]:+.4f}")
+
+    # cross-check: brute-force forward sum for t=0 must match the backward sweep.
+    rewards = [r for (_s, r, _ns, _d) in ep]
+    G0_brute = sum(gamma ** k * rewards[k] for k in range(len(rewards)))
+    print(f"\nbackward G_0 = {G[0]:+.6f}   forward-sum G_0 = {G0_brute:+.6f}   "
+          f"match={np.isclose(G[0], G0_brute)}")
+    print("note: earlier states have SMALLER G (more -0.04 tolls + more discount "
+          "before the +1).")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 4: mc_prediction — average first-visit returns over many episodes.
+#   V(s) = mean of the G_t observed on the FIRST visit to s, across episodes.
+# ---------------------------------------------------------------------------
+
+def mc_prediction(env, sampler, policy, gamma, num_episodes, rng):
+    """First-visit Monte Carlo estimate of V^pi."""
+    returns_sum = np.zeros(env.nS)
+    returns_cnt = np.zeros(env.nS)
+    for _ in range(num_episodes):
+        ep = generate_episode(sampler, policy, rng)
+        G = returns_from_episode(ep, gamma)
+        seen = set()
+        for t, (s, _r, _ns, _d) in enumerate(ep):
+            if s not in seen:                # first visit only
+                seen.add(s)
+                returns_sum[s] += G[t]
+                returns_cnt[s] += 1
+    V = np.zeros(env.nS)
+    nz = returns_cnt > 0
+    V[nz] = returns_sum[nz] / returns_cnt[nz]
+    return V
+
+
+def _rms(V_hat, V_true, states):
+    d = V_hat[states] - V_true[states]
+    return float(np.sqrt(np.mean(d ** 2)))
+
+
+def _show_two(env, V_a, V_b, label_a, label_b):
+    """Print two value functions on the grid, side by side, for eyeballing."""
+    def grid_lines(V):
+        rows = []
+        for r in range(env.rows):
+            cells = []
+            for c in range(env.cols):
+                if (r, c) in env.walls:
+                    cells.append("  #  ")
+                else:
+                    cells.append(f"{V[env.s2i[(r, c)]]:+.2f}")
+            rows.append(" ".join(cells))
+        return rows
+    A, B = grid_lines(V_a), grid_lines(V_b)
+    print(f"{label_a:<26}   {label_b}")
+    for la, lb in zip(A, B):
+        print(f"{la:<26}   {lb}")
+
+
+def exp_mc_prediction(seed=0):
+    """Run first-visit MC, checkpointing RMS error vs the exact V^pi as episodes
+    accumulate, then show the final estimate next to the ground truth."""
+    env = GridWorld()
+    gamma = env.gamma
+    rng = np.random.default_rng(seed)
+    sampler = Sampler(env, rng)
+    opt_policy, _ = mdp_dp.value_iteration(env, gamma)
+    V_true = mdp_dp.analytic_policy_value(env, opt_policy, gamma)
+    nonterm = sampler._nonterminal
+
+    _banner("LAYER 4: first-visit MC prediction (V^pi of the optimal policy)")
+    print("episodes |  RMS error vs exact V^pi")
+    print("---------+--------------------------")
+    checkpoints = [100, 500, 2000, 10000, 50000]
+    prev = 0
+    returns_sum = np.zeros(env.nS)
+    returns_cnt = np.zeros(env.nS)
+    V = np.zeros(env.nS)
+    for cp in checkpoints:
+        for _ in range(cp - prev):           # extend, reusing accumulated counts
+            ep = generate_episode(sampler, opt_policy, rng)
+            G = returns_from_episode(ep, gamma)
+            seen = set()
+            for t, (s, _r, _ns, _d) in enumerate(ep):
+                if s not in seen:
+                    seen.add(s)
+                    returns_sum[s] += G[t]
+                    returns_cnt[s] += 1
+        prev = cp
+        nz = returns_cnt > 0
+        V[nz] = returns_sum[nz] / returns_cnt[nz]
+        print(f"{cp:8d} |  {_rms(V, V_true, nonterm):.4f}")
+
+    print()
+    _show_two(env, V_true, V, "exact V^pi (linear solve)", "MC estimate (50k eps)")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 5: td0_prediction — bootstrap; update EVERY step, no episode-end wait.
+#   target = r + gamma * V(s') * (1 - done)        # one reward + a GUESS
+#   V(s)  += alpha * (target - V(s))               # nudge by the TD error
+# ---------------------------------------------------------------------------
+
+def td0_prediction(env, sampler, policy, gamma, num_episodes, alpha, rng):
+    """TD(0) estimate of V^pi with constant step size alpha."""
+    V = np.zeros(env.nS)
+    for _ in range(num_episodes):
+        for (s, r, ns, done) in generate_episode(sampler, policy, rng):
+            target = r + gamma * V[ns] * (1.0 - done)   # no bootstrap past the end
+            V[s] += alpha * (target - V[s])
+    return V
+
+
+def exp_td_prediction(seed=0, alpha=0.05):
+    """TD(0) with the SAME checkpoints as MC, so you can compare convergence and
+    see the constant-alpha noise floor (it hovers, never fully lands)."""
+    env = GridWorld()
+    gamma = env.gamma
+    rng = np.random.default_rng(seed)
+    sampler = Sampler(env, rng)
+    opt_policy, _ = mdp_dp.value_iteration(env, gamma)
+    V_true = mdp_dp.analytic_policy_value(env, opt_policy, gamma)
+    nonterm = sampler._nonterminal
+
+    _banner(f"LAYER 5: TD(0) prediction (alpha={alpha})")
+    print("episodes |  RMS error vs exact V^pi")
+    print("---------+--------------------------")
+    checkpoints = [100, 500, 2000, 10000, 50000]
+    prev = 0
+    V = np.zeros(env.nS)
+    for cp in checkpoints:
+        for _ in range(cp - prev):
+            for (s, r, ns, done) in generate_episode(sampler, opt_policy, rng):
+                V[s] += alpha * (r + gamma * V[ns] * (1.0 - done) - V[s])
+        prev = cp
+        print(f"{cp:8d} |  {_rms(V, V_true, nonterm):.4f}")
+
+    print()
+    _show_two(env, V_true, V, "exact V^pi (linear solve)", "TD(0) estimate (50k eps)")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 6: MC vs TD head-to-head.
+#   A) bias/variance over many seeds (mean +/- std of RMS).
+#   B) the batch A/B example — same data, different fixed points; TD = the
+#      certainty-equivalence (max-likelihood-MDP) estimate, MC = training-set fit.
+# ---------------------------------------------------------------------------
+
+def exp_mc_vs_td(seeds=12, alpha=0.05):
+    """Run BOTH methods for several episode budgets across many seeds; report mean
+    and std of RMS vs the exact V^pi. TD: lower variance early; MC: lower bias
+    (its constant-alpha-free 1/N average keeps shrinking, TD hits a noise floor)."""
+    env = GridWorld()
+    gamma = env.gamma
+    opt_policy, _ = mdp_dp.value_iteration(env, gamma)
+    V_true = mdp_dp.analytic_policy_value(env, opt_policy, gamma)
+
+    _banner(f"LAYER 6A: MC vs TD(0) bias/variance  ({seeds} seeds, alpha={alpha})")
+    print("episodes |     MC  mean+/-std    |     TD  mean+/-std")
+    print("---------+-----------------------+----------------------")
+    for n in (200, 1000, 5000, 25000):
+        mc_errs, td_errs = [], []
+        for seed in range(seeds):
+            rng = np.random.default_rng(seed)
+            samp = Sampler(env, rng)
+            nt = samp._nonterminal
+            mc_errs.append(_rms(mc_prediction(env, samp, opt_policy, gamma, n, rng),
+                                V_true, nt))
+            rng = np.random.default_rng(seed)         # same episodes for TD
+            samp = Sampler(env, rng)
+            td_errs.append(_rms(td0_prediction(env, samp, opt_policy, gamma, n,
+                                               alpha, rng), V_true, nt))
+        print(f"{n:8d} |  {np.mean(mc_errs):.4f} +/- {np.std(mc_errs):.4f}   "
+              f"|  {np.mean(td_errs):.4f} +/- {np.std(td_errs):.4f}")
+
+
+# The classic A/B batch (Sutton & Barto, Example 6.4). gamma = 1, two states A,B.
+# States: A=0, B=1; terminal flagged by done. Eight episodes:
+#   1x   A -(0)-> B -(0)-> end
+#   6x   B -(1)-> end
+#   1x   B -(0)-> end
+A, B = 0, 1
+_AB_EPISODES = (
+    [[(A, 0.0, B, False), (B, 0.0, -1, True)]]
+    + [[(B, 1.0, -1, True)]] * 6
+    + [[(B, 0.0, -1, True)]]
+)
+
+
+def batch_mc(episodes, gamma=1.0):
+    """Batch (every-visit) MC fixed point: V(s) = mean observed return from s."""
+    rsum, rcnt = {}, {}
+    for ep in episodes:
+        G = 0.0
+        for t in range(len(ep) - 1, -1, -1):
+            s, r = ep[t][0], ep[t][1]
+            G = r + gamma * G
+            rsum[s] = rsum.get(s, 0.0) + G
+            rcnt[s] = rcnt.get(s, 0) + 1
+    return {s: rsum[s] / rcnt[s] for s in rsum}
+
+
+def batch_td(episodes, gamma=1.0, alpha=0.01, sweeps=20000):
+    """Batch TD(0) fixed point: present all transitions repeatedly until V stops
+    moving. Converges to the value of the MAXIMUM-LIKELIHOOD MDP built from the
+    data (certainty equivalence)."""
+    V = {A: 0.0, B: 0.0}
+    for _ in range(sweeps):
+        for ep in episodes:
+            for (s, r, ns, done) in ep:
+                target = r + gamma * (0.0 if done else V[ns])
+                V[s] += alpha * (target - V[s])
+    return V
+
+
+def exp_batch_ab():
+    """Same 8 episodes, two fixed points: MC says V(A)=0 (its one episode returned
+    0); TD says V(A)=0.75 (A always leads to B, and V(B)=0.75)."""
+    _banner("LAYER 6B: batch A/B — TD is 'right', MC fits the training returns")
+    vmc = batch_mc(_AB_EPISODES)
+    vtd = batch_td(_AB_EPISODES)
+    print("       V(A)     V(B)")
+    print(f"MC :  {vmc[A]:+.3f}   {vmc[B]:+.3f}     <- mean return seen from each state")
+    print(f"TD :  {vtd[A]:+.3f}   {vtd[B]:+.3f}     <- value of the implied (ML) MDP")
+    print("\nBoth agree V(B)=0.75 (6 of 8 B-episodes paid 1). They split on A:")
+    print("  MC: the ONE episode through A returned 0  => V(A)=0.")
+    print("  TD: A -> B in 100% of data, and V(B)=0.75 => V(A)=0+0.75=0.75.")
+    print("  TD's is the certainty-equivalence estimate (build the empirical MDP,")
+    print("  solve it) — it generalizes; MC just minimizes error on observed returns.")
 
 
 def run_experiments():
-    # value_iteration_experiments()
-    policy_iteration_experiments()
+    # exp_samples_are_the_model()
+    # exp_one_episode()
+    # exp_returns()
+    # exp_mc_prediction()
+    # exp_td_prediction()
+    exp_mc_vs_td()
+    exp_batch_ab()
 
 
 @contextlib.contextmanager
 def _tee(path):
-    """Print to BOTH the terminal and `path` (so long runs aren't lost to scrollback)."""
+    """Print to BOTH the terminal and `path` (long runs survive scrollback)."""
     class _Tee:
         def __init__(self, *streams):
             self.streams = streams
@@ -387,7 +484,7 @@ def _tee(path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", metavar="FILE",
-                        help="also write all output to FILE (full run, no scrollback limit)")
+                        help="also write all output to FILE")
     args = parser.parse_args()
 
     if args.out:
