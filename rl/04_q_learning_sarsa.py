@@ -121,9 +121,10 @@ def epsilon_greedy(Q: np.ndarray, s: int, eps: float,
 
     Returns an int action in [0, nA).
     """
-    # TODO: implement ε-greedy with random tie-breaking on the greedy branch.
-    # Hint: np.flatnonzero(q == q.max()) gives all argmax indices to choose among.
-    raise NotImplementedError
+    if rng.random() < eps:
+        return int(rng.integers(nA))
+    q = Q[s]
+    return int(rng.choice(np.flatnonzero(q == q.max())))
 
 
 def sarsa(env, gamma: float, num_episodes: int, alpha: float,
@@ -144,8 +145,20 @@ def sarsa(env, gamma: float, num_episodes: int, alpha: float,
     Note a' is chosen ONCE and reused as next step's a — that's what makes SARSA
     on-policy (it learns the value of the policy it actually follows). Returns Q (nS,nA).
     """
-    # TODO: implement the SARSA control loop with linear ε decay.
-    raise NotImplementedError
+    Q = np.zeros((env.nS, env.nA))
+    for ep in range(num_episodes):
+        eps = max(eps_min, eps0 * (1 - ep / num_episodes))   # linear ε anneal
+        s = env.reset()
+        a = epsilon_greedy(Q, s, eps, rng, env.nA)
+        for _ in range(1000):
+            ns, r, done = env.step(a)
+            na = epsilon_greedy(Q, ns, eps, rng, env.nA)      # the second A in SARSA
+            target = r + gamma * Q[ns, na] * (1.0 - done)     # bootstrap off a'
+            Q[s, a] += alpha * (target - Q[s, a])
+            s, a = ns, na                                     # reuse a' as next a
+            if done:
+                break
+    return Q
 
 
 def q_learning(env, gamma: float, num_episodes: int, alpha: float,
@@ -165,8 +178,19 @@ def q_learning(env, gamma: float, num_episodes: int, alpha: float,
     The max (vs SARSA's Q[s',a']) is the only line that differs — and it's the whole
     on/off-policy story. Returns Q (nS, nA).
     """
-    # TODO: implement the Q-learning control loop with linear ε decay.
-    raise NotImplementedError
+    Q = np.zeros((env.nS, env.nA))
+    for ep in range(num_episodes):
+        eps = max(eps_min, eps0 * (1 - ep / num_episodes))
+        s = env.reset()
+        for _ in range(1000):
+            a = epsilon_greedy(Q, s, eps, rng, env.nA)        # behave ε-greedily
+            ns, r, done = env.step(a)
+            target = r + gamma * Q[ns].max() * (1.0 - done)   # ...but TARGET the max
+            Q[s, a] += alpha * (target - Q[s, a])
+            s = ns
+            if done:
+                break
+    return Q
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +345,7 @@ if __name__ == "__main__":
     print("both greedy policies walk start → +1 goal ✅")
 
     print("\noptimal policy (value iteration):")
-    print(render_policy(env, np.eye(env.nA)[vi_pol.argmax(1)]))
+    print(render_policy(env, vi_pol))
     print("\nQ-learning greedy policy:")
     print(render_policy(env, Qq))
     print("\nSARSA greedy policy:")
