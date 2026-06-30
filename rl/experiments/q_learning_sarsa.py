@@ -570,6 +570,63 @@ def exp_cliff(seed=0, num_episodes=500, alpha=0.5, eps=0.1):
     print("  same ε — the only difference is max vs Q[s',a'].")
 
 
+def exp_cliff_dissect(seed=0, num_episodes=500, alpha=0.5, eps=0.1):
+    """Zoom into WHY the two cliff policies differ — the per-action Q at the edge.
+    Q-learning's max assumes a perfect next move, so an edge cell's value is the EXACT
+    optimal cost (-distance), exploration-blind. SARSA bootstraps off the action it
+    actually samples (a'), so the ε-chance of stepping off gets priced in: 'stay on the
+    edge' accrues a penalty and SARSA flees upward. Same data, only max vs Q[s',a']."""
+    env = Cliff()
+
+    def train(kind):
+        rng = np.random.default_rng(seed)
+        Q = np.zeros((env.nS, env.nA))
+        for _ in range(num_episodes):
+            s = env.reset()
+            a = epsilon_greedy(Q, s, eps, rng, env.nA)
+            for _ in range(2000):
+                if kind == "q":
+                    a = epsilon_greedy(Q, s, eps, rng, env.nA)
+                ns, r, done = env.step(a)
+                if kind == "sarsa":
+                    na = epsilon_greedy(Q, ns, eps, rng, env.nA)
+                    Q[s, a] += alpha * (r + Q[ns, na] * (1.0 - done) - Q[s, a])
+                    s, a = ns, na
+                else:
+                    Q[s, a] += alpha * (r + Q[ns].max() * (1.0 - done) - Q[s, a])
+                    s = ns
+                if done:
+                    break
+        return Q
+
+    Qs, Qq = train("sarsa"), train("q")
+
+    def row(Q, rc):
+        s = env._i(rc)
+        return f"{np.round(Q[s], 2)}  greedy={_ARROWS[int(Q[s].argmax())]}"
+
+    _banner("LAYER 5b: dissecting the cliff — edge-cell values & a single Q-row")
+    print("  edge cells (row 2, directly above the cliff): state value max_a Q + greedy")
+    print("   cell  | SARSA   val  act | Q-learn val  act | optimal -dist")
+    print("  -------+------------------+------------------+--------------")
+    for c in range(1, 11):
+        s = env._i((2, c))
+        opt = -(12 - c)                          # (11-c) rights to col 11, then 1 down
+        print(f"  (2,{c:2d}) | {Qs[s].max():7.2f}  {_ARROWS[int(Qs[s].argmax())]}   |"
+              f" {Qq[s].max():7.2f}  {_ARROWS[int(Qq[s].argmax())]}   |     {opt:3d}")
+
+    print("\n  full Q-row [UP, RIGHT, DOWN, LEFT] at edge cell (2,5):")
+    print(f"    SARSA   : {row(Qs, (2, 5))}")
+    print(f"    Q-learn : {row(Qq, (2, 5))}")
+    print("    -> SARSA's RIGHT (stay on the edge) is WORSE than UP/LEFT: edge time = risk.")
+    print("       Q-learning's RIGHT is best (-distance); the max ignores the ε-plunge.\n")
+    print("  one row UP at (1,5), where an exploratory DOWN only costs -1 (lands on edge):")
+    print(f"    SARSA   : {row(Qs, (1, 5))}")
+    print(f"    Q-learn : {row(Qq, (1, 5))}")
+    print("    -> OPPOSITE greedy: Q-learning steps DOWN toward the edge (shortest path),")
+    print("       SARSA climbs UP away from it. Annealing ε->0 would collapse the two.")
+
+
 # ---------------------------------------------------------------------------
 # LAYER 6 (bonus): MAXIMIZATION BIAS — why Q-learning over-values, and the fix.
 #
@@ -659,7 +716,8 @@ def run_experiments():
     # exp_sarsa()
     # exp_qlearning()
     # exp_cliff()
-    exp_max_bias()
+    exp_cliff_dissect()
+    # exp_max_bias()
     # (all six layers built — uncomment any to re-run it)
 
 
