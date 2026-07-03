@@ -21,7 +21,7 @@ Layers (run each `exp_*`, watch the output, then say "next"):
   6. one SFT gradient step — masked loss on a batch, backward, step.
   7. the fine-tune loop — train on the reverse task, watch the loss fall.
   8. before vs after — the payoff: the fine-tuned model reverses held-out strings.
-  9. tokenization decides difficulty — char (~100%) vs BPE (~64%) on the SAME task.
+  9. tokenization decides difficulty — char (100%) vs BPE (~80%) on the SAME task.
 
 This is the SCRATCH file. The real exercise (sft.py) stays untouched so you can
 rebuild it yourself afterwards.
