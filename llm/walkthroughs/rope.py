@@ -30,6 +30,13 @@ Layers (run each `exp_*`, watch the output, then say "next"):
   5. rotate_half — the cheap production formula (x*cos + rotate_half(x)*sin) == the explicit rotation.
   6. RoPESelfAttention — drop it into the real head layout; causal, KV-cache-correct, and NO length cap.
 
+Context extension (layers 7-10): "no length cap" means RoPE RUNS at any length, but a
+model TRAINED at length L still DEGRADES past L. Why, and the three standard fixes:
+  7. the problem — past L the SLOW (long-wavelength) planes rotate into angles never seen in training.
+  8. Position Interpolation (PI) — scale positions by L/L' so every distance maps back into the trained arc.
+  9. NTK-aware — raise the base so slow planes stretch but fast planes keep local resolution (one-line, no fine-tune).
+  10. YaRN — explicit extrapolate-fast / interpolate-slow split + an attention-temperature fix (Llama-3.1/Qwen2).
+
 This is the SCRATCH file; you rebuild a clean rope.py yourself afterwards.
 """
 
@@ -467,7 +474,184 @@ def exp_6_attention(seed=0):
     print("\n  That's RoPE end-to-end: rotate q,k by position so scores depend only on")
     print("  distance (n-m), computed as x*cos + rotate_half(x)*sin, dropped into")
     print("  attention with 0 params, KV-cache-correct, and no length cap.  ✅")
-    print("  Next: rebuild a clean rope.py yourself, then swap it into model.py/attention.py.")
+    print("  Next (layer 7): it RUNS past the trained length, but does it WORK? The")
+    print("  degradation problem + the fixes (PI / NTK-aware / YaRN) that give 128k context.")
+
+
+# ===========================================================================
+# CONTEXT EXTENSION (layers 7-10): "no length cap" (layer 6) means RoPE RUNS at
+# any length — but a model TRAINED at length L still degrades past L, because
+# beyond L the rotations land at angle-combinations it never saw. Layers 7-10 are
+# why, and the three standard fixes. These are pure position/frequency math (no
+# training), so we reason about angles, not sample quality. Maps to advanced_
+# roadmap.md item 2b (Position Interpolation, NTK-aware, YaRN).
+# ===========================================================================
+
+
+# ---------------------------------------------------------------------------
+# LAYER 7: why vanilla RoPE degrades past L — the SLOW planes leave their arc.
+#
+# During training at length L, a query and key are at most L-1 apart, so plane k
+# only ever rotates through relative angles up to ~L*theta_k. The model's weights
+# are tuned ONLY on that arc. What arc is that, per plane?
+#   * FAST planes (short wavelength): L*theta_k >> 2*pi, so they sweep the FULL
+#     circle many times during training -> every angle was seen -> they extrapolate
+#     FINE to any distance.
+#   * SLOW planes (wavelength > L): L*theta_k < 2*pi, so they only ever swept a
+#     small ARC of their circle. At distance > L they rotate PAST that arc into
+#     angles the model never saw -> this is where extrapolation breaks.
+# So the culprit is precisely the low-frequency / long-wavelength planes. The
+# clean criterion (YaRN's): a plane is "safe" iff its wavelength <= L (it completes
+# a full turn within the trained window). That split drives every fix below.
+# ---------------------------------------------------------------------------
+def exp_7_extrapolation_problem(train_len=64, d=64):
+    """For a model trained at context length L, show per plane how much of its
+    rotation circle was seen in training — fast planes see it all (extrapolate
+    fine), slow planes see only a sliver (break past L)."""
+    _banner(f"LAYER 7: past the trained length L={train_len}, the SLOW planes hit unseen angles")
+    theta = rope_frequencies(d)                       # (d/2,)
+    twopi = 2 * math.pi
+
+    print(f"  head_size d = {d} ({d//2} planes), trained context length L = {train_len}\n")
+    print("  plane |   theta_k    | wavelength | turns in L (L/wl) | arc seen | extrapolates?")
+    print("  ------+--------------+------------+-------------------+----------+--------------")
+    for k in [0, d // 8, d // 4, 3 * d // 8, d // 2 - 1]:
+        th = theta[k].item()
+        wl = twopi / th
+        turns = train_len / wl                        # = L*theta/2pi
+        arc = min(train_len * th, twopi)              # radians actually swept (cap 1 turn)
+        ok = "yes (all seen)" if wl <= train_len else "NO (unseen past L)"
+        print(f"   {k:3d}  | {th:.4e} | {wl:10.1f} |     {turns:8.3f}      | {arc:5.2f} ra | {ok}")
+
+    safe = int((theta * train_len / twopi >= 1).sum())   # wavelength <= L
+    print(f"\n  {safe}/{d//2} planes complete a full turn within L (wavelength <= L) -> safe to")
+    print(f"  extrapolate. The other {d//2 - safe} (slow, long-wavelength) planes swept only a")
+    print("  partial arc in training, so a longer context rotates them into NOVEL angles the")
+    print("  model was never tuned on -> that's the degradation. The fixes all target these")
+    print("  slow planes. Next (layer 8): Position Interpolation — squeeze positions back in.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 8: Position Interpolation (PI) — squeeze every position into the arc.
+#
+# Simplest fix (Chen et al. / Meta, used by Llama-2 long-context). To extend L -> L'
+# scale EVERY position by s = L/L' before rotating: position m becomes m*s. Then the
+# largest relative angle at the new max distance L' is L'*s*theta_k = L*theta_k =
+# exactly the trained maximum -> every distance now maps to an angle the model saw.
+# Needs a short fine-tune, but far less than training long from scratch.
+#
+# The cost is that the squeeze is UNIFORM across planes: the per-position angle step
+# shrinks by s for EVERY plane, including the fast ones that were already fine. So
+# adjacent tokens now differ by a smaller angle everywhere -> local/high-frequency
+# resolution is blurred. Layers 9-10 fix exactly this over-squeezing.
+# ---------------------------------------------------------------------------
+def exp_8_position_interpolation(train_len=64, ext_len=256, d=64):
+    """Show PI: scale positions by s=L/L' so the max angle at L' equals the trained
+    max (back in range) — but the per-step angle shrinks uniformly (the downside)."""
+    _banner(f"LAYER 8: Position Interpolation — scale positions by s=L/L' to fit L'={ext_len}")
+    theta = rope_frequencies(d)
+    s = train_len / ext_len                           # < 1, the PI position scale
+    print(f"  extend L={train_len} -> L'={ext_len} (x{ext_len//train_len}).  PI scale s = L/L' = {s:.3f}\n")
+
+    print("  plane | step angle (orig) | step angle (PI) | max ang @L' no-PI | @L' with PI | trained max")
+    print("  ------+-------------------+-----------------+-------------------+-------------+------------")
+    for k in [0, d // 4, d // 2 - 1]:
+        th = theta[k].item()
+        trained_max = train_len * th
+        print(f"   {k:3d}  |     {th:8.4f}      |    {s*th:8.4f}     |     {ext_len*th:9.3f}     |  "
+              f"{ext_len*s*th:8.4f}   |  {trained_max:8.4f}")
+
+    print(f"\n  With PI, max angle at L' == trained max ({train_len}*theta) for EVERY plane -> in range.")
+    print(f"  But the per-step angle shrank x{s:.3f} UNIFORMLY — even plane 0 (fast, already safe)")
+    print("  now resolves adjacent tokens {:.0f}x more coarsely. Over-squeezing the fast planes".format(1/s))
+    print("  is PI's weakness. Next (layer 9): NTK-aware — stretch slow planes, spare fast ones.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 9: NTK-aware scaling — interpolate UNEVENLY across frequencies.
+#
+# Insight (bloc97): PI over-squeezes the fast planes. Instead, change the single
+# knob RoPE already has — the base — so the interpolation is spread across planes:
+# fast (high-freq) planes barely move, slow (low-freq) planes stretch the most.
+#     base' = base * s_ext^(d/(d-2))     with s_ext = L'/L  (> 1)
+# Since theta_k = base^(-2k/d), scaling the base multiplies theta_k by
+# s_ext^(-2k/(d-2)): plane 0 -> x1 (untouched), the slowest plane -> x(1/s_ext)
+# (wavelength x s_ext, so it now spans the extended window). This is a ONE-LINE
+# change (just pass a bigger rope_base) and needs NO fine-tune — it's why it caught
+# on (CodeLlama, NousResearch). Trade-off: less precise than a tuned YaRN, but free.
+# ---------------------------------------------------------------------------
+def exp_9_ntk_aware(train_len=64, ext_len=256, d=64, base=10000.0):
+    """Show NTK-aware: bump the base so wavelengths stretch NON-uniformly — fast
+    planes ~unchanged (local resolution kept), slow planes x s_ext (cover L')."""
+    _banner(f"LAYER 9: NTK-aware — raise the base so slow planes stretch, fast planes don't")
+    s_ext = ext_len / train_len                       # > 1
+    base2 = base * s_ext ** (d / (d - 2))
+    theta1 = rope_frequencies(d, base)
+    theta2 = rope_frequencies(d, base2)
+    twopi = 2 * math.pi
+    print(f"  extend x{s_ext:.0f}:  base {base:.0f} -> base' = base*s^(d/(d-2)) = {base2:.0f}\n")
+
+    print("  plane | wavelength (base) | wavelength (NTK) | ratio | PI would use (uniform)")
+    print("  ------+-------------------+------------------+-------+-----------------------")
+    for k in [0, d // 4, d // 2 - 1]:
+        wl1 = twopi / theta1[k].item()
+        wl2 = twopi / theta2[k].item()
+        print(f"   {k:3d}  |     {wl1:10.1f}    |    {wl2:10.1f}    | {wl2/wl1:4.2f}x |     {s_ext:4.2f}x")
+
+    print(f"\n  PI multiplies EVERY wavelength by s_ext={s_ext:.1f} (uniform, blurs fast planes).")
+    print("  NTK ramps the ratio from ~1.0x (plane 0, local detail preserved) up to ~s_ext")
+    print("  (slowest plane, now covers L'). Same extension, fast-plane resolution kept.")
+    print("  Next (layer 10): YaRN — make that fast/slow split explicit + fix the softmax temp.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 10: YaRN — NTK-by-parts + an attention-temperature correction.
+#
+# YaRN (Peng et al.; Llama-3.1 / Qwen2 long-context) makes layer-7's safe/unsafe
+# split EXPLICIT instead of NTK's smooth curve:
+#   * a plane's "rotations within L" is r_k = L / wavelength_k = L*theta_k/2pi.
+#   * r_k >= beta  (many turns, high-freq): EXTRAPOLATE — leave theta_k alone (it's
+#     safe, layer 7). r_k <= alpha (< 1 turn, low-freq): INTERPOLATE — full PI
+#     (theta_k / s_ext). Linear RAMP in between. (alpha, beta are tuned thresholds.)
+# Plus one thing PI/NTK ignore: packing more positions into the same arc makes the
+# q.k scores (and thus the softmax) more peaked, shifting attention entropy. YaRN
+# corrects it with an attention TEMPERATURE t = 0.1*ln(s_ext)+1: scale the scores by
+# 1/t (equivalently scale q,k by 1/sqrt(t)). That entropy fix is YaRN's real edge.
+# ---------------------------------------------------------------------------
+def exp_10_yarn(train_len=64, ext_len=256, d=64, alpha=1.0, beta=8.0):
+    """Show YaRN's per-plane decision (extrapolate high-freq / interpolate low-freq /
+    ramp between) via r_k = L/wavelength, plus the attention-temperature factor."""
+    _banner("LAYER 10: YaRN — extrapolate fast planes, interpolate slow ones, fix the temp")
+    s_ext = ext_len / train_len
+    theta = rope_frequencies(d)
+    twopi = 2 * math.pi
+    rotations = train_len * theta / twopi             # r_k = L/wavelength per plane
+    gamma = ((rotations - alpha) / (beta - alpha)).clamp(0, 1)  # 1=extrapolate, 0=interpolate
+    divisor = s_ext - gamma * (s_ext - 1)             # 1 (keep) .. s_ext (full PI)
+    print(f"  extend x{s_ext:.0f}, ramp thresholds alpha={alpha:g} (interp below) beta={beta:g} (extrap above)\n")
+
+    print("  plane | turns in L (r_k) | gamma | freq divisor | action")
+    print("  ------+------------------+-------+--------------+----------------------")
+    for k in [0, d // 8, d // 4, 3 * d // 8, d // 2 - 1]:
+        r = rotations[k].item()
+        g = gamma[k].item()
+        div = divisor[k].item()                       # theta_yarn = theta / div
+        act = ("extrapolate (keep)" if g > 0.99 else
+               "interpolate (full PI)" if g < 0.01 else "ramp (blend)")
+        print(f"   {k:3d}  |     {r:9.3f}    | {g:.2f}  |    {div:6.3f}    | {act}")
+
+    n_ex = int((gamma > 0.99).sum())
+    n_in = int((gamma < 0.01).sum())
+    temp = 0.1 * math.log(s_ext) + 1
+    print(f"\n  {n_ex} fast planes extrapolated (untouched), {n_in} slow planes interpolated, "
+          f"{d//2 - n_ex - n_in} ramped.")
+    print(f"  attention temperature t = 0.1*ln(s_ext)+1 = {temp:.4f}: scale scores by 1/t "
+          f"(q,k by 1/sqrt(t)={1/math.sqrt(temp):.4f})")
+    print("  to counter the sharper softmax from denser positions — the piece PI/NTK skip.")
+    print("\n  Summary of the family: PI = uniform squeeze (simple, blurs local); NTK = uneven")
+    print("  squeeze via base (free, no fine-tune); YaRN = explicit fast/slow split + temp fix")
+    print("  (best quality, Llama-3.1/Qwen2). All three only rescale the SAME rope_base/theta")
+    print("  knob you built — nothing else in attention changes.")
 
 
 def run_experiments():
@@ -476,7 +660,11 @@ def run_experiments():
     # exp_3_relative()
     # exp_4_frequencies()
     # exp_5_rotate_half()
-    exp_6_attention()
+    # exp_6_attention()
+    exp_7_extrapolation_problem()
+    exp_8_position_interpolation()
+    exp_9_ntk_aware()
+    exp_10_yarn()
 
 
 @contextlib.contextmanager
