@@ -43,6 +43,7 @@ from checkpoint import load_checkpoint, save_checkpoint
 from config import GPTConfig
 from data import DATA_PATH
 from grad_accum import grad_accum_step
+from lora import apply_lora, merge_lora
 from lr_schedule import get_lr
 from model import GPT
 from optimizer import configure_optimizers
@@ -235,13 +236,27 @@ def print_samples(model, tok, words, device: str):
 
 def finetune(tokenizer: str = "char", steps: int = SFT_STEPS, lr: float = SFT_LR,
              batch_size: int = SFT_BATCH_SIZE, grad_accum_steps: int = 1,
-             warmup: int = 50, eval_interval: int = 100, seed: int = 0):
+             warmup: int = 50, eval_interval: int = 100, seed: int = 0,
+             lora: bool = False, rank: int = 8):
     """Fine-tune the base model on the reverse task and save it. The loop body is
-    train.py's, verbatim in spirit — only the base, the data, and the LR differ."""
+    train.py's, verbatim in spirit — only the base, the data, and the LR differ.
+
+    lora=True freezes the base and trains low-rank adapters instead of all weights
+    (see lora.py). Same data/loss/loop — configure_optimizers already filters to
+    requires_grad params, so the optimizer picks up only the adapters. We merge the
+    adapters back into the weights before saving, so the checkpoint is a plain GPT.
+    """
     torch.manual_seed(1337)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, tok = load_base(tokenizer, device)              # <-- init from the BASE
     cfg = model.config
+
+    if lora:
+        apply_lora(model, r=rank)                          # freeze base, inject adapters
+        model.to(device)                                   # adapters were created on CPU
+        n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        n_all = sum(p.numel() for p in model.parameters())
+        print(f"  LoRA (r={rank}): training {n_train:,}/{n_all:,} params ({n_train/n_all:.1%})")
 
     # data: masked (prompt, answer) pairs. val words are a disjoint seed from train,
     # so val loss / accuracy measure generalization, not memorization.
@@ -280,13 +295,18 @@ def finetune(tokenizer: str = "char", steps: int = SFT_STEPS, lr: float = SFT_LR
                         device_type=device_type, grad_clip=1.0)
 
     val = evaluate(model, val_ex, device)
-    out_ckpt = OUT_CKPT[tokenizer]
+    if lora:
+        merge_lora(model)                # fold adapters into the weights -> plain GPT
+    out_ckpt = OUT_CKPT[tokenizer].replace(".pt", "_lora.pt" if lora else ".pt")
+    # after a merge the saved optimizer state refers to the (now-gone) adapters, so
+    # it's dead weight — fine, a merged LoRA checkpoint is for inference, not resume.
     save_checkpoint(out_ckpt, model, optimizer, steps, cfg, task="reverse", val_loss=val)
 
     test_words = make_words(200, seed=3)                 # held out from train/val
     print_samples(model, tok, test_words[:12], device)   # eyeball a dozen
     acc = accuracy(model, tok, test_words, device)        # score all 200
-    print(f"\ndone [{tokenizer}] | final val loss {val:.3f} | held-out reverse accuracy {acc:.1%}")
+    tag = f"{tokenizer}{'+lora' if lora else ''}"
+    print(f"\ndone [{tag}] | final val loss {val:.3f} | held-out reverse accuracy {acc:.1%}")
     print(f"saved -> {os.path.relpath(out_ckpt, _HERE)}")
 
 
@@ -346,13 +366,20 @@ if __name__ == "__main__":
                         help="run the data-half self-check (build_example + collate) and exit")
     parser.add_argument("--tokenizer", choices=["bpe", "char"], default="char",
                         help="which pretrained base + tokenizer to fine-tune")
+    parser.add_argument("--lora", action="store_true",
+                        help="freeze the base and train low-rank adapters (lora.py) instead "
+                             "of all weights; merged into the weights before saving")
+    parser.add_argument("--rank", type=int, default=8, help="LoRA rank r (with --lora)")
     parser.add_argument("--steps", type=int, default=SFT_STEPS)
-    parser.add_argument("--lr", type=float, default=SFT_LR)
+    parser.add_argument("--lr", type=float, default=None,
+                        help="learning rate; default 5e-4 (full) or 3e-3 (--lora: adapters "
+                             "start at 0 and train fewer params, so they want a bigger step)")
     parser.add_argument("--batch-size", type=int, default=SFT_BATCH_SIZE)
     args = parser.parse_args()
 
     if args.check:
         _data_self_check()
     else:
-        finetune(tokenizer=args.tokenizer, steps=args.steps, lr=args.lr,
-                 batch_size=args.batch_size)
+        lr = args.lr if args.lr is not None else (3e-3 if args.lora else SFT_LR)
+        finetune(tokenizer=args.tokenizer, steps=args.steps, lr=lr,
+                 batch_size=args.batch_size, lora=args.lora, rank=args.rank)
