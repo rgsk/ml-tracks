@@ -24,3 +24,8 @@ class GPTConfig:
     n_layer: int = 6          # number of transformer blocks
     dropout: float = 0.2
     tie_weights: bool = True  # share one (V,C) tensor for token_embedding & lm_head (GPT-2 style)
+    # RoPE: inject position by ROTATING q,k inside attention instead of adding a
+    # learned position table at the input. When True, GPT drops position_embedding
+    # entirely and CausalSelfAttention rotates q,k by their absolute position.
+    use_rope: bool = False
+    rope_base: float = 10000.0  # theta_k = rope_base^(-2k/head_size); bigger => longer context

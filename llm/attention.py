@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import GPTConfig
+from rope import apply_rope, build_rope_cache
 
 
 class Head(nn.Module):
@@ -107,6 +108,12 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.head_size = config.n_embd // config.n_head
 
+        # RoPE: rotate q,k by absolute position inside forward (no learned pos table).
+        self.use_rope = config.use_rope
+        self.rope_base = config.rope_base
+        if self.use_rope:
+            assert self.head_size % 2 == 0, "head_size must be even for RoPE"
+
         # one projection producing Q, K, V stacked (C -> 3C); split in forward
         self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         self.proj = nn.Linear(config.n_embd, config.n_embd)
@@ -140,6 +147,17 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, nh, hs).transpose(1, 2)
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
+        # RoPE: rotate the NEW q,k by their ABSOLUTE positions BEFORE caching. The
+        # offset = number of cached tokens, so new token(s) get their true position;
+        # cached keys were already rotated when they were new (never re-rotated). v is
+        # left alone — position shapes the q.k match, not the payload being moved.
+        if self.use_rope:
+            past_len = kv_cache[0].size(2) if kv_cache is not None else 0
+            cos, sin = build_rope_cache(T, hs, self.rope_base, offset=past_len,
+                                        device=x.device, dtype=q.dtype)
+            q = apply_rope(q, cos, sin)
+            k = apply_rope(k, cos, sin)
+
         # KV cache: prepend the cached past K/V (computed in earlier steps) to the
         # K/V for the new token(s), along the TIME axis. q still holds only the new
         # token(s); k/v now hold ALL positions. Return the updated cache.
@@ -156,10 +174,17 @@ class CausalSelfAttention(nn.Module):
         wei = q @ k.transpose(-2, -1) * hs ** -0.5               # (B, nh, T, T_k)
 
         # offset-aware causal mask: query row i is at absolute position T_past + i
-        # and may attend keys 0..(T_past + i), so slice the tril by the queries'
-        # absolute row range. Incremental case (T=1) -> a single all-ones row (the
-        # frontier token sees every cached key), so the mask is a no-op there.
-        wei = wei.masked_fill(self.tril[T_past:T_k, :T_k] == 0, float("-inf"))
+        # and may attend keys 0..(T_past + i). Incremental case (T=1) -> a single
+        # all-ones row (the frontier token sees every cached key), a no-op there.
+        # Fast path uses the precomputed tril buffer; but with RoPE there's no
+        # position table, so a sequence can exceed block_size — the buffer would
+        # index out of range, so build the mask on the fly. Both give the identical
+        # mask (element (i,j) kept iff j <= T_past + i); the buffer is just a cache.
+        if T_k <= self.tril.size(0):
+            causal = self.tril[T_past:T_k, :T_k]
+        else:
+            causal = torch.ones(T, T_k, device=x.device).tril(diagonal=T_past)
+        wei = wei.masked_fill(causal == 0, float("-inf"))
 
         wei = F.softmax(wei, dim=-1)
         wei = self.attn_dropout(wei)

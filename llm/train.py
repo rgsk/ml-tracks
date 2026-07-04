@@ -28,6 +28,7 @@ from optimizer import configure_optimizers
 # --- hyperparameters (small, so it runs in a few minutes on CPU) ---
 TOKENIZER = "bpe"       # "char" (one token/char) | "bpe" (byte-level, GPT-2 style)
 BPE_VOCAB_SIZE = 1024    # only used when TOKENIZER == "bpe"
+USE_ROPE = False         # RoPE positions instead of a learned table (see --rope)
 BLOCK_SIZE = 64
 BATCH_SIZE = 32
 N_EMBD = 96
@@ -101,6 +102,10 @@ def main():
         "--bpe-vocab", type=int, default=BPE_VOCAB_SIZE,
         help="vocab size for the BPE tokenizer (only used with --tokenizer bpe)",
     )
+    parser.add_argument(
+        "--rope", action="store_true", default=USE_ROPE,
+        help="use RoPE positions (rotate q,k) instead of a learned position table",
+    )
     args = parser.parse_args()
 
     torch.manual_seed(1337)
@@ -109,6 +114,8 @@ def main():
     # keep their checkpoints in separate dirs — and so a comparison run of one
     # never clobbers the other's best.pt.
     tag = args.tokenizer if args.tokenizer == "char" else f"bpe{args.bpe_vocab}"
+    if args.rope:
+        tag += "_rope"           # separate dir so a RoPE run never clobbers the learned-PE best.pt
     ckpt_dir = os.path.join(ARTIFACTS_DIR, "checkpoints", tag)
     last_path = os.path.join(ckpt_dir, "last.pt")
     best_path = os.path.join(ckpt_dir, "best.pt")
@@ -138,10 +145,12 @@ def main():
         n_head=N_HEAD,
         n_layer=N_LAYER,
         dropout=DROPOUT,
+        use_rope=args.rope,
     )
     model = GPT(cfg).to(DEVICE)
     n_params = sum(p.numel() for p in model.parameters())
-    print(f"training on {DEVICE} | {n_params/1e6:.2f}M params | dtype {DTYPE}")
+    print(f"training on {DEVICE} | {n_params/1e6:.2f}M params | dtype {DTYPE} | "
+          f"pos {'rope' if args.rope else 'learned'}")
     lr = args.lr if args.lr is not None else LEARNING_RATE
     optimizer = configure_optimizers(model, weight_decay=WEIGHT_DECAY, learning_rate=lr)
 

@@ -26,9 +26,14 @@ class GPT(nn.Module):
         super().__init__()
         self.config = config
 
-        # one learned vector per vocab id, and per position in the context
+        # one learned vector per vocab id. Position is either a learned table (added
+        # here) or RoPE — which rotates q,k inside attention, so there's NO position
+        # table at all. When use_rope is set, position_embedding is None.
         self.token_embedding = nn.Embedding(config.vocab_size, config.n_embd)
-        self.position_embedding = nn.Embedding(config.block_size, config.n_embd)
+        self.position_embedding = (
+            None if config.use_rope
+            else nn.Embedding(config.block_size, config.n_embd)
+        )
 
         # n_layer transformer blocks, then a final LayerNorm before the head.
         # ModuleList (not Sequential) so we can thread a per-layer KV cache and a
@@ -91,9 +96,13 @@ class GPT(nn.Module):
             past_len = kv_caches[0][0].size(2)                    # cache k: (B, nh, T_past, hs)
 
         tok_emb = self.token_embedding(idx)                       # (B, T, C)
-        pos = torch.arange(past_len, past_len + T, device=idx.device)  # absolute positions
-        pos_emb = self.position_embedding(pos)                    # (T, C)
-        x = tok_emb + pos_emb                                     # broadcast -> (B, T, C)
+        if self.position_embedding is None:
+            # RoPE: position is injected inside attention, nothing added here.
+            x = tok_emb
+        else:
+            pos = torch.arange(past_len, past_len + T, device=idx.device)  # absolute positions
+            pos_emb = self.position_embedding(pos)                # (T, C)
+            x = tok_emb + pos_emb                                 # broadcast -> (B, T, C)
 
         new_caches = [] if use_cache else None
         for i, block in enumerate(self.blocks):
@@ -150,16 +159,20 @@ class GPT(nn.Module):
 
         use_cache: KV-cache the past K/V instead of recomputing the whole context
         each step — O(T) per token instead of O(T^2). The first step processes the
-        full prompt to fill the cache; later steps feed only the newest token. The
-        cache stores absolute positions, so total length can't exceed block_size
-        (the limit of learned absolute position embeddings — relative schemes like
-        RoPE are partly motivated by lifting exactly this restriction).
+        full prompt to fill the cache; later steps feed only the newest token. With
+        learned absolute position embeddings the total length can't exceed block_size
+        (the pos table has only that many rows); with RoPE there is no such table and
+        the mask is built on the fly, so generation can run BEYOND block_size —
+        lifting exactly the restriction relative schemes were designed to remove.
+        (Vanilla RoPE still degrades in QUALITY past the trained length; tricks like
+        NTK/YaRN scaling address that, but the mechanism runs unbounded here.)
         """
-        if use_cache:
-            # the cache holds absolute positions and can't slide, so the whole
-            # sequence (prompt + everything generated) must fit in block_size.
-            # Fail fast with a clear message instead of an opaque index error when
-            # position_embedding / tril run off the end mid-generation.
+        if use_cache and not self.config.use_rope:
+            # absolute position embeddings only: the learned pos table has exactly
+            # block_size rows, so the whole cached sequence must fit. Fail fast with
+            # a clear message instead of an opaque index error mid-generation.
+            # (RoPE has no pos table and builds its mask on the fly, so it has no
+            # such cap — that's a core reason RoPE exists; skip the assert for it.)
             total = idx.size(1) + max_new_tokens
             assert total <= self.config.block_size, (
                 f"use_cache needs prompt+max_new_tokens ({idx.size(1)}+{max_new_tokens}"
@@ -175,9 +188,10 @@ class GPT(nn.Module):
                 idx_cond = idx if kv_caches is None else idx[:, -1:]
                 logits, _, kv_caches = self(idx_cond, kv_caches=kv_caches, use_cache=True)
             else:
-                # no cache: re-feed the (cropped) context every step. crop to
-                # block_size since position_embedding only has block_size rows.
-                idx_cond = idx[:, -self.config.block_size:]
+                # no cache: re-feed the context every step. Absolute PE must crop to
+                # block_size (the pos table only has that many rows); RoPE has no such
+                # table and extrapolates, so feed the whole (growing) context.
+                idx_cond = idx if self.config.use_rope else idx[:, -self.config.block_size:]
                 logits, _ = self(idx_cond)                      # (B, T, vocab)
             logits = logits[:, -1, :]                           # (B, vocab) last step
 
