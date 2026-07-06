@@ -6,3 +6,7 @@ checkpoints/
 # generated files: training checkpoints + tokenizer cache (rebuilt on demand)
 artifacts/
 outputs/
+
+# downloaded datasets (re-fetched on demand), e.g. diffusion/data/mnist.npz
+diffusion/data/
+*.npz
