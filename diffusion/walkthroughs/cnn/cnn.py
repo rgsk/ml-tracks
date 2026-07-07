@@ -47,9 +47,10 @@ import sys
 import torch
 import torch.nn.functional as F
 
-_HERE = os.path.dirname(os.path.abspath(__file__))   # diffusion/walkthroughs/
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)                         # so `import denoiser_and_loss` works
+_HERE = os.path.dirname(os.path.abspath(__file__))   # diffusion/walkthroughs/cnn
+_WALK = os.path.dirname(_HERE)                        # diffusion/walkthroughs (holds denoiser_and_loss)
+if _WALK not in sys.path:
+    sys.path.insert(0, _WALK)                         # so `import denoiser_and_loss` works
 
 
 def _banner(*lines):
