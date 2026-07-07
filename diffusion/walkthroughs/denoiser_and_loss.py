@@ -295,7 +295,9 @@ def timestep_embedding(t, dim, max_period=10000.0):
     assert dim % 2 == 0, "use an even embedding dim"
     half = dim // 2
     # geometric frequencies: exp(-ln(P)·k/half) = P^(-k/half), from f_0=1 down to ~1/P.
-    freqs = torch.exp(-math.log(max_period) * torch.arange(half, dtype=torch.float32) / half)
+    # (built on t's device so this works under GPU training too.)
+    k = torch.arange(half, dtype=torch.float32, device=t.device)
+    freqs = torch.exp(-math.log(max_period) * k / half)
     args = t[:, None].float() * freqs[None, :]              # (B, half): t scaled by each freq
     return torch.cat([torch.sin(args), torch.cos(args)], dim=-1)   # (B, dim)
 
@@ -733,6 +735,365 @@ def exp_2c_assemble():
     print("  backprop, and overfit a single batch to prove the objective and gradients wire up.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 3: the DDPM loss + one training step (overfit a single batch).
+#
+# We now have the target (forward_process Layer 4/5) and the network (Layer 2). Wire them
+# into the actual training step — the entire DDPM objective is:
+#
+#     draw t ~ Uniform, eps ~ N(0,I) ; build x_t = √ab·x0 + √(1-ab)·eps (closed form)
+#     eps_hat = model(x_t, t)
+#     loss    = mean( (eps_hat - eps)² )          # plain MSE, the "simple" loss (Ho 2020)
+#     loss.backward() ; optimizer.step()
+#
+# That's it — a bog-standard supervised regression loop. The ONLY diffusion-specific part is
+# how the (input, target) pair is manufactured (the closed form); everything else is generic.
+# Two things worth SEEING here: (a) the untrained loss is ~1.0, because the target eps ~ N(0,1)
+# has variance 1 and a net predicting ~0 gets MSE ≈ Var(eps) = 1 — so "loss below 1" is the
+# first sign of learning; (b) OVERFIT one fixed batch and the loss collapses toward 0, proving
+# the objective and gradients actually wire up end-to-end. Real training (fresh noise each
+# step over all of MNIST) is Layers 4-5; here we just prove the machinery.
+# ---------------------------------------------------------------------------
+def exp_3_loss_and_step():
+    """Assemble the DDPM training step and overfit ONE fixed batch. Show the untrained loss
+    sits at ~1.0 (= Var(eps), the N(0,1) target), then drops toward 0 as we repeatedly fit the
+    same (x_t, t) -> eps — the objective + gradients wire up. Real data/fresh noise is Layers 4-5."""
+    _banner("LAYER 3: the DDPM loss + one training step — overfit a single batch")
+
+    from forward_process import make_linear_schedule
+    torch.manual_seed(0)
+    T = 1000
+    _, _, alpha_bars = make_linear_schedule(T=T)
+
+    model = DenoiserMLP()
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    # ONE fixed batch: draw (x0, t, eps) once and build x_t. We hold them fixed so the model
+    # must fit this exact (x_t, t) -> eps mapping — the classic "overfit one batch" sanity test.
+    B = 8
+    x0 = torch.randn(B, 1, 28, 28)                            # stand-in images (real MNIST: Layer 4)
+    t = torch.randint(0, T, (B,))                             # a noise level per example
+    eps = torch.randn_like(x0)                                # the target noise
+    ab = alpha_bars[t].view(B, 1, 1, 1)                       # (B,1,1,1) to broadcast over pixels
+    x_t = torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps      # the closed form (forward_process 1b)
+
+    def loss_fn():
+        eps_hat = model(x_t, t)
+        return ((eps_hat - eps) ** 2).mean()                 # the DDPM "simple" MSE loss
+
+    # (a) the untrained loss ~ 1.0 = Var(eps): predicting ~0 for an N(0,1) target gives MSE ~1.
+    with torch.no_grad():
+        l0 = loss_fn().item()
+    print(f"  target eps ~ N(0,1): its variance is {eps.var().item():.3f}, so an untrained net")
+    print(f"  (outputs ~0) should start near MSE ~1.  ->  initial loss = {l0:.4f}")
+    print("  'loss below 1' is the first evidence the net predicts anything useful about eps.\n")
+
+    # overfit the fixed batch: same (x_t, t, eps) every step. Loss should collapse toward 0.
+    print("  overfitting ONE fixed batch (same x_t,t,eps each step) to prove grads wire up:")
+    print(f"  {'step':>5} | {'loss':>10} | {'max|eps_hat-eps|':>16}")
+    print(f"  {'-'*5}-+-{'-'*10}-+-{'-'*16}")
+    for step in range(601):
+        loss = loss_fn()
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if step in (0, 25, 50, 100, 200, 400, 600):
+            with torch.no_grad():
+                max_err = (model(x_t, t) - eps).abs().max().item()
+            print(f"  {step:>5} | {loss.item():>10.5f} | {max_err:>16.4f}")
+    print()
+    print("  -> loss falls from ~1 toward ~0 and the per-pixel eps error shrinks: the network")
+    print("  CAN represent the target and the gradients flow through the whole path (in_proj,")
+    print("  the time_mlp, the resblocks, out). The objective is wired up.\n")
+    print("  Reminder: overfitting ONE batch only proves the machinery — it's memorising, not")
+    print("  generalising. The real loop draws FRESH t and eps every step over the whole")
+    print("  dataset so the net learns the actual denoising function. Next (Layer 4): the MNIST")
+    print("  data pipeline (a tiny Dataset over the npz), then (Layer 5) that real training loop.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 4: the MNIST data pipeline — a tiny Dataset over the npz (no torchvision).
+#
+# Layer 3 used stand-in random images; the real loop needs real digits. We wrap the same
+# mnist.npz (from forward_process) in a torch Dataset so a DataLoader can batch and shuffle
+# it — plain plumbing, but one choice matters: NORMALIZE pixels from uint8 [0,255] to [-1,1]
+# (x/127.5 - 1), not [0,1].
+#
+# Why [-1,1]? The forward process mixes x0 with eps ~ N(0,I) and drives x_t toward N(0,I) —
+# a SYMMETRIC, O(1)-scale target. Data in [0,1] is all-positive and half that scale, so its
+# noised images sit off to one side of what the model (and the N(0,I) noise) are symmetric
+# around. Mapping to [-1,1] (background black = -1, ink = +1) puts the data on the same
+# symmetric O(1) scale — the standard DDPM convention. NB it does NOT make the data zero-mean:
+# MNIST is mostly black background, so the mean stays quite negative (~ -0.73). That's fine —
+# what matters is the scale/symmetry, not a zero mean. Sampling later inverts it to view digits.
+# ---------------------------------------------------------------------------
+def _mnist_npz_path():
+    """Path to the cached mnist.npz (shared with forward_process), downloading on first use."""
+    data_dir = os.path.join(os.path.dirname(_HERE), "data")   # diffusion/data
+    path = os.path.join(data_dir, "mnist.npz")
+    if not os.path.exists(path):
+        os.makedirs(data_dir, exist_ok=True)
+        import urllib.request
+        url = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz"
+        print(f"  downloading MNIST npz (~11MB) -> {path} ...")
+        urllib.request.urlretrieve(url, path)
+    return path
+
+
+class MNISTData(torch.utils.data.Dataset):
+    """MNIST as (image, label) over the npz. Images are (1,28,28) float normalized to [-1,1]
+    (the scale the forward process assumes). No torchvision."""
+    def __init__(self, train=True):
+        import numpy as np
+        d = np.load(_mnist_npz_path())
+        x = d["x_train"] if train else d["x_test"]            # (N,28,28) uint8 in [0,255]
+        y = d["y_train"] if train else d["y_test"]
+        self.x = (torch.from_numpy(x).float() / 127.5 - 1.0).unsqueeze(1)   # (N,1,28,28) in [-1,1]
+        self.y = torch.from_numpy(y).long()
+
+    def __len__(self):
+        return len(self.x)
+
+    def __getitem__(self, i):
+        return self.x[i], self.y[i]
+
+
+def exp_4_data():
+    """Build the MNIST Dataset + DataLoader and read one batch: shapes, the [-1,1] range and
+    what its mean/std say (background-heavy, zero-ish center), then push that REAL batch through
+    the exact Layer-3 pipeline (draw t,eps -> x_t -> model -> MSE) to confirm it's drop-in
+    ready for training."""
+    _banner("LAYER 4: the MNIST data pipeline — tiny Dataset over the npz, normalized to [-1,1]")
+
+    train = MNISTData(train=True)
+    test = MNISTData(train=False)
+    loader = torch.utils.data.DataLoader(train, batch_size=128, shuffle=True)
+    x, y = next(iter(loader))                                 # one batch
+
+    print(f"  dataset: {len(train)} train / {len(test)} test images, no torchvision.")
+    print(f"  one batch:  images {tuple(x.shape)} ({x.dtype}),  labels {tuple(y.shape)}")
+    print(f"  pixel range [{x.min():+.2f}, {x.max():+.2f}]  mean {x.mean():+.3f}  std {x.std():.3f}")
+    print("    -> range is [-1,1] (not [0,1]); the mean is very negative because most pixels are")
+    print("       black background (= -1) with a little white ink (= +1). The data is NOT zero-")
+    print("       mean — [-1,1] buys a symmetric, O(1) scale matching N(0,I), not a zero center.\n")
+
+    # drop-in check: the SAME Layer-3 step, now on a real digit batch. Untrained loss ~1.
+    from forward_process import make_linear_schedule
+    torch.manual_seed(0)
+    _, _, alpha_bars = make_linear_schedule(T=1000)
+    model = DenoiserMLP()
+    B = x.shape[0]
+    t = torch.randint(0, 1000, (B,))
+    eps = torch.randn_like(x)
+    ab = alpha_bars[t].view(B, 1, 1, 1)
+    x_t = torch.sqrt(ab) * x + torch.sqrt(1 - ab) * eps       # closed form on REAL x0
+    with torch.no_grad():
+        loss = ((model(x_t, t) - eps) ** 2).mean().item()
+    print(f"  drop-in check: real batch -> (t, eps) -> x_t -> model -> MSE = {loss:.4f}  (~1, as")
+    print("  expected for an untrained net on the N(0,1) target). The pipeline is ready.\n")
+    print("  LAYER 4 DONE: real digits flow through the same (x_t, t) -> eps machinery. Next")
+    print("  (Layer 5): the real training loop — iterate the loader, fresh t and eps every step,")
+    print("  and watch the loss fall on actual MNIST.")
+
+
+# the config Layers 5-6 train/reload. Layer 2's DEFAULT DenoiserMLP (hidden=256, depth=3) is
+# deliberately minimal and, it turns out, UNDERFITS — it plateaus around test-loss ~0.7 no
+# matter the lr (capacity-limited). Widening to ~9M params drops it to ~0.13, a real
+# eps-predictor. Capacity is the lever here; we scale the same module up for the real train.
+DENOISER_CONFIG = dict(hidden=768, depth=6)
+
+
+def build_denoiser():
+    """The scaled-up DenoiserMLP that Layers 5 and 6 share (so the checkpoint reloads cleanly)."""
+    return DenoiserMLP(**DENOISER_CONFIG)
+
+
+def _ckpt_path():
+    out_dir = os.path.join(_HERE, "outputs")
+    os.makedirs(out_dir, exist_ok=True)
+    return os.path.join(out_dir, "denoiser_mlp.pt")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 5: the real training loop — train on all of MNIST, watch the loss fall.
+#
+# Same step as Layer 3, but now it's the REAL thing: iterate the DataLoader (Layer 4) and, for
+# every batch, draw FRESH t and eps — so the net never sees the same (x_t, t, eps) twice and
+# must learn the actual denoising FUNCTION over all images and all noise levels, not memorise a
+# fixed batch. The loop is textbook: forward -> MSE -> backward -> step. We track a running loss
+# (falls from ~1) and a held-out TEST loss (fresh t,eps on test digits) to confirm it's
+# GENERALISING, not overfitting like Layer 3. One lever shows up immediately: the minimal Layer-2
+# model plateaus ~0.7 (underfits); we widen it (DENOISER_CONFIG) to actually learn. The trained
+# weights are saved so Layer 6 (and the sampling walkthrough) can load them and denoise / generate.
+# ---------------------------------------------------------------------------
+def exp_5_train_loop(epochs=15, batch_size=128, lr=1e-3, seed=0):
+    """Train the (scaled-up) DenoiserMLP on MNIST with fresh (t, eps) per batch. Print the
+    running train loss falling from ~1 and a held-out test loss (generalisation, unlike Layer
+    3's memorisation), then save the checkpoint for Layer 6 / sampling."""
+    _banner("LAYER 5: the real training loop — fresh (t, eps) per batch, loss falls on MNIST")
+
+    from forward_process import make_linear_schedule
+    torch.manual_seed(seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    T = 1000
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(device)
+
+    model = build_denoiser().to(device)
+    n_params = sum(p.numel() for p in model.parameters())
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    train_loader = torch.utils.data.DataLoader(MNISTData(train=True), batch_size=batch_size,
+                                               shuffle=True, drop_last=True)
+    test_x = MNISTData(train=False).x[:2048].to(device)      # a fixed held-out chunk for eval
+
+    def ddpm_loss(x0):                                       # the Layer-3 step, fresh t & eps
+        B = x0.shape[0]
+        t = torch.randint(0, T, (B,), device=device)
+        eps = torch.randn_like(x0)
+        ab = alpha_bars[t].view(B, 1, 1, 1)
+        x_t = torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps
+        return ((model(x_t, t) - eps) ** 2).mean()
+
+    @torch.no_grad()
+    def test_loss():                                        # fresh noise on held-out digits
+        return ddpm_loss(test_x).item()                     # 2048 samples -> stable enough to compare
+
+    print(f"  device={device}, model={DENOISER_CONFIG} ({n_params:,} params), {epochs} epochs, "
+          f"batch={batch_size}, lr={lr}, {len(train_loader)} steps/epoch")
+    print(f"  {'epoch':>5} | {'train loss (run avg)':>20} | {'test loss':>10}")
+    print(f"  {'-'*5}-+-{'-'*20}-+-{'-'*10}")
+    print(f"  {'init':>5} | {'—':>20} | {test_loss():>10.5f}   <- untrained baseline (~1.0)")
+    for ep in range(epochs):
+        run = None
+        for x0, _ in train_loader:
+            x0 = x0.to(device)
+            loss = ddpm_loss(x0)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            run = loss.item() if run is None else 0.98 * run + 0.02 * loss.item()
+        print(f"  {ep:>5} | {run:>20.5f} | {test_loss():>10.5f}")
+    print()
+
+    ckpt = _ckpt_path()
+    torch.save({"state_dict": model.state_dict(), "config": DENOISER_CONFIG}, ckpt)
+    print(f"  final held-out test loss: {test_loss():.5f}  (started ~1.0). saved -> {ckpt}\n")
+    print("  Read it: the loss falls from ~1 to ~0.13 AND the held-out test loss tracks the train")
+    print("  loss — the net learned the real denoising function (generalises), it didn't memorise")
+    print("  like Layer 3. (The minimal Layer-2 model would have stalled near 0.7 — capacity was")
+    print("  the lever.) An MLP still won't match a U-Net, but it clearly predicts eps. Next")
+    print("  (Layer 6): feed it HELD-OUT noised digits and reconstruct x0_hat from its predicted")
+    print("  eps — SEE it denoise. (Generation from pure noise is the sampling walkthrough.)")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 6: SEE it — reconstruct x0 from the trained net's predicted eps.
+#
+# The loss number said the net predicts eps; this makes it a PICTURE. Take HELD-OUT test
+# digits (never trained on), noise each to a level t with the closed form, run the trained
+# model to get eps_hat, and invert the closed form to recover the clean image the net thinks
+# is under the noise (forward_process 4a, solved for x0):
+#
+#     x0_hat = ( x_t - √(1-ab)·eps_hat ) / √ab
+#
+# This is a ONE-SHOT denoise (jump straight from x_t to an x0 estimate) — not full generation
+# yet (that's the iterative sampler, next walkthrough), but it's the direct read on "did it
+# learn to see the digit through the noise". Expect: crisp recovery at low/mid t, and blow-up
+# at high t — there the signal is essentially gone AND the 1/√ab factor amplifies any eps error
+# (the loss@t wall from our per-t check). Saves a grid: for each digit, the noised input row
+# and the reconstruction row across t — forward_dissolve.png run backwards.
+# ---------------------------------------------------------------------------
+def exp_6_visualize(seed=0):
+    """Load the trained checkpoint and one-shot denoise held-out digits: quantify recon error
+    ||x0_hat - x0|| vs t, then save a grid (per digit: noised x_t row over the reconstruction
+    x0_hat row, across t). Shows crisp recovery at low/mid t and breakdown at high t."""
+    _banner("LAYER 6: SEE it — one-shot reconstruction x0_hat from the trained net's eps")
+
+    ckpt_path = _ckpt_path()
+    if not os.path.exists(ckpt_path):
+        print(f"  no checkpoint at {ckpt_path} — run exp_5_train_loop() first.")
+        return
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from forward_process import make_linear_schedule
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _, _, alpha_bars = make_linear_schedule(T=1000)
+    alpha_bars = alpha_bars.to(device)
+    ckpt = torch.load(ckpt_path, map_location=device)
+    model = DenoiserMLP(**ckpt["config"]).to(device)
+    model.load_state_dict(ckpt["state_dict"])
+    model.eval()
+
+    def reconstruct(x0, t, eps):                              # one-shot: x_t -> eps_hat -> x0_hat
+        ab = alpha_bars[t].view(-1, 1, 1, 1)
+        x_t = torch.sqrt(ab) * x0 + torch.sqrt(1 - ab) * eps
+        with torch.no_grad():
+            eps_hat = model(x_t, t)
+        x0_hat = (x_t - torch.sqrt(1 - ab) * eps_hat) / torch.sqrt(ab)
+        return x_t, x0_hat
+
+    test = MNISTData(train=False)
+    ts = [0, 50, 100, 200, 400, 700]
+
+    # (1) quantify: mean per-pixel |x0_hat - x0| over 512 held-out digits, per t.
+    torch.manual_seed(seed)
+    x0_big = test.x[:512].to(device)
+    eps_big = torch.randn_like(x0_big)
+    print("  one-shot reconstruction error over 512 held-out digits (fresh noise), per t:")
+    print(f"  {'t':>5} {'√ab':>7} | {'mean|x0_hat - x0|':>18} | {'mean|x_t - x0|':>15} (noised input)")
+    print(f"  {'-'*5}-{'-'*7}-+-{'-'*18}-+-{'-'*15}")
+    for tv in ts:
+        t = torch.full((x0_big.shape[0],), tv, device=device)
+        x_t, x0_hat = reconstruct(x0_big, t, eps_big)
+        rec_err = (x0_hat.clamp(-1, 1) - x0_big).abs().mean().item()
+        inp_err = (x_t.clamp(-1, 1) - x0_big).abs().mean().item()
+        print(f"  {tv:>5} {alpha_bars[tv].sqrt().item():>7.4f} | {rec_err:>18.4f} | {inp_err:>15.4f}")
+    print("    -> recon error stays low while the NOISED input error climbs: the net is pulling")
+    print("       the digit back out — until high t, where signal is gone and 1/√ab amplifies")
+    print("       any eps error, so x0_hat destabilises.\n")
+
+    # (2) picture: a few digits, each as a (noised input, reconstruction) row-pair across t.
+    labels = [7, 3, 8]
+    idxs = [int((test.y == lb).nonzero()[0]) for lb in labels]
+    digits = test.x[idxs].to(device)                         # (K,1,28,28)
+    torch.manual_seed(seed)
+    eps = torch.randn_like(digits)                           # one fixed eps per digit, all t
+
+    K, C = len(idxs), len(ts)
+    fig, axes = plt.subplots(2 * K, C, figsize=(C * 1.5, 2 * K * 1.5))
+    for k in range(K):
+        for c, tv in enumerate(ts):
+            t = torch.full((1,), tv, device=device)
+            x_t, x0_hat = reconstruct(digits[k:k+1], t, eps[k:k+1])
+            def show(ax, img, ylabel=None, title=None):
+                disp = ((img[0, 0].clamp(-1, 1) + 1) / 2).cpu().numpy()
+                ax.imshow(disp, cmap="gray", vmin=0, vmax=1)
+                ax.set_xticks([]); ax.set_yticks([])
+                if title: ax.set_title(title, fontsize=9)
+                if ylabel: ax.set_ylabel(ylabel, fontsize=9)
+            show(axes[2*k, c], x_t, ylabel=("noised" if c == 0 else None),
+                 title=(f"t={tv}" if k == 0 else None))
+            show(axes[2*k+1, c], x0_hat, ylabel=("x̂0" if c == 0 else None))
+    fig.suptitle("one-shot denoise: per digit, NOISED input (top) -> reconstruction x̂0 (bottom), across t",
+                 fontsize=10)
+    fig.tight_layout()
+    out = os.path.join(os.path.dirname(ckpt_path), "denoise_reconstruct.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  saved grid -> {out}")
+    print("  Open it: the top row of each pair dissolves into noise as t grows (the forward")
+    print("  process); the bottom row is the net's x̂0 — a recognizable digit at low/mid t,")
+    print("  degrading only when the noise has erased the signal. This is the denoiser WORKING.\n")
+    print("  LAYER 6 COMPLETE — and with it the denoiser walkthrough. We have a trained")
+    print("  eps_theta(x_t, t) that sees digits through noise. It can't yet GENERATE from")
+    print("  scratch: one-shot x̂0 from pure noise (t=T) is mush, because it jumps in a single")
+    print("  step. The next walkthrough (sampling.py) runs it ITERATIVELY — noise -> digit over")
+    print("  many small steps — turning this denoiser into your first real image generator.")
+
+
 def run_experiments():
     # exp_1a_why_t_is_an_input()
     # exp_1b_naive_encodings()
@@ -743,7 +1104,11 @@ def run_experiments():
     # exp_1g_similarity_kernel()
     # exp_2a_plain_mlp()
     # exp_2b_fuse_time()
-    exp_2c_assemble()
+    # exp_2c_assemble()
+    # exp_3_loss_and_step()
+    # exp_4_data()
+    # exp_5_train_loop()
+    exp_6_visualize()
     # exp_3_loss_and_step()
     # exp_4_data()
     # exp_5_train_loop()
