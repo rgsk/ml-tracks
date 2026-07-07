@@ -175,7 +175,7 @@ all 602k weights into that exact tiled pattern, and only if training showed it e
 The reason equivariance holds is that the **same** 3×3 kernel is applied at every position. Watch it
 walk across the digit — the feature map fills in pixel by pixel, all from *one* tiny detector:
 
-![kernel sliding](figs/01_slide.gif)
+![kernel sliding](figs/extra/01_slide.gif)
 
 The same stroke detector fires wherever the stroke goes. Nothing is position-specific.
 

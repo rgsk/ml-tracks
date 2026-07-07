@@ -49,6 +49,7 @@ import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))   # diffusion/walkthroughs/cnn
 _WALK = os.path.dirname(_HERE)                        # diffusion/walkthroughs (holds denoiser_and_loss)
+_FIGS = os.path.join(_HERE, "notes", "figs")          # single home for note figures (00_*, 01_*, ...)
 if _WALK not in sys.path:
     sys.path.insert(0, _WALK)                         # so `import denoiser_and_loss` works
 
@@ -159,30 +160,42 @@ def exp_1_why_conv(seed=0):
     print("         right bias built in. This is why every image model is built from convs.\n")
 
     # ---- a picture: digit, its shift, and the two feature maps lining up ---------------------
+    # 2x3 grid: bottom-middle (shift, then conv) and bottom-right (conv, then shift) are pixel-
+    # identical on the interior -> that IS featmap(shift x) == shift(featmap x). edge maps use a
+    # diverging colormap centered at 0 (the sum-to-zero kernel is signed).
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    def _fm(t):
+        return t.squeeze().detach().cpu().numpy()
+
+    fig, ax = plt.subplots(2, 3, figsize=(9, 6))
     panels = [
-        (_to_img(x), "original 7"),
-        (_to_img(x_shift), f"shifted ({shift},{shift})"),
-        (shift_of_fmap.squeeze().cpu().numpy(), "shift( featmap(orig) )"),
-        (fmap_of_shift.squeeze().cpu().numpy(), "featmap( shifted )"),
+        (0, 0, _to_img(x), "input  x", "gray"),
+        (0, 1, _to_img(x_shift), "shift(x)", "gray"),
+        (0, 2, None, "", None),
+        (1, 0, _fm(fmap), "featmap(x)", "coolwarm"),
+        (1, 1, _fm(fmap_of_shift), "featmap(shift(x))\n[shift, then conv]", "coolwarm"),
+        (1, 2, _fm(shift_of_fmap), "shift(featmap(x))\n[conv, then shift]", "coolwarm"),
     ]
-    fig, axes = plt.subplots(1, 4, figsize=(4 * 2.1, 2.4))
-    for ax, (img, title) in zip(axes, panels):
-        ax.imshow(img, cmap="gray")
-        ax.set_title(title, fontsize=9)
-        ax.set_xticks([]); ax.set_yticks([])
-    fig.suptitle("shift the input -> the conv feature map just shifts (right two panels match)", fontsize=10)
-    fig.tight_layout()
-    out = os.path.join(_HERE, "outputs", "cnn_equivariance.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    for r, c, img, title, cmap in panels:
+        a = ax[r][c]
+        a.set_xticks([]); a.set_yticks([])
+        if img is None:
+            a.axis("off"); continue
+        kw = dict(cmap=cmap) if cmap == "gray" else dict(cmap=cmap, vmin=-scale, vmax=scale)
+        a.imshow(img, **kw)
+        a.set_title(title, fontsize=11)
+    fig.suptitle(f"a conv is translation-EQUIVARIANT:  bottom-middle == bottom-right  "
+                 f"(max diff {diff:.1e})", fontsize=12)
+    out = os.path.join(_FIGS, "01_equivariance.png")
+    os.makedirs(_FIGS, exist_ok=True)
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"  saved -> {out}")
-    print("  Open it: the two right panels — shift-then-featmap vs featmap-of-shift — are the same")
-    print("  image. That equality is the property a flatten throws away and a conv keeps.\n")
+    print("  Open it: bottom-middle (shift, then conv) and bottom-right (conv, then shift) are the")
+    print("  same image. That equality is the property a flatten throws away and a conv keeps.\n")
     print("  Next (Layer 2): the convolution op itself — what that sliding kernel computes, hand-set")
     print("  edge kernels you can SEE in the feature maps, and the output-size formula.")
 
@@ -294,14 +307,19 @@ def exp_2_conv_op(seed=0):
     axes[0].imshow(_to_img(x), cmap="gray"); axes[0].set_title("input '3'", fontsize=9)
     for ax, (name, k) in zip(axes[1:], kernels.items()):
         w = torch.tensor(k, dtype=torch.float32).view(1, 1, 3, 3)
-        fm = F.conv2d(x, w, padding=1).squeeze().cpu().numpy()
-        ax.imshow(fm, cmap="gray"); ax.set_title(name, fontsize=9)
+        fm = F.conv2d(x, w, padding=1).squeeze()
+        if name in ("identity", "blur (box)"):
+            ax.imshow(fm.cpu().numpy(), cmap="gray")           # near-nonnegative: just a filtered image
+        else:
+            M = fm.abs().max().item()                          # signed edge map: center 0 on neutral
+            ax.imshow(fm.cpu().numpy(), cmap="coolwarm", vmin=-M, vmax=M)
+        ax.set_title(name, fontsize=9)
     for ax in axes:
         ax.set_xticks([]); ax.set_yticks([])
     fig.suptitle("one input, four hand-set kernels -> four feature maps (edges, blur)", fontsize=10)
     fig.tight_layout()
-    out = os.path.join(_HERE, "outputs", "cnn_feature_maps.png")
-    os.makedirs(os.path.dirname(out), exist_ok=True)
+    out = os.path.join(_FIGS, "02_feature_maps.png")
+    os.makedirs(_FIGS, exist_ok=True)
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"      saved -> {out}")

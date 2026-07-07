@@ -1,9 +1,11 @@
 """
-figs — generates every figure the CNN notes embed. One function per layer's figures; outputs
-go to figs/ namespaced by layer number (01_*, 02_*, ...). The experiments file (../cnn.py) never
-plots — all images come from here.
+figs — EXTRA figures for the CNN notes that no experiment already produces. Anything an `exp_*`
+in ../cnn.py plots is written by that experiment straight into figs/ (single source of truth);
+this file only holds figures with no experiment counterpart (e.g. animations). To keep ownership
+obvious, these go in figs/extra/ (figs/ itself = experiment-owned), namespaced by layer number
+(01_*, 02_*, ...).
 
-Run:  python figs.py            (regenerates all figures)
+Run:  python figs.py            (regenerates the extra figures)
 """
 from __future__ import annotations
 
@@ -23,7 +25,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))               # .../cnn/notes
 _WALK = os.path.dirname(os.path.dirname(_HERE))                  # .../walkthroughs (for denoiser_and_loss)
 if _WALK not in sys.path:
     sys.path.insert(0, _WALK)
-_OUT = os.path.join(_HERE, "figs")
+_OUT = os.path.join(_HERE, "figs", "extra")           # extras only; experiment figures live in figs/
 os.makedirs(_OUT, exist_ok=True)
 
 
@@ -39,49 +41,13 @@ def _seven():
     return test.x[idx:idx + 1]                                  # (1,1,28,28) in [-1,1]
 
 
-# the fixed 3x3 diagonal edge detector used throughout Layer 1.
+# the fixed 3x3 diagonal edge detector used throughout Layer 1 (matches cnn.py's exp_1).
 KERNEL = torch.tensor([[-1., -1., 0.], [-1., 0., 1.], [0., 1., 1.]]).view(1, 1, 3, 3)
-SHIFT = 4
 
 
 # --- Layer 1 figures -------------------------------------------------------
-def fig_1_equivariance():
-    """2x3 grid: bottom-middle (shift then conv) and bottom-right (conv then shift) are pixel-
-    identical on the interior -> that IS featmap(shift x) == shift(featmap x)."""
-    x = _seven()
-    x_shift = torch.roll(x, (SHIFT, SHIFT), (2, 3))
-    fmap = F.conv2d(x, KERNEL, padding=1)
-    fmap_of_shift = F.conv2d(x_shift, KERNEL, padding=1)         # shift, then conv
-    shift_of_fmap = torch.roll(fmap, (SHIFT, SHIFT), (2, 3))     # conv, then shift
-
-    fig, ax = plt.subplots(2, 3, figsize=(9, 6))
-    panels = [
-        (0, 0, x, "input  x", "gray"),
-        (0, 1, x_shift, "shift(x)", "gray"),
-        (0, 2, None, "", None),
-        (1, 0, fmap, "featmap(x)", "coolwarm"),
-        (1, 1, fmap_of_shift, "featmap(shift(x))\n[shift, then conv]", "coolwarm"),
-        (1, 2, shift_of_fmap, "shift(featmap(x))\n[conv, then shift]", "coolwarm"),
-    ]
-    for r, c, t, title, cmap in panels:
-        a = ax[r][c]
-        a.set_xticks([]); a.set_yticks([])
-        if t is None:
-            a.axis("off"); continue
-        a.imshow(_to_img(t) if cmap == "gray" else t.squeeze().detach().numpy(),
-                 cmap=cmap, vmin=None if cmap == "gray" else -6, vmax=None if cmap == "gray" else 6)
-        a.set_title(title, fontsize=11)
-
-    m = SHIFT + 1
-    diff = (fmap_of_shift[..., m:-m, m:-m] - shift_of_fmap[..., m:-m, m:-m]).abs().max().item()
-    fig.suptitle(f"a conv is translation-EQUIVARIANT:  bottom-middle == bottom-right  "
-                 f"(max diff {diff:.1e})", fontsize=12)
-    out = os.path.join(_OUT, "01_equivariance.png")
-    fig.savefig(out, dpi=130, bbox_inches="tight")
-    plt.close(fig)
-    print(f"wrote {out}")
-
-
+# NB: the equivariance still-image (01_equivariance.png) is produced by exp_1_why_conv in
+# ../cnn.py, not here. This animation has no experiment counterpart, so it lives here.
 def fig_1_slide():
     """Animate the 3x3 kernel walking across the digit; the feature map fills in as it goes.
     Makes 'ONE kernel, reused at every position' (weight sharing) visceral."""
@@ -119,7 +85,7 @@ def fig_1_slide():
     print(f"wrote {out}")
 
 
-ALL = [fig_1_equivariance, fig_1_slide]
+ALL = [fig_1_slide]
 
 
 if __name__ == "__main__":
