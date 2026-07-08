@@ -455,11 +455,93 @@ def exp_3_stack_and_relu(seed=0):
     print("  28->14->7 pyramid that gives late layers a receptive field covering the whole digit.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 4: downsampling — a stride-2 conv halves H,W, and we grow channels.
+#
+# Layer 3 stacked stride-1 convs: the map stayed 28x28 and the receptive field crept up by
+# (k-1)=2 per layer. To "see" a whole 28x28 digit that way you'd need ~14 layers. Real nets
+# instead build a RESOLUTION PYRAMID: periodically DOWNSAMPLE with a stride-2 conv, which
+#
+#   (1) HALVES H and W (28 -> 14 -> 7 -> ..., the Layer-2 formula with k3,s2,p1 = ceil(in/2)), and
+#   (2) MULTIPLIES receptive-field growth. RF_L = RF_{L-1} + (k-1)·∏_{i<L} s_i : once you've
+#       downsampled, every later (k-1) step is worth `stride` INPUT pixels, so RF explodes.
+#       Pure stride-2 stack: RF 3 -> 7 -> 15 -> 31 (four layers already cover 28).
+#
+# And downsampling is what makes GROWING CHANNELS affordable: each stride-2 stage cuts the number
+# of positions 4x, so doubling the channel count still leaves the activation footprint C·H·W (and
+# the conv FLOPs) SHRINKING. That's the universal CNN shape: resolution down, channels up. We use
+# a learned stride-2 conv (the modern default) rather than a fixed max-pool, so the downsampler
+# itself is trained. Below we (a) build the 28->14->7 pyramid and check shapes, (b) MEASURE the
+# receptive field in input pixels for stride-1 vs stride-2 stacks, (c) tally the footprint per stage.
+# ---------------------------------------------------------------------------
+def exp_4_downsample(seed=0):
+    """Three facts about downsampling: (a) a stride-2 k3 conv halves H,W while channels grow —
+    the 28->14->7 pyramid, shapes checked against the Layer-2 formula; (b) receptive field, measured
+    in INPUT pixels via autograd, grows far faster with stride (RF 3/7/15 for stride-2 vs 3/5/7 for
+    stride-1) because the stride product multiplies every later step; (c) each downsample cuts
+    positions 4x, so doubling channels still shrinks the activation footprint C·H·W."""
+    _banner("LAYER 4: downsampling — stride-2 halves H,W, channels grow: the 28->14->7 pyramid")
+
+    torch.manual_seed(seed)
+
+    # ---- (a) the resolution pyramid: stride-2 halves H,W while channels grow --------------
+    x = torch.randn(1, 1, 28, 28)
+    conv1 = torch.nn.Conv2d(1, 16, kernel_size=3, stride=2, padding=1)    # 28 -> 14
+    conv2 = torch.nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)   # 14 -> 7
+    h1 = conv1(x)
+    h2 = conv2(h1)
+    print("  (a) a STRIDE-2 conv (k3, p1) halves H,W; we DOUBLE channels at each step.")
+    print(f"      {tuple(x.shape)}  --conv(1->16, s2)-->  {tuple(h1.shape)}"
+          f"  --conv(16->32, s2)-->  {tuple(h2.shape)}")
+    print("      spatial pyramid 28 -> 14 -> 7  (k3,s2,p1 -> out = ceil(in/2), the Layer-2 formula)")
+    print(f"      params: conv1 = 16·1·9+16 = {16 * 1 * 9 + 16}, conv2 = 32·16·9+32 = {32 * 16 * 9 + 32}\n")
+
+    # ---- (b) receptive field: stride MULTIPLIES the reach of every later step -------------
+    # Measure RF in INPUT pixels exactly: pick one central OUTPUT cell, backprop to the input,
+    # and the input pixels with nonzero gradient are precisely the ones it depends on.
+    S = 31
+    ones = torch.ones(1, 1, 3, 3)
+
+    def rf(n_layers, stride):
+        xin = torch.zeros(1, 1, S, S, requires_grad=True)
+        y = xin
+        for _ in range(n_layers):
+            y = F.conv2d(y, ones, stride=stride, padding=1)
+        c = y.shape[-1] // 2                                   # a central output cell
+        y[0, 0, c, c].backward()
+        m = xin.grad[0, 0].abs() > 0                           # input pixels it depends on
+        ys, _ = m.nonzero(as_tuple=True)
+        return ys.max().item() - ys.min().item() + 1          # RF side length, in input pixels
+
+    print("  (b) receptive field of ONE output cell, in INPUT pixels (autograd: which input pixels")
+    print("      the cell actually depends on), for stride-1 vs stride-2 stacks of k3 convs:")
+    print("        layers |  stride-1 RF  |  stride-2 RF")
+    for L in (1, 2, 3):
+        print(f"           {L}    |      {rf(L, 1):>2}       |      {rf(L, 2):>2}")
+    print("      RF_L = RF_{L-1} + (k-1)·∏(strides): the stride PRODUCT multiplies every later step.")
+    print("      -> ~14 stride-1 convs to reach RF 28, but only ~4 stride-2 (3->7->15->31): stride is")
+    print("         how a small-kernel net comes to 'see' the whole digit.\n")
+
+    # ---- (c) why channels grow as resolution shrinks: the footprint stays bounded ---------
+    print("  (c) footprint C·H·W per stage. once channels DOUBLE while area QUARTERS, each downsample")
+    print("      multiplies the footprint by 2·(1/4) = 1/2 — resolution traded for depth cheaply:")
+    prev = None
+    for name, t in (("input", x), ("after conv1", h1), ("after conv2", h2)):
+        c, hh, ww = t.shape[1], t.shape[2], t.shape[3]
+        v = c * hh * ww
+        ratio = "(input)" if prev is None else f"×{v / prev:.2f} vs prev"
+        print(f"        {name:<12} {c:>2}·{hh}·{ww} = {v:>5} values   {ratio}")
+        prev = v
+    print("      -> stride-2 conv FLOPs drop 4x per stage too, which is what makes deep, wide late")
+    print("         layers affordable. Next (Layer 5): global-average-pool the 7x7 map -> a vector,")
+    print("         Linear -> 10 logits, cross-entropy.")
+
+
 def run_experiments():
     # exp_1_why_conv()
     # exp_2_conv_op()
-    exp_3_stack_and_relu()
-    # exp_4_downsample()
+    # exp_3_stack_and_relu()
+    exp_4_downsample()
     # exp_5_head_and_loss()
     # exp_6_train()
 
