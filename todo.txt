@@ -6,3 +6,7 @@ Weights & Biases
 
 
 understand gqa tests
+
+match closed_form and iterative at each t
+
+LEFT: SEE the spread widen as we scale. Wider box = bigger variance. in new/diffusion/foundations/gaussian_facts/walkthroughs/linear_ops.py
