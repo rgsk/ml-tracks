@@ -39,6 +39,7 @@ new/diffusion/data/mnist.npz.
 """
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -271,10 +272,255 @@ def exp_3_closed_form(seed=0, T=1000):
     print("  Next (exp_4): where the process ENDS — x_T ~ N(0,I), the digit fully erased.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 4 (box): the endpoint — where the dissolve ENDS, and why it's the same for every digit.
+#
+# The last column of exp_1's grid was pure static, identical-looking for all four digits. Here's
+# why. From exp_3, x_t has mean √ᾱ·x0 and std √(1-ᾱ). As t→T, ᾱ→0: the signal term √ᾱ·x0 VANISHES
+# and the std →1, so x_T ~ N(0,I) no matter what x0 was. We noise two very different images and
+# watch them start distinguishable (different means mid-way) but converge to the SAME N(0,1) by
+# t=T. That universal endpoint is what lets generation START from a fresh scoop of noise.
+# ---------------------------------------------------------------------------
+def exp_4_endpoint(seed=0, T=1000):
+    """Noise two very different x0 (+2.0 and -5.0) to several t. Mid-way their distributions differ
+    (means ≈ √ᾱ·x0); by t=T both are ≈ N(0,1) — x0 fully erased. Hence the sampler can begin from
+    a fresh scoop of N(0,1)."""
+    _banner("LAYER 4: the endpoint — x_T ~ N(0,I), the digit fully erased")
+    g = torch.Generator().manual_seed(seed)
+    betas, _, alpha_bars = make_linear_schedule(T=T)
+    n = 40000
+    x0_a, x0_b = torch.tensor(2.0), torch.tensor(-5.0)
+
+    print("  From exp_3: x_t has mean √ᾱ·x0 and std √(1-ᾱ). As t→T, ᾱ→0, so the signal term √ᾱ·x0")
+    print("  vanishes and std→1. Noise two very different images (x0=+2.0 and x0=-5.0) to a few")
+    print("  levels t, 40k times each, and watch their distributions converge:\n")
+    print(f"  {'t':>4} | {'ᾱ':>9} | {'+2.0 mean':>9} {'std':>7} | {'-5.0 mean':>9} {'std':>7}")
+    print(f"  {'-'*4}-+-{'-'*9}-+-{'-'*9}-{'-'*7}-+-{'-'*9}-{'-'*7}")
+    for t in [250, 500, 750, T - 1]:
+        xa = forward_iterative(x0_a, betas, t, n, generator=g)
+        xb = forward_iterative(x0_b, betas, t, n, generator=g)
+        ab = alpha_bars[t].item()
+        print(f"  {t:>4} | {ab:>9.5f} | {xa.mean():>+9.4f} {xa.std():>7.4f} | "
+              f"{xb.mean():>+9.4f} {xb.std():>7.4f}")
+    print()
+    print("  At t=250 the two are still far apart (means ≈ √ᾱ·x0: +1.44 vs -3.61) — the digit still")
+    print("  shows through, exactly the mid columns of exp_1's dissolve. But as ᾱ→0 the signal term")
+    print("  dies, and by t=999 BOTH are ≈ N(0,1): mean~0, std~1, indistinguishable. The forward")
+    print("  process has ERASED x0 — the last column looks the same for ANY digit.\n")
+    print("  Why this is the linchpin of GENERATION: the endpoint is the SAME universal N(0,I) for")
+    print("  every image. So to generate, grab a fresh scoop of N(0,1) static (free to sample) — a")
+    print("  valid x_T for SOME digit — and run the process BACKWARDS, denoising step by step, into")
+    print("  a brand-new digit. That reverse is exactly the parent ddpm.py's sampler.")
+    print("  Next (exp_5): the schedule SHAPE — the cosine schedule, and why it keeps signal longer.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 5 (box): the schedule SHAPE — the cosine schedule.
+#
+# Everything so far used the LINEAR schedule (exp_2): set β_t directly, ᾱ falls out as a cumprod.
+# The cosine schedule (Nichol & Dhariwal 2021, "Improved DDPM") flips the CONSTRUCTION: declare
+# the signal curve ᾱ(t) you want — a gentle cos² falloff from 1 to 0 — then back-solve the per-step
+# betas from the ratio of consecutive ᾱ:  β_t = 1 - ᾱ_t/ᾱ_{t-1}  (clamped < 0.999 so the tail can't
+# demand more than 100% noise). Same three arrays, same closed-form jump; only the SHAPE of the
+# noise-over-time curve changes. This box builds it and reads it; exp_6 puts it beside linear.
+# ---------------------------------------------------------------------------
+def make_cosine_schedule(T=1000, s=0.008, max_beta=0.999):
+    """Cosine schedule: DECLARE ᾱ(t) as a cos² falloff, then back-solve betas. Returns
+    (betas, alphas, alpha_bars), each shape (T,) — same interface as make_linear_schedule."""
+    steps = torch.arange(T + 1, dtype=torch.float32)          # 0..T (T+1 points)
+    f = torch.cos(((steps / T) + s) / (1 + s) * (math.pi / 2)) ** 2
+    alpha_bars_full = f / f[0]                                 # normalize so ᾱ(0)=1
+    # β_t from the drop between consecutive ᾱ, then clamp the tail.
+    betas = (1.0 - alpha_bars_full[1:] / alpha_bars_full[:-1]).clamp(max=max_beta)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)                  # recompute from clamped betas
+    return betas, alphas, alpha_bars
+
+
+def exp_5_cosine_schedule():
+    """Build the cosine schedule and READ it: β_t (tiny early, ramps late) and its ᾱ_t curve. The
+    point of THIS box is the CONSTRUCTION — ᾱ is set directly as cos², β back-solved, the reverse
+    of how the linear schedule is defined."""
+    _banner("LAYER 5: the cosine schedule — declare ᾱ as cos², back-solve β")
+
+    T = 1000
+    betas, _, alpha_bars = make_cosine_schedule(T=T)
+
+    print("  linear (exp_2):  set β_t  ->  ᾱ = cumprod(1-β)   (ᾱ falls out)")
+    print("  cosine (here):   set ᾱ = cos²(...)  ->  β_t back-solved from it")
+    print("    β_t = 1 - ᾱ_t / ᾱ_{t-1}   (clamped < 0.999 at the tail)\n")
+
+    print(f"  {'t':>4} | {'β_t':>8} | {'ᾱ_t':>10} | {'signal √ᾱ':>10} | {'noise √(1-ᾱ)':>13}")
+    print(f"  {'-'*4}-+-{'-'*8}-+-{'-'*10}-+-{'-'*10}-+-{'-'*13}")
+    for t in [0, 100, 250, 500, 750, T - 1]:
+        b, ab = betas[t].item(), alpha_bars[t].item()
+        print(f"  {t:>4} | {b:>8.5f} | {ab:>10.5f} | {ab**0.5:>10.4f} | {(1-ab)**0.5:>13.4f}")
+    print()
+    print("  β_t is NOT linear here: it stays tiny early (keeping the image crisp longer), then")
+    print("  ramps up toward the end. And ᾱ_t descends gently — at t=500 ᾱ≈0.49 (√ᾱ≈0.70) vs")
+    print("  linear's ᾱ≈0.078 (√ᾱ≈0.28): the digit is still clearly there where linear is mush.")
+    print("  Same forward math as exp_2/3/4 — only the noise-over-time CURVE changed.")
+    print("  Next (exp_6): put the two curves side by side + a second dissolve, and see why cosine")
+    print("  keeps signal alive longer (which matters most for small images like MNIST).")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 6 (box): linear vs cosine — why the shape matters, made VISIBLE.
+#
+# Put the two ᾱ curves side by side. Linear plunges to ~0 well before t=T (many late steps are
+# already pure noise = wasted capacity) AND rushes the informative middle; cosine descends gently
+# and keeps usable signal much longer. We measure it (count near-pure-noise steps) and then SEE it:
+# a second dissolve with a LINEAR row and a COSINE row, same digit and same ε, so the only
+# difference is the schedule. This is where exp_1's dissolve returns as a comparison.
+# ---------------------------------------------------------------------------
+def exp_6_linear_vs_cosine(seed=0, T=1000):
+    """Compare the two schedules' ᾱ curves, count how many steps each spends in the near-pure-noise
+    regime, and save a linear-vs-cosine dissolve grid (same digit, same ε) that makes 'cosine keeps
+    signal alive longer' literally visible."""
+    _banner("LAYER 6: linear vs cosine — cosine keeps signal alive longer")
+
+    torch.manual_seed(seed)
+    _, _, ab_lin = make_linear_schedule(T=T)
+    _, _, ab_cos = make_cosine_schedule(T=T)
+
+    # (A) the two curves, side by side.
+    print("  ᾱ (fraction of the ORIGINAL signal still present) at each t:\n")
+    print(f"  {'t':>4} | {'linear ᾱ':>10} {'√ᾱ':>7} | {'cosine ᾱ':>10} {'√ᾱ':>7}")
+    print(f"  {'-'*4}-+-{'-'*10}-{'-'*7}-+-{'-'*10}-{'-'*7}")
+    for t in [0, 100, 200, 300, 400, 500, 600, 700, 800, 900, T - 1]:
+        al, ac = ab_lin[t].item(), ab_cos[t].item()
+        print(f"  {t:>4} | {al:>10.5f} {al**0.5:>7.4f} | {ac:>10.5f} {ac**0.5:>7.4f}")
+    print()
+
+    # (B) "wasted" = ᾱ so small the image is basically gone → denoising there teaches little.
+    thr = 0.01                                    # ᾱ < 0.01  <=>  signal √ᾱ < 0.1
+    waste_lin, waste_cos = int((ab_lin < thr).sum()), int((ab_cos < thr).sum())
+    first_lin = int((ab_lin < thr).float().argmax())     # first t below threshold
+    first_cos = int((ab_cos < thr).float().argmax())
+    print(f"  'nearly pure noise' = ᾱ < {thr} (signal √ᾱ < {thr**0.5:.1f}):")
+    print(f"    linear: crosses at t={first_lin}, so {waste_lin}/{T} steps ({waste_lin/T:.0%}) contribute little")
+    print(f"    cosine: crosses at t={first_cos}, so {waste_cos}/{T} steps ({waste_cos/T:.0%}) contribute little")
+    print("  Linear hits near-pure-noise early and burns a big chunk of its steps there (nothing")
+    print("  left to remove = nothing to learn), AND rushes the informative middle. Cosine holds")
+    print("  signal deep into the schedule — far more steps land in the useful regime. This is the")
+    print("  Improved-DDPM motivation; it matters MOST for small images (MNIST) with little redundancy.\n")
+
+    # (C) SEE it: same digit, same ε, linear row vs cosine row.
+    imgs = _mnist(train=False)
+    x0 = imgs[0]                                   # one held-out digit
+    eps = torch.randn_like(x0)                     # ONE fixed noise, shared across every cell
+    ts = [0, 100, 250, 500, 750, T - 1]
+    schedules = [("linear", ab_lin), ("cosine", ab_cos)]
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(len(schedules), len(ts), figsize=(len(ts) * 1.4, len(schedules) * 1.7))
+    for r, (name, ab_all) in enumerate(schedules):
+        for c, t in enumerate(ts):
+            ab = ab_all[t]
+            x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+            ax = axes[r, c]
+            ax.imshow(_to_img(x_t), cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(f"t={t}", fontsize=9)
+            ax.set_xlabel(f"√ᾱ={ab.sqrt().item():.2f}", fontsize=8)   # differs per row → per-cell
+            if c == 0:
+                ax.set_ylabel(name, fontsize=11)
+    fig.suptitle("same digit, same ε — linear (top) vs cosine (bottom): cosine keeps it legible longer",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "06_linear_vs_cosine.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  wrote {out} — top row (linear) is mush by the middle columns; bottom row (cosine)")
+    print("  keeps the digit legible far later. The Layer-2 point, now literally visible.")
+    print("  Next (exp_7): SNR — repackage ᾱ as the per-t DIFFICULTY, the axis modern schedules use.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 7 (box): the SNR — ᾱ repackaged as the per-t DIFFICULTY.
+#
+# Everything so far tracked ᾱ (signal fraction) and its mirror 1-ᾱ (noise). SNR just takes their
+# RATIO:
+#     SNR(t) = signal power / noise power = ᾱ / (1 - ᾱ)
+# (from x_t = √ᾱ·x0 + √(1-ᾱ)·ε: signal amplitude √ᾱ → power ᾱ, noise amplitude √(1-ᾱ) → power 1-ᾱ.)
+# SNR is the single number for how HARD denoising is at step t: high SNR (small t) = barely noised =
+# easy; low SNR (big t) = mostly noise = hard. A training step picks a random t, so the schedule
+# decides how the training budget spreads across difficulties. SNR spans ~9 orders of magnitude, so
+# we look at log-SNR — the coordinate modern schedules (EDM, flow matching) are actually defined in.
+# ---------------------------------------------------------------------------
+def exp_7_snr(T=1000):
+    """Repackage ᾱ as SNR(t)=ᾱ/(1-ᾱ) = the per-t difficulty; show it in log-SNR and compare linear
+    vs cosine. Cosine's log-SNR is a more even ramp; linear crams the easy end then flatlines deep
+    negative — the same wasted-steps story from exp_6, in the coordinate papers actually use."""
+    _banner("LAYER 7: signal-to-noise ratio — SNR(t) = ᾱ/(1-ᾱ), and log-SNR")
+
+    _, _, ab_lin = make_linear_schedule(T=T)
+    _, _, ab_cos = make_cosine_schedule(T=T)
+    snr_lin = ab_lin / (1 - ab_lin)                    # signal power / noise power
+    snr_cos = ab_cos / (1 - ab_cos)
+
+    print("  SNR(t) = ᾱ / (1 - ᾱ) = signal power / noise power.")
+    print("  high SNR = barely noised = EASY denoise ; low SNR = mostly noise = HARD.\n")
+    print(f"  {'t':>4} | {'lin SNR':>10} {'lin logSNR':>10} | {'cos SNR':>10} {'cos logSNR':>10}")
+    print(f"  {'-'*4}-+-{'-'*10}-{'-'*10}-+-{'-'*10}-{'-'*10}")
+    for t in [0, 100, 250, 500, 750, 900, T - 1]:
+        sl, sc = snr_lin[t].item(), snr_cos[t].item()
+        lsl = math.log(sl) if sl > 0 else float("-inf")
+        lsc = math.log(sc) if sc > 0 else float("-inf")
+        print(f"  {t:>4} | {sl:>10.3f} {lsl:>10.2f} | {sc:>10.3f} {lsc:>10.2f}")
+    print()
+
+    # logSNR = 0 ⇔ SNR = 1 ⇔ signal power == noise power = the "halfway hard" point.
+    first_lin = int((snr_lin < 1).float().argmax())    # first t past logSNR=0
+    first_cos = int((snr_cos < 1).float().argmax())
+    print("  Two reads:")
+    print("  (1) SNR is just ᾱ in disguise (a monotonic repackaging) — but it NAMES the difficulty:")
+    print("      t=0 → SNR ~1e4 (almost clean, trivial); t=T → SNR ~1e-5 (basically noise, maximal).")
+    print("  (2) log-SNR is the honest axis (SNR spans ~9 orders). logSNR=0 ⇔ SNR=1 ⇔ signal power ==")
+    print("      noise power = 'halfway hard'.")
+    print(f"      linear crosses logSNR=0 at t≈{first_lin} (front-loads the easy end, then the tail is")
+    print(f"      crammed at extreme low SNR); cosine at t≈{first_cos} (a far more even ramp).\n")
+
+    # SEE it: log-SNR vs t, both schedules (clamp the floor so the pure-noise tail doesn't dominate).
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    ts = torch.arange(T)
+    ls_lin = torch.log(snr_lin.clamp_min(1e-5))
+    ls_cos = torch.log(snr_cos.clamp_min(1e-5))
+    fig, ax = plt.subplots(figsize=(7, 4.2))
+    ax.plot(ts, ls_lin, label="linear", color="tab:blue")
+    ax.plot(ts, ls_cos, label="cosine", color="tab:orange")
+    ax.axhline(0, color="gray", ls="--", lw=1)
+    ax.annotate("logSNR=0\n(signal power == noise power)", xy=(T * 0.62, 0.3), fontsize=8, color="gray")
+    ax.set_xlabel("t (noise level)"); ax.set_ylabel("log-SNR = log(ᾱ/(1-ᾱ))")
+    ax.set_title("difficulty curriculum: cosine spreads it evenly, linear crams the tail")
+    ax.legend()
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "07_snr.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+
+    print(f"  wrote {out} — cosine's log-SNR is a near-straight, even ramp; linear drops fast through")
+    print("  the easy end then flatlines deep negative (redundant near-noise steps). Same wasted-steps")
+    print("  story as exp_6, in the coordinate modern schedules place their steps along directly.")
+    print("  🎉 forward_process COMPLETE — the first box of the ddpm whole game, fully opened.")
+
+
 def run_experiments():
     # exp_1_dissolve()
     # exp_2_schedule()
-    exp_3_closed_form()
+    # exp_3_closed_form()
+    # exp_4_endpoint()
+    # exp_5_cosine_schedule()
+    # exp_6_linear_vs_cosine()
+    exp_7_snr()
 
 
 if __name__ == "__main__":
