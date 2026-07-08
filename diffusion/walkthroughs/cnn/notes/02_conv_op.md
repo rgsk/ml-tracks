@@ -65,10 +65,13 @@ and want it to mean what you drew — which is exactly what we do next, and why 
 Fire four fixed 3×3 kernels at a real `3` (with `padding=1`, keeping 28×28):
 
 ```
-identity          [[0,0,0],[0,1,0],[0,0,0]]          copies the input (sanity check)
-vertical edge     [[-1,0,1],[-2,0,2],[-1,0,1]]       Sobel-x: left↔right brightness change
-horizontal edge   [[-1,-2,-1],[0,0,0],[1,2,1]]       Sobel-y: up↕down brightness change
-blur (box)        [[1/9]*3]*3                         local average: smooths
+identity          vertical edge     horizontal edge    blur (box)
+copies input      Sobel-x: L↔R      Sobel-y: U↕D       local average
+                  change            change             smooths
+
+ 0  0  0          -1  0  1          -1 -2 -1          1/9 1/9 1/9
+ 0  1  0          -2  0  2           0  0  0          1/9 1/9 1/9
+ 0  0  0          -1  0  1           1  2  1          1/9 1/9 1/9
 ```
 
 ![feature maps from hand-set kernels](figs/02_feature_maps.png)
