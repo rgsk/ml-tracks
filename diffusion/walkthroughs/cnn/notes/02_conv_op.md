@@ -101,11 +101,24 @@ The three cases we use downstream, checked against `F.conv2d`:
 | 28 | 3 | 1 | 1 | **28** | **same size** — the workhorse conv (`padding = k//2`) |
 | 28 | 3 | 2 | 1 | **14** | **half** — the Layer-4 downsample |
 | 28 | 5 | 1 | 0 | 24 | shrink by `k−1`, no padding |
-| 28 | 3 | 2 | 0 | 14 | strided, no pad |
+| 28 | 3 | 2 | 0 | 13 | strided, no pad |
 
 Two facts worth memorizing: `k3, s1, p1` **preserves** size (so you can stack convs without the map
 shrinking), and `k3, s2, p1` **halves** it (the resolution pyramid `28 → 14 → 7` of Layer 4). The
 formula matches `F.conv2d` exactly.
+
+### Practice: the two important configs on small inputs
+
+Same two rows, applied to `in=6` (even) and `in=5` (odd) — small enough to hand-derive and check:
+
+| in | k | s | p | out | role |
+|---|---|---|---|---|---|
+| 6 | 3 | 1 | 1 | **6** | same size — preserved |
+| 5 | 3 | 1 | 1 | **5** | same size — preserved |
+| 6 | 3 | 2 | 1 | **3** | half — even in halves exactly (`6/2`) |
+| 5 | 3 | 2 | 1 | **3** | half — odd in rounds up (`ceil(5/2)`) |
+
+`k3, s1, p1` always returns `in`; `k3, s2, p1` returns `ceil(in/2)`.
 
 ---
 

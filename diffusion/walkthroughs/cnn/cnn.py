@@ -457,8 +457,8 @@ def exp_3_stack_and_relu(seed=0):
 
 def run_experiments():
     # exp_1_why_conv()
-    # exp_2_conv_op()
-    exp_3_stack_and_relu()
+    exp_2_conv_op()
+    # exp_3_stack_and_relu()
     # exp_4_downsample()
     # exp_5_head_and_loss()
     # exp_6_train()
