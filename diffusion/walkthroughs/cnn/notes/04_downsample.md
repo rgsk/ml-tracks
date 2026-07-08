@@ -57,6 +57,11 @@ The `∏ s_i` is the whole story. With stride-1 everywhere that product is alway
 a flat `k−1 = 2` — the slow crawl. But **once you've downsampled, every later `(k−1)` step is worth
 `stride` input pixels**, because the map underneath it has been subsampled. The reach compounds.
 
+Picture one 2nd-layer cell reading three windows of the input. At stride 1 the windows step by 1
+(span 5); at stride 2 they step by 2 and overlap by one pixel at the bold cells (span 7):
+
+<img src="figs/extra/04_receptive_field.png" alt="receptive field: stride 1 vs stride 2" width="420">
+
 Trace a pure stride-2 stack:
 
 ```
