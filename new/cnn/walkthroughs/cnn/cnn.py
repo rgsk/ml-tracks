@@ -26,8 +26,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _HERE = os.path.dirname(os.path.abspath(__file__))                 # new/cnn/walkthroughs/cnn (this topic)
-_NEW = os.path.dirname(os.path.dirname(os.path.dirname(_HERE)))     # new/ (holds diffusion/data)
+_CNN = os.path.dirname(os.path.dirname(_HERE))                     # new/cnn (holds custom/)
+_NEW = os.path.dirname(_CNN)                                        # new/ (holds diffusion/data)
 _FIGS = os.path.join(_HERE, "figures", "experiments")              # experiment-generated figures
+if _CNN not in sys.path:
+    sys.path.insert(0, _CNN)                                        # so `from custom.naive_conv2d import ...` works
 
 
 def _banner(*lines):
@@ -167,8 +170,104 @@ def exp_1_whole_game(seed=0, epochs=5, batch_size=128, lr=1e-3):
     print("  box — `features` — and ask what a single Conv2d actually computes.")
 
 
+# ---------------------------------------------------------------------------
+# EXP 2: open the first box, `features` — what does a single Conv2d compute?
+#
+# exp_1's `features` was a stack of Conv2d. Here we open ONE of them. Three things:
+#   (a) it's just a SLIDING WINDOW multiply-and-sum. We rebuild it from scratch (custom/naive_conv2d,
+#       three loops) and match F.conv2d to floating-point noise — no magic, no special math.
+#   (b) with hand-SET kernels (not learned) we can SEE what a conv detects: edge kernels trace strokes,
+#       a blur smooths. A trained conv just LEARNS kernels like these.
+#   (c) the output-size formula out = floor((in + 2p - k)/s) + 1 — it's what set the 28->14->7 pyramid
+#       you already watched in exp_1.
+# ---------------------------------------------------------------------------
+def exp_2_open_features(seed=0):
+    """Open `features`: (a) a Conv2d is a windowed multiply-and-sum — naive_conv2d (from scratch) matches
+    F.conv2d to ~0; (b) fire hand-set edge/blur kernels at a real digit and SEE the feature maps;
+    (c) the output-size formula that produced exp_1's 28->14->7 pyramid."""
+    _banner("EXP 2: open `features` — a Conv2d is a sliding multiply-and-sum (feature maps, sizes)")
+
+    from custom.naive_conv2d import naive_conv2d
+
+    # ---- (a) rebuild the conv op from scratch and match F.conv2d --------------------------
+    torch.manual_seed(seed)
+    x = torch.randn(1, 1, 6, 6)
+    w = torch.randn(1, 1, 3, 3)
+    mine = naive_conv2d(x, w, stride=1, padding=0)                  # (1,1,4,4)
+    ref = F.conv2d(x, w, stride=1, padding=0)
+    window = x[0, 0, 0:3, 0:3]
+    print("  (a) a conv cell = line the kernel over a window, multiply element-wise, sum.")
+    print(f"        ONE cell by hand (top-left):  (window * kernel).sum() = {(window * w[0, 0]).sum().item():+.4f}")
+    print(f"        F.conv2d[0,0,0,0]                                     = {ref[0, 0, 0, 0].item():+.4f}")
+    print(f"        whole map: max|naive_conv2d - F.conv2d| = {(mine - ref).abs().max().item():.2e}"
+          "   -> our 3 loops ARE F.conv2d.\n")
+
+    # ---- (b) hand-set kernels on a real digit -> feature maps -----------------------------
+    xte, yte = _mnist(train=False)
+    x = xte[(yte == 3).nonzero()[0].item():][:1]                   # a real '3' (1,1,28,28)
+    kernels = {
+        "identity": [
+            [0, 0, 0],
+            [0, 1, 0],
+            [0, 0, 0],
+        ],  # copies the input (sanity)
+        "vertical edge": [
+            [-1, 0, 1],
+            [-2, 0, 2],
+            [-1, 0, 1],
+        ],  # Sobel-x: left<->right change
+        "horizontal edge": [
+            [-1, -2, -1],
+            [ 0,  0,  0],
+            [ 1,  2,  1],
+        ],  # Sobel-y: up<->down change
+        "blur (box)": [[1 / 9] * 3] * 3,  # local average: smooths
+    }
+    print("  (b) fire four hand-SET 3x3 kernels at a real '3' (padding=1 keeps 28x28) -> feature maps:")
+    for name, k in kernels.items():
+        fm = F.conv2d(x, torch.tensor(k).float().view(1, 1, 3, 3), padding=1)
+        print(f"        {name:<16} range [{fm.min():+.2f}, {fm.max():+.2f}]")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 5, figsize=(5 * 2.0, 2.3))
+    axes[0].imshow(_to_img(x), cmap="gray"); axes[0].set_title("input '3'", fontsize=9)
+    for ax, (name, k) in zip(axes[1:], kernels.items()):
+        fm = F.conv2d(x, torch.tensor(k).float().view(1, 1, 3, 3), padding=1).squeeze()
+        if name in ("identity", "blur (box)"):
+            ax.imshow(fm.numpy(), cmap="gray")                     # near-nonnegative: just a filtered image
+        else:
+            m = fm.abs().max().item()                              # signed edge map: 0 = neutral center
+            ax.imshow(fm.numpy(), cmap="coolwarm", vmin=-m, vmax=m)
+        ax.set_title(name, fontsize=9)
+    for ax in axes:
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("one input, four hand-set kernels -> four feature maps (edges, blur)", fontsize=10)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "02_feature_maps.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"      wrote {out}  (edge kernels trace strokes; blur smooths; a CNN LEARNS kernels like these)\n")
+
+    # ---- (c) the output-size formula that made exp_1's 28->14->7 pyramid ------------------
+    def out_size(inp, k, s, p):
+        return (inp + 2 * p - k) // s + 1
+
+    print("  (c) each Conv2d's output size: out = floor((in + 2p - k)/s) + 1 — this IS exp_1's pyramid:")
+    for inp, k, s, p, role in [(28, 3, 1, 1, "stem  k3,s1,p1"),
+                               (28, 3, 2, 1, "down1 k3,s2,p1"),
+                               (14, 3, 2, 1, "down2 k3,s2,p1")]:
+        real = F.conv2d(torch.zeros(1, 1, inp, inp), torch.zeros(1, 1, k, k), stride=s, padding=p).shape[-1]
+        print(f"        {role}:  {inp:>2} -> {out_size(inp, k, s, p):>2}   (F.conv2d gives {real})")
+    print("      -> 28 -> 14 -> 7, exactly the shrink you saw. Next (exp_3): why conv at all, vs the")
+    print("         flatten+MLP we could have reused?")
+
+
 def run_experiments():
-    exp_1_whole_game()
+    # exp_1_whole_game()
+    exp_2_open_features()
 
 
 if __name__ == "__main__":

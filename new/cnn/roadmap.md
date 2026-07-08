@@ -16,19 +16,25 @@ happening, then dig in and break each piece apart.
 
 ```
 new/cnn/
-  roadmap.md            <- this file: how we'll teach the topic
+  roadmap.md              <- this file: how we'll teach the topic
+  custom/                 <- from-scratch impls we build to prove "no magic" (naive_conv2d, …);
+                             each runs standalone as its own self-test vs torch
   walkthroughs/
-    cnn.py              <- the experiments (exp_1 .. exp_N); run each, watch the output
-    notes/
-      *.md              <- one write-up per experiment, with figures
-      figs/             <- figures the experiments generate
-  custom/               <- from-scratch implementations we build to prove "no magic" (naive_conv2d, …)
-  <root: new/cnn/>      <- the cleaned-up model, assembled once we understand each piece
-                           (sometimes built with TODOs to fill in, sometimes straight)
+    cnn/                  <- one folder per topic (cnn now; diffusion subtopics later)
+      cnn.py             <- the experiments (exp_1 .. exp_N); run each, watch the output
+      notes/
+        *.md             <- one write-up per experiment, with figures
+      figures/
+        figures.py       <- generates illustrative diagrams (no experiment counterpart)
+        experiments/     <- figures the experiments (exp_*) produce
+        generated/       <- figures figures.py produces
+        handmade/        <- hand-drawn diagrams
+  <root: new/cnn/>        <- the cleaned-up model, assembled once we understand each piece
+                             (sometimes built with TODOs to fill in, sometimes straight)
 ```
 
-Small topic (CNN) → **one** walkthrough file. A big topic (diffusion) → several files, each with
-multiple experiments.
+Small topic (CNN) → **one** topic folder with **one** walkthrough file. A big topic (diffusion) →
+several topic folders under `walkthroughs/`, each with its own file(s), notes, and figures.
 
 ---
 
@@ -64,4 +70,5 @@ U-Net we'll build for diffusion.
 
 ---
 
-*Run: `python walkthroughs/cnn.py`. Figures + notes land in `walkthroughs/notes/`.*
+*Run: `python walkthroughs/cnn/cnn.py`. Notes land in `walkthroughs/cnn/notes/`, figures in
+`walkthroughs/cnn/figures/`.*
