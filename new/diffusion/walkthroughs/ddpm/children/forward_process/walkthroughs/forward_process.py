@@ -201,6 +201,15 @@ def forward_iterative(x0, betas, t_idx, n_samples, generator=None):
     return x
 
 
+def forward_closed_form(x0, alpha_bars, t_idx, n_samples, generator=None):
+    """The ONE-JUMP forward process: x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε, one fresh ε ~ N(0,1) per sample.
+    Same signature/return as forward_iterative so the two can be compared draw-for-draw — this is
+    the loop above collapsed into a single step by the derivation in the comment block."""
+    ab = alpha_bars[t_idx]
+    eps = torch.randn(n_samples, generator=generator)
+    return ab.sqrt() * x0 + (1.0 - ab).sqrt() * eps
+
+
 '''
 DERIVATION — the forward closed form  x_t = √ᾱ·x0 + √(1−ᾱ)·ε : why the t single steps
 collapse into ONE jump.
@@ -240,20 +249,30 @@ def exp_3_closed_form(seed=0, T=1000):
     g = torch.Generator().manual_seed(seed)
     betas, _, alpha_bars = make_linear_schedule(T=T)
 
-    # (A) we can't compare single samples (each draws its own noise); compare the DISTRIBUTION.
+    # (A) run BOTH procedures as Monte-Carlo and compare. We can't match single samples (each
+    #     draws its own noise), so compare the DISTRIBUTION each lands in — iterative (T-step loop)
+    #     vs closed form (one jump). Both should agree, and both should hit the analytic √ᾱ·x0 /
+    #     √(1-ᾱ) that the derivation predicts.
     x0 = torch.tensor(2.0)
     n = 40000
-    print("  (A) step-by-step vs one-jump. Noise a fixed x0=2.0 step-by-step 40k times to level t,")
-    print("      then compare its empirical mean/std to the closed form's √ᾱ·x0 and √(1-ᾱ):\n")
-    print(f"  {'t':>4} | {'iter mean':>10} {'iter std':>9} | {'√ᾱ·x0':>8} {'√(1-ᾱ)':>8}")
-    print(f"  {'-'*4}-+-{'-'*10}-{'-'*9}-+-{'-'*8}-{'-'*8}")
+    print("  (A) step-by-step vs one-jump. Noise a fixed x0=2.0 to level t, 40k times, TWO ways —")
+    print("      forward_iterative (the T-step loop) and forward_closed_form (the single jump) —")
+    print("      then read off each one's empirical mean/std. They should match each other, and")
+    print("      both should match the analytic √ᾱ·x0 and √(1-ᾱ):\n")
+    print(f"  {'t':>4} | {'iter mean':>10} {'iter std':>9} | {'closed mean':>11} {'closed std':>10} "
+          f"| {'√ᾱ·x0':>8} {'√(1-ᾱ)':>8}")
+    print(f"  {'-'*4}-+-{'-'*10}-{'-'*9}-+-{'-'*11}-{'-'*10}-+-{'-'*8}-{'-'*8}")
     for t in [100, 500, T - 1]:
-        xt = forward_iterative(x0, betas, t, n, generator=g)
+        xi = forward_iterative(x0, betas, t, n, generator=g)
+        xc = forward_closed_form(x0, alpha_bars, t, n, generator=g)
         ab = alpha_bars[t]
-        print(f"  {t:>4} | {xt.mean():>+10.4f} {xt.std():>9.4f} | "
+        print(f"  {t:>4} | {xi.mean():>+10.4f} {xi.std():>9.4f} | "
+              f"{xc.mean():>+11.4f} {xc.std():>10.4f} | "
               f"{(ab.sqrt()*x0).item():>+8.4f} {(1-ab).sqrt().item():>8.4f}")
-    print("\n      match → we can SKIP the T-step loop and jump straight to any t. That one-liner is")
-    print("      exactly what exp_1's dissolve and the parent's train loop use.\n")
+    print("\n      all three columns agree → the T-step loop and the one jump land in the SAME")
+    print("      distribution, and it's exactly the √ᾱ·x0 / √(1-ᾱ) the derivation predicts. So we")
+    print("      can SKIP the loop and jump straight to any t — what exp_1's dissolve and the")
+    print("      parent's train loop use.\n")
 
     # (B) why √: variance preservation. x0 ~ N(0,1) → Var(x_t) = ᾱ + (1-ᾱ) = 1 for every t.
     print("  (B) why the coefficients are √:  (√ᾱ)² + (√(1-ᾱ))² = ᾱ + (1-ᾱ) = 1. On unit-variance")
@@ -296,13 +315,15 @@ def exp_4_endpoint(seed=0, T=1000):
     print("  levels t, 40k times each, and watch their distributions converge:\n")
     print(f"  {'t':>4} | {'ᾱ':>9} | {'+2.0 mean':>9} {'std':>7} | {'-5.0 mean':>9} {'std':>7}")
     print(f"  {'-'*4}-+-{'-'*9}-+-{'-'*9}-{'-'*7}-+-{'-'*9}-{'-'*7}")
-    for t in [250, 500, 750, T - 1]:
+    for t in [0, 250, 500, 750, T - 1]:
         xa = forward_iterative(x0_a, betas, t, n, generator=g)
         xb = forward_iterative(x0_b, betas, t, n, generator=g)
         ab = alpha_bars[t].item()
         print(f"  {t:>4} | {ab:>9.5f} | {xa.mean():>+9.4f} {xa.std():>7.4f} | "
               f"{xb.mean():>+9.4f} {xb.std():>7.4f}")
     print()
+    print("  At t=0 the two are maximally distinct — mean ≈ x0 (+2.0 vs -5.0) with std ≈ 0 (ᾱ≈1, so")
+    print("  almost no noise yet): all the digit-specific information is intact.")
     print("  At t=250 the two are still far apart (means ≈ √ᾱ·x0: +1.44 vs -3.61) — the digit still")
     print("  shows through, exactly the mid columns of exp_1's dissolve. But as ᾱ→0 the signal term")
     print("  dies, and by t=999 BOTH are ≈ N(0,1): mean~0, std~1, indistinguishable. The forward")
@@ -430,7 +451,9 @@ def exp_6_linear_vs_cosine(seed=0, T=1000):
                 ax.set_ylabel(name, fontsize=11)
     fig.suptitle("same digit, same ε — linear (top) vs cosine (bottom): cosine keeps it legible longer",
                  fontsize=11)
-    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    # h_pad gives the top row's per-cell √ᾱ labels room; without it they collapse against the
+    # cosine row below.
+    fig.tight_layout(rect=(0, 0, 1, 0.95), h_pad=2.5)
     os.makedirs(_FIGS, exist_ok=True)
     out = os.path.join(_FIGS, "06_linear_vs_cosine.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")
@@ -516,11 +539,11 @@ def exp_7_snr(T=1000):
 def run_experiments():
     # exp_1_dissolve()
     # exp_2_schedule()
-    exp_3_closed_form()
+    # exp_3_closed_form()
     # exp_4_endpoint()
     # exp_5_cosine_schedule()
     # exp_6_linear_vs_cosine()
-    # exp_7_snr()
+    exp_7_snr()
 
 
 if __name__ == "__main__":

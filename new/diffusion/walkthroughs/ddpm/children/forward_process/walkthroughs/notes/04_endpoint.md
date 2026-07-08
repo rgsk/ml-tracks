@@ -16,7 +16,7 @@ From exp_3, the noised image has
 ```
 
 As `t → T`, `ᾱ_t → 0`, so the **signal term `√ᾱ·x0` vanishes** and the **std → 1**. Whatever `x0`
-was, `x_T ≈ N(0, I)`. The digit-specific part dies; only universal static is left.
+was, `x_T ≈ N(0, 1)`. The digit-specific part dies; only universal static is left.
 
 ---
 
@@ -28,12 +28,15 @@ their mean/std:
 ```
    t |    ᾱ     | +2.0 mean   std  | -5.0 mean   std
  -----+----------+------------------+-----------------
-  250 |  0.52142 |  +1.4458  0.6884 |  -3.6127  0.6935
-  500 |  0.07780 |  +0.5519  0.9616 |  -1.3923  0.9608
-  750 |  0.00330 |  +0.1132  1.0006 |  -0.2822  0.9965
-  999 |  0.00004 |  +0.0213  0.9965 |  -0.0362  1.0028
+    0 |  0.99990 |  +1.9998  0.0100 |  -4.9997  0.0100
+  250 |  0.52142 |  +1.4451  0.6885 |  -3.6124  0.6928
+  500 |  0.07780 |  +0.5515  0.9612 |  -1.3923  0.9603
+  750 |  0.00330 |  +0.1125  1.0003 |  -0.2836  0.9970
+  999 |  0.00004 |  +0.0207  0.9952 |  -0.0327  1.0042
 ```
 
+- **At the start (`t=0`)** the two are maximally distinct — mean `≈ x0` (`+2.0` vs `-5.0`) with
+  `std ≈ 0` (`ᾱ ≈ 1`, so almost no noise yet). All the digit-specific information is intact.
 - **Mid-way (`t=250`)** the two are still far apart — means `≈ √ᾱ·x0` = `+1.45` vs `-3.61`. The
   original still shows through (those are the *middle* columns of exp_1's dissolve, where the digit
   is grainy but legible).

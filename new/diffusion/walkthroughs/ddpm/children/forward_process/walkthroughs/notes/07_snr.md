@@ -44,7 +44,10 @@ maximally ambiguous).
 
 **(2) log-SNR is the honest axis.** SNR crosses ~9 orders of magnitude, so only in log does the
 schedule look like a smooth ramp. The key landmark is `logSNR = 0` ⇔ `SNR = 1` ⇔ **signal power ==
-noise power** = the "halfway hard" point:
+noise power** = the "halfway hard" point. 
+
+`SNR = ᾱ/(1-ᾱ) = 1` means `ᾱ = 1-ᾱ`, i.e. `ᾱ = 0.5`, so
+signal power is `0.5` and noise power is `1 - 0.5 = 0.5` — `SNR = 0.5 / (1 - 0.5) = 1`:
 
 ```
   linear crosses logSNR=0 at t ≈ 259   → front-loads the easy end, then crams the tail at extreme low SNR

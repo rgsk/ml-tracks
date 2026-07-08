@@ -22,19 +22,44 @@ match **in distribution**.
 
 ## (A) one-jump == step-by-step
 
-Noise a fixed `x0 = 2.0` step-by-step 40k times to level `t`, and compare the empirical
-mean/std of those draws to the closed form's predicted `√ᾱ·x0` and `√(1-ᾱ)`:
+Noise a fixed `x0 = 2.0` to level `t`, 40k times, **two ways** — `forward_iterative` (the T-step
+loop) and `forward_closed_form` (the single jump) — and read off each one's empirical mean/std.
+The two procedures should match each other, and both should match the analytic `√ᾱ·x0` / `√(1-ᾱ)`:
 
 ```
-   t |  iter mean  iter std |   √ᾱ·x0   √(1-ᾱ)
- -----+----------------------+-----------------
-  100 |   +1.8919   0.3240   |  +1.8922   0.3238
-  500 |   +0.5553   0.9571   |  +0.5578   0.9603
-  999 |   +0.0177   1.0060   |  +0.0127   1.0000
+   t |  iter mean  iter std | closed mean closed std |   √ᾱ·x0   √(1-ᾱ)
+ -----+----------------------+------------------------+-----------------
+  100 |   +1.8919   0.3240   |    +1.8947   0.3239    |  +1.8922   0.3238
+  500 |   +0.5554   0.9574   |    +0.5541   0.9639    |  +0.5578   0.9603
+  999 |   +0.0179   1.0069   |    +0.0157   0.9996    |  +0.0127   1.0000
 ```
 
-Mean and std match at every `t`. So the loop and the jump are the **same distribution** — we skip
-the loop. That one-liner is exactly what exp_1's dissolve drew and what the parent's train loop uses.
+All three columns agree at every `t`. The loop and the jump land in the **same distribution**, and
+it's exactly the `√ᾱ·x0` / `√(1-ᾱ)` the derivation predicts — so we skip the loop. That one-liner is
+exactly what exp_1's dissolve drew and what the parent's train loop uses.
+
+**Where the `√ᾱ·x0` and `√(1-ᾱ)` come from** — read them straight off the closed form. `x0` is a
+fixed constant and `ε ~ N(0,1)` (so `E[ε]=0`, `Var(ε)=1`); mean and variance are then just the two
+rules "shift/scale a constant" and "scaling by `c` multiplies variance by `c²`":
+
+```
+  x_t = √ᾱ·x0 + √(1-ᾱ)·ε ,   ε ~ N(0,1)
+
+  MEAN:  E[x_t] = E[ √ᾱ·x0 + √(1-ᾱ)·ε ]
+               = √ᾱ·x0 + √(1-ᾱ)·E[ε]        (linearity; √ᾱ·x0 is constant)
+               = √ᾱ·x0 + √(1-ᾱ)·0
+               = √ᾱ·x0                        ← the "√ᾱ·x0" column
+
+  VAR:   Var(x_t) = Var[ √ᾱ·x0 + √(1-ᾱ)·ε ]
+                  = Var[ √(1-ᾱ)·ε ]           (adding the constant √ᾱ·x0 shifts, doesn't spread)
+                  = (√(1-ᾱ))²·Var[ε]          (scaling by c → ×c² on variance)
+                  = (1-ᾱ)·1 = 1-ᾱ
+  STD:   √Var(x_t) = √(1-ᾱ)                    ← the "√(1-ᾱ)" column
+```
+
+So the closed form is `x_t ~ N(√ᾱ·x0, 1-ᾱ)`: the coefficient in front of `x0` **is** the mean, and
+the coefficient in front of `ε` **is** the std. (The `√α_s`/`√(1-α_s)` of a single step are the same
+statement for one hop; the derivation below is what lets us fold `T` hops into this one.)
 
 **Why they collapse into one jump** — compose two steps, leaning on three facts:
 
