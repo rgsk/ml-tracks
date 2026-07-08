@@ -31,8 +31,11 @@ Layers (run each `exp_*`, watch the output, then say "next"):
      28 -> 14 -> 7, receptive field covering the whole digit.
   5. the head + loss — global-average-pool the final map to a vector, Linear -> 10 logits,
      cross-entropy; untrained loss ~ ln 10, overfit one batch -> 0 (wiring test).
-  6. train it — the real loop on MNIST: accuracy climbs to ~99%, far above the MLP for a
-     fraction of the params; save a grid of held-out digits with predicted labels.
+  6. train it — the real loop on MNIST: the GAP net climbs but PLATEAUS ~95%, short of ~99%;
+     still a working reader in ~24k params. Save a grid of held-out digits with predicted labels.
+  7. why GAP stalled — global pooling is translation-INVARIANT, so it discards WHERE features fire;
+     centered digits are told apart by position. A flatten head (same conv trunk) keeps position and
+     hits ~99%. flatten-on-features is fine; only flatten-on-raw-pixels (Layer 1) was the mistake.
 
 Reuses denoiser_and_loss.py's MNISTData (the npz loader + [-1,1] normalization). No torchvision.
 """
@@ -537,13 +540,323 @@ def exp_4_downsample(seed=0):
     print("         Linear -> 10 logits, cross-entropy.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 5: the head + loss — turn the final feature map into class scores, and score them.
+#
+# Layers 2-4 give us a feature stack: (B,1,28,28) -> (B,64,7,7), a small grid of 64-channel
+# feature vectors. To classify we need (B,10) logits and a scalar loss. Two pieces:
+#
+# THE HEAD. How do we go from a (64,7,7) map to a 10-vector? The MLP-era answer was FLATTEN then
+# Linear — but that ties the head to an exact spatial size (3136 inputs) and burns 31k weights.
+# The modern answer is GLOBAL AVERAGE POOLING: average each channel's 7x7 map down to ONE number,
+# giving a 64-vector ("how strongly is feature c present ANYWHERE?"), then a single Linear(64->10).
+# It's spatial-size independent (any HxW pools to 64) and ~50x cheaper. That 64-vector -> 10 logits.
+#
+# THE LOSS. Cross-entropy: softmax the logits to a distribution p, take -log p[true class]. A useful
+# SANITY CHECK falls out of the math: an untrained net has ~equal logits, so p_true ~ 1/C and the
+# loss ~ ln C = ln 10 ~ 2.30. If your untrained loss isn't near that, something is miswired.
+#
+# THE WIRING TEST. Before training on all of MNIST, OVERFIT A SINGLE BATCH: a correctly-wired model
+# with enough capacity must drive one batch's loss to ~0 and accuracy to 100%. If it can't, the bug
+# is in the model/plumbing, not the data or schedule — the single most useful debugging habit there is.
+# ---------------------------------------------------------------------------
+class SmallCNN(torch.nn.Module):
+    """Layers 2-4 assembled + a classifier head: (B,1,28,28) -> (B,10) logits. A stride-1 stem then
+    two stride-2 downsamples (28->14->7, channels 1->16->32->64), then a head.
+
+    head="gap"     : global-average-pool the (64,7,7) map to a 64-vector, Linear(64->10). The Layer-5
+                     default; cheap and position-INVARIANT (Layers 5-6).
+    head="flatten" : flatten the (64,7,7) map to 3136 and Linear(3136->10), keeping POSITION. Layer 7
+                     shows this is what actually reaches ~99% on centered MNIST."""
+
+    def __init__(self, n_classes=10, head="gap"):
+        super().__init__()
+        self.features = torch.nn.Sequential(
+            torch.nn.Conv2d(1, 16, kernel_size=3, padding=1), torch.nn.ReLU(),            # 28x28
+            torch.nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), torch.nn.ReLU(),  # 14x14
+            torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), torch.nn.ReLU(),  # 7x7
+        )
+        self.head_kind = head
+        self.head = torch.nn.Linear(64 if head == "gap" else 64 * 7 * 7, n_classes)
+
+    def forward(self, x):
+        f = self.features(x)                                  # (B, 64, 7, 7)
+        v = f.mean(dim=(2, 3)) if self.head_kind == "gap" else f.flatten(1)   # (B,64) or (B,3136)
+        return self.head(v)                                   # (B, 10)
+
+
+def exp_5_head_and_loss(seed=0):
+    """Assemble the full classifier and check three things: (a) the GAP head turns a (B,64,7,7) map
+    into (B,10) logits, spatial-size-independent and ~50x cheaper than flatten+Linear; (b) an
+    untrained net's cross-entropy loss sits at ~ln 10 (a calibration check the softmax math predicts);
+    (c) OVERFIT one batch -> loss ~0, acc 100%, proving the whole thing is wired and gradients flow."""
+    _banner("LAYER 5: the head + loss — global-average-pool -> logits, cross-entropy, wiring tests")
+
+    import math
+    torch.manual_seed(seed)
+    dev = _device()
+
+    from denoiser_and_loss import MNISTData
+    train = MNISTData(train=True)
+    B = 32
+    xb = train.x[:B].to(dev)                                   # (B,1,28,28) in [-1,1]
+    yb = train.y[:B].to(dev)                                   # (B,) labels 0..9
+    model = SmallCNN().to(dev)
+
+    # ---- (a) the head: global-average-pool -> Linear --------------------------------------
+    with torch.no_grad():
+        f = model.features(xb)
+        v = f.mean(dim=(2, 3))
+        logits = model.head(v)
+    print("  (a) GLOBAL-AVERAGE-POOL the final map, then a Linear head -> class logits.")
+    print(f"      features {tuple(f.shape)}  --mean over H,W-->  {tuple(v.shape)}"
+          f"  --Linear(64->10)-->  {tuple(logits.shape)}")
+    print("      GAP = collapse each channel's 7x7 map to ONE number ('how much of feature c anywhere').")
+    print(f"        GAP + Linear(64->10)       = 64·10+10   = {64 * 10 + 10} params  (works for ANY H,W)")
+    print(f"        flatten + Linear({64*7*7=}->10) = 3136·10+10 = {3136 * 10 + 10} params  (~50x more, size-locked)\n")
+
+    # ---- (b) cross-entropy: untrained loss ~ ln(class count) ------------------------------
+    loss0 = F.cross_entropy(logits, yb).item()
+    print("  (b) cross-entropy = -log( softmax(logits)[true class] ) = -log(p_true).")
+    print(f"      at init the logits are ~equal, so p_true ~ 1/10 and loss ~ ln 10 = {math.log(10):.4f}")
+    print(f"        measured untrained loss = {loss0:.4f}   (matches -> softmax/labels/init all wired right)\n")
+
+    # ---- (c) overfit ONE batch -> loss ~0 (the wiring test) ------------------------------
+    opt = torch.optim.Adam(model.parameters(), lr=3e-3)
+    print("  (c) OVERFIT one batch: a correctly-wired net with enough capacity must drive a single")
+    print("      batch's loss to ~0 and accuracy to 100% (proves gradients flow and the head connects):")
+    for step in range(201):
+        logits = model(xb)
+        loss = F.cross_entropy(logits, yb)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if step % 40 == 0 or step == 200:
+            acc = (logits.argmax(1) == yb).float().mean().item()
+            print(f"        step {step:>3}: loss {loss.item():.4f}   acc {acc * 100:5.1f}%")
+    print("      -> loss collapses to ~0, acc 100%: the full CNN (Layers 2-5) is wired right.\n")
+    print("  Next (Layer 6): train on ALL of MNIST and watch test accuracy climb, for a fraction of the")
+    print("  MLP's params, and save a grid of held-out digits with their predicted labels.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 6: train it — the real loop on MNIST, and read held-out digits.
+#
+# Everything is assembled: SmallCNN (Layers 2-5) with the GAP head maps a digit to 10 logits,
+# cross-entropy scores them, and the one-batch overfit test proved it's wired. Now the actual job:
+# minimize cross-entropy over ALL 60k training images, and MEASURE generalization on the 10k test
+# images the net never sees. The loop is the standard four lines — forward, loss, backward, step —
+# over shuffled minibatches, repeated for a few epochs. We print test accuracy after each epoch so
+# you WATCH it climb from ~chance (10%) to the low-to-mid 90s. It's a working digit reader in ~24k
+# params (smaller than the MLP's first dense layer alone) — but it PLATEAUS around ~95%, short of the
+# ~99% MNIST easily allows. That shortfall is real and intentional: Layer 7 diagnoses WHY the GAP head
+# caps out here and swaps in the head that reaches ~99%. The payoff figure is the digit reader: a grid
+# of held-out digits with predictions (green = correct, red = wrong), a few of them wrong at ~95%.
+# ---------------------------------------------------------------------------
+def exp_6_train(seed=0, epochs=8, batch_size=128, lr=2e-3):
+    """Train the GAP SmallCNN on all of MNIST and watch test accuracy climb — from ~chance to the
+    low-to-mid 90s, where it PLATEAUS (short of the ~99% MNIST allows; Layer 7 explains why). Save a
+    grid of held-out test digits with the CNN's predictions (green=correct, red=wrong)."""
+    _banner("LAYER 6: train the GAP CNN on MNIST — accuracy climbs to ~95%, then plateaus")
+
+    torch.manual_seed(seed)
+    dev = _device()
+
+    from denoiser_and_loss import MNISTData
+    train = MNISTData(train=True)
+    test = MNISTData(train=False)
+    train_loader = torch.utils.data.DataLoader(train, batch_size=batch_size, shuffle=True)
+
+    model = SmallCNN(head="gap").to(dev)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"  model: SmallCNN(GAP head), {n_params:,} params TOTAL — smaller than the MLP's first dense")
+    print(f"         layer alone (784·768 = 602,880 from Layer 1). Training on {len(train)} images on {dev}.\n")
+
+    xte, yte = test.x.to(dev), test.y.to(dev)
+
+    @torch.no_grad()
+    def test_acc():
+        model.eval()
+        correct = 0
+        for i in range(0, len(xte), 2000):                     # chunk the 10k test set
+            correct += (model(xte[i:i + 2000]).argmax(1) == yte[i:i + 2000]).sum().item()
+        model.train()
+        return correct / len(xte)
+
+    opt = torch.optim.Adam(model.parameters(), lr=lr)
+    print(f"  epochs={epochs}, batch={batch_size}, lr={lr}, {len(train_loader)} steps/epoch."
+          "  test accuracy after each epoch:")
+    print(f"        before training : test acc {test_acc() * 100:5.2f}%   (~chance, 10 classes)")
+    for ep in range(1, epochs + 1):
+        run = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(dev), yb.to(dev)
+            loss = F.cross_entropy(model(xb), yb)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            run += loss.item()
+        print(f"        epoch {ep}        : train loss {run / len(train_loader):.4f}   "
+              f"test acc {test_acc() * 100:5.2f}%")
+
+    # ---- the payoff: an actual digit reader on held-out images ----------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    model.eval()
+    torch.manual_seed(seed)
+    idxs = torch.randperm(len(test))[:40]                      # 40 held-out digits
+    with torch.no_grad():
+        preds = model(xte[idxs]).argmax(1).cpu()
+    rows, cols = 5, 8
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.1, rows * 1.25))
+    for ax, k in zip(axes.flat, range(len(idxs))):
+        i = idxs[k].item()
+        pred, true = preds[k].item(), test.y[i].item()
+        ok = pred == true
+        ax.imshow(_to_img(test.x[i]), cmap="gray")
+        ax.set_title(f"{pred}" if ok else f"{pred}≠{true}", color=("green" if ok else "red"), fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("held-out MNIST digits — CNN predictions (green = correct, red = wrong)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out = os.path.join(_FIGS, "06_predictions.png")
+    os.makedirs(_FIGS, exist_ok=True)
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — held-out digits with the GAP CNN's predictions (a few wrong at ~95%).")
+    print("  It works, but it stalled short of ~99%. Next (Layer 7): WHY the GAP head caps out on")
+    print("  centered MNIST, and the flatten head that fixes it -> ~99%.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 7: why GAP stalled — global pooling throws position away; flatten keeps it, and wins.
+#
+# Layer 6's GAP net plateaued around ~95%, not the ~99% MNIST allows. This layer diagnoses it and
+# fixes it, with the SAME conv stack — only the head changes.
+#
+# THE CULPRIT: GAP is largely translation-INVARIANT. Layer 1 showed conv features are translation-
+# EQUIVARIANT (shift the input -> the feature MAP shifts). GAP then AVERAGES each channel's map over
+# space, and the average of a shifted map changes far less than a position-keeping readout would -> the
+# pooled 64-vector moves ~4x less than the flatten vector when the digit shifts (measured below; it's
+# not perfectly invariant here because stride-2 aliasing and boundaries leak some position). So GAP
+# mostly sees how much of a feature exists, not WHERE — it discards position. That invariance is
+# a feature for big natural-image nets (an object can be anywhere), but MNIST digits are CENTERED and
+# told apart largely by position — the top loop of a 9 vs the bottom loop of a 6, a 1's central stroke.
+# Throwing position away is throwing away the signal. (GAP also bottlenecks 64·7·7=3136 numbers down to
+# 64 — a 49x crush — while flatten keeps all 3136.)
+#
+# THE FIX: a FLATTEN head. Lay the (64,7,7) map into a 3136-vector (keeping which feature fired WHERE)
+# and Linear(3136->10). It costs more params in the head (31k vs 650) but reaches ~99%. And this does
+# NOT contradict Layer 1's "don't flatten": there we flattened RAW PIXELS (before any conv), destroying
+# the spatial structure; here we flatten CONV FEATURES the stack already built with weight-sharing and
+# locality. Flatten-on-pixels is the disease; flatten-on-features is a fine readout (it's what LeNet did).
+# We (a) train both heads head-to-head, (b) MEASURE the shift-invariance that explains the gap, (c) save
+# the ~99% reader.
+# ---------------------------------------------------------------------------
+def exp_7_gap_vs_flatten(seed=0, epochs=5, batch_size=128):
+    """Diagnose Layer 6's plateau: (a) same conv stack, GAP vs flatten head, trained head-to-head —
+    GAP ~95%, flatten ~99%; (b) MEASURE why: shift the digit a few px and the GAP vector barely moves
+    (translation-invariant -> blind to position) while the flatten vector changes a lot; (c) save the
+    flatten model's held-out predictions — the ~99% digit reader."""
+    _banner("LAYER 7: why GAP stalled — position-blind pooling vs position-keeping flatten (-> ~99%)")
+
+    torch.manual_seed(seed)
+    dev = _device()
+
+    from denoiser_and_loss import MNISTData
+    train = MNISTData(train=True)
+    test = MNISTData(train=False)
+    loader = torch.utils.data.DataLoader(train, batch_size=batch_size, shuffle=True)
+    xte, yte = test.x.to(dev), test.y.to(dev)
+
+    def train_head(head, lr):
+        torch.manual_seed(seed)                                # same init/shuffle -> fair comparison
+        m = SmallCNN(head=head).to(dev)
+        opt = torch.optim.Adam(m.parameters(), lr=lr)
+        for _ in range(epochs):
+            for xb, yb in loader:
+                xb, yb = xb.to(dev), yb.to(dev)
+                loss = F.cross_entropy(m(xb), yb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+        return m
+
+    @torch.no_grad()
+    def acc(m):
+        m.eval()
+        c = 0
+        for i in range(0, len(xte), 2000):
+            c += (m(xte[i:i + 2000]).argmax(1) == yte[i:i + 2000]).sum().item()
+        return c / len(xte)
+
+    # ---- (a) same conv stack, two heads, head-to-head ------------------------------------
+    gap = train_head("gap", lr=2e-3)
+    flat = train_head("flatten", lr=1e-3)
+    p_gap = sum(p.numel() for p in gap.parameters())
+    p_flat = sum(p.numel() for p in flat.parameters())
+    print(f"  (a) SAME conv stack ({epochs} epochs each), only the head differs:")
+    print(f"        GAP head      ( 64 -> 10):  {p_gap:>6,} params   test acc {acc(gap) * 100:5.2f}%")
+    print(f"        flatten head  (3136-> 10):  {p_flat:>6,} params   test acc {acc(flat) * 100:5.2f}%")
+    print("      -> flatten wins by several points. The conv features are identical; the head is the")
+    print("         whole difference. Why?\n")
+
+    # ---- (b) MEASURE the cause: GAP is translation-invariant, flatten isn't --------------
+    # conv features are translation-EQUIVARIANT; GAP averages over space (invariant), flatten keeps it.
+    xb = xte[:512]
+    xs = torch.roll(xb, shifts=(2, 2), dims=(2, 3))            # shift the digit 2px down-and-right
+    with torch.no_grad():
+        f0 = flat.features(xb)
+        f1 = flat.features(xs)
+        gap0, gap1 = f0.mean(dim=(2, 3)), f1.mean(dim=(2, 3))        # GAP representation
+        flt0, flt1 = f0.flatten(1), f1.flatten(1)                    # flatten representation
+    gap_move = ((gap1 - gap0).norm(dim=1) / (gap0.norm(dim=1) + 1e-9)).mean().item()
+    flt_move = ((flt1 - flt0).norm(dim=1) / (flt0.norm(dim=1) + 1e-9)).mean().item()
+    print("  (b) shift the digit 2px and watch how much each head's REPRESENTATION moves:")
+    print(f"        GAP vector     moves {gap_move * 100:5.1f}%   (averaging over space washes out position)")
+    print(f"        flatten vector moves {flt_move * 100:5.1f}%   (it encodes WHERE each feature fired)")
+    print(f"      -> flatten is ~{flt_move / gap_move:.0f}x more position-sensitive. GAP largely averages position")
+    print("         away — but centered MNIST digits are told apart BY position (a 6's loop is low, a 9's")
+    print("         is high), so the flatten head keeps exactly the signal GAP discards.\n")
+
+    # ---- (c) the payoff: the ~99% reader --------------------------------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    flat.eval()
+    torch.manual_seed(seed)
+    idxs = torch.randperm(len(test))[:40]
+    with torch.no_grad():
+        preds = flat(xte[idxs]).argmax(1).cpu()
+    rows, cols = 5, 8
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.1, rows * 1.25))
+    for ax, k in zip(axes.flat, range(len(idxs))):
+        i = idxs[k].item()
+        pred, true = preds[k].item(), test.y[i].item()
+        ok = pred == true
+        ax.imshow(_to_img(test.x[i]), cmap="gray")
+        ax.set_title(f"{pred}" if ok else f"{pred}≠{true}", color=("green" if ok else "red"), fontsize=11)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("held-out MNIST digits — flatten CNN predictions (~99%)", fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    out = os.path.join(_FIGS, "07_predictions_flatten.png")
+    os.makedirs(_FIGS, exist_ok=True)
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  (c) wrote {out} — the flatten model's held-out predictions (~99%, nearly all green).")
+    print("      Lesson: match the head's invariance to the task. GAP's position-invariance is right for")
+    print("      big natural images, wrong for small centered digits — flatten keeps the position they")
+    print("      need. Same conv trunk either way, and that trunk is what we carry into the U-Net next.")
+
+
 def run_experiments():
     # exp_1_why_conv()
     # exp_2_conv_op()
     # exp_3_stack_and_relu()
-    exp_4_downsample()
+    # exp_4_downsample()
     # exp_5_head_and_loss()
     # exp_6_train()
+    exp_7_gap_vs_flatten()
 
 
 @contextlib.contextmanager
