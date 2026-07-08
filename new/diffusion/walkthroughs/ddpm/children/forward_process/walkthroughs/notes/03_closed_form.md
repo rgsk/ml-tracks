@@ -91,10 +91,21 @@ fades — it just trades signal for noise.
 
 That's the whole point of the square roots: it's the **squares** that must sum to 1 (signal power
 `ᾱ` + noise power `1-ᾱ`), so the **amplitudes** have to be `√ᾱ` and `√(1-ᾱ)`. Pick `ᾱ` and `1-ᾱ`
-directly instead and the variance would blow up early and collapse late. With the √, `x_t` never
-blows up or fades — it just **trades signal for noise** as `t` climbs. (This is called a
-*variance-preserving* process; it's also why `x_T` sits at a clean unit-variance `N(0,I)` — the
-next box.)
+directly instead and the variance would be `ᾱ²+(1-ᾱ)²` — still 1 at the two ends, but **sagging to
+0.5 in the middle** (at `ᾱ=0.5`), so `x_t`'s scale would wobble across `t`:
+
+```
+   t |   ᾱ    | √-coeffs Var | (ᾱ,1-ᾱ) Var  = ᾱ²+(1-ᾱ)²
+ -----+--------+--------------+--------------------------
+    0 | 0.9999 |    1.00      |    1.00
+  250 | 0.5214 |    1.01      |    0.50   ← sags
+  500 | 0.0778 |    1.00      |    0.86
+  999 | 0.0000 |    1.01      |    1.01
+```
+
+With the √, the squares are exactly `ᾱ` and `1-ᾱ`, which sum to 1 at **every** `t` — no wobble;
+`x_t` just **trades signal for noise** as `t` climbs. (This is called a *variance-preserving*
+process; it's also why `x_T` sits at a clean unit-variance `N(0,I)` — the next box.)
 
 ---
 

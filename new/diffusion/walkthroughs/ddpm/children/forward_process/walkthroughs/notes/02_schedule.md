@@ -75,7 +75,6 @@ lives in `x_t` — the exact numbers behind the fade in [01_dissolve.md](01_diss
 | next | opens | the question |
 |---|---|---|
 | **exp_3** | the closed-form **jump** / the `√` | does dialing `ᾱ` really equal adding noise step-by-step? why are the coefficients `√`? |
-| exp_4 | the **endpoint** | why is `x_T` pure `N(0,I)` regardless of `x0`? (→ why sampling starts from noise) |
 
 Next: **exp_3** — Monte-Carlo verify that the one-line jump matches the slow step-by-step process,
 and see why the `√` makes the process *variance-preserving*.

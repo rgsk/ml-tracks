@@ -64,12 +64,10 @@ That closes the core forward process: **a digit → a universal noise endpoint.*
 
 ## What's next
 
-The remaining boxes are about the *shape* of the schedule, not new mechanics:
+The core forward *mechanics* are done. The remaining boxes are about the *shape* of the schedule:
 
 - **exp_5** — the **cosine schedule**: declare the `ᾱ` curve directly and back-solve `β` (the
   reverse of how we built the linear one).
-- exp_6 — **linear vs cosine**: which keeps signal alive longer, made visible with a second dissolve.
-- exp_7 — **SNR**: `ᾱ/(1-ᾱ)` as the per-`t` difficulty, and the axis modern schedules are defined in.
 
 Next: **exp_5 — the cosine schedule.**
 

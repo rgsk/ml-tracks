@@ -516,11 +516,11 @@ def exp_7_snr(T=1000):
 def run_experiments():
     # exp_1_dissolve()
     # exp_2_schedule()
-    # exp_3_closed_form()
+    exp_3_closed_form()
     # exp_4_endpoint()
     # exp_5_cosine_schedule()
     # exp_6_linear_vs_cosine()
-    exp_7_snr()
+    # exp_7_snr()
 
 
 if __name__ == "__main__":
