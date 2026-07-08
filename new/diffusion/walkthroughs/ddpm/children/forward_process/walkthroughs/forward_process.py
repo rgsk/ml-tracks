@@ -187,18 +187,7 @@ def exp_2_schedule():
 # "real" forward process adds a little noise T times:  x_s = √α_s·x_{s-1} + √(1-α_s)·z_s. Do they
 # agree? They can't match sample-by-sample (each draws its own noise) but they match in
 # DISTRIBUTION — and seeing why also reveals why the coefficients are √: variance preservation.
-#
-# DERIVATION — why T single steps collapse into one jump (and why √):
-#   one step:   x_s = √α_s·x_{s-1} + √(1-α_s)·z_s,   z_s ~ N(0,I) iid.
-#   compose two:
-#     x_2 = √α_2·(√α_1·x0 + √(1-α_1)·ε_1) + √(1-α_2)·ε_2
-#         = √(α_1α_2)·x0 + [√α_2·√(1-α_1)·ε_1 + √(1-α_2)·ε_2]
-#   the bracket is two independent zero-mean Gaussians, so their VARIANCES add:
-#     α_2(1-α_1) + (1-α_2) = 1 - α_1α_2,
-#   hence it's one fresh √(1-α_1α_2)·ε. With ᾱ_2 = α_1α_2:  x_2 = √ᾱ_2·x0 + √(1-ᾱ_2)·ε.
-#   induction over t →  x_t = √ᾱ·x0 + √(1-ᾱ)·ε.
-#   variance (x0 ⟂ ε, Var(x0)=1):  Var(x_t) = (√ᾱ)²·1 + (√(1-ᾱ))²·1 = ᾱ + (1-ᾱ) = 1  for EVERY t.
-#   → the √ is chosen precisely so signal-power ᾱ + noise-power (1-ᾱ) = 1: no blow-up, no fade.
+# (Full derivation in the ''' block just below forward_iterative.)
 # ---------------------------------------------------------------------------
 def forward_iterative(x0, betas, t_idx, n_samples, generator=None):
     """Step-by-step forward process from x0 through steps 0..t_idx, run n_samples independent
@@ -209,6 +198,36 @@ def forward_iterative(x0, betas, t_idx, n_samples, generator=None):
         z = torch.randn(n_samples, generator=generator)
         x = torch.sqrt(1.0 - betas[s]) * x + torch.sqrt(betas[s]) * z
     return x
+
+
+'''
+DERIVATION — the forward closed form  x_t = √ᾱ·x0 + √(1−ᾱ)·ε : why the t single steps
+collapse into ONE jump.
+  Single step:  x_s = √α_s·x_{s−1} + √(1−α_s)·z_s,   z_s ~ N(0,I) iid.
+  Three facts:
+     (A) scaling by c scales VARIANCE by c²;
+     (B) independent Gaussians added → their variances add;
+     (C) a sum of Gaussians is Gaussian.
+  Compose two steps:
+      x_1 = √α₁·x0 + √(1−α₁)·ε₁
+      x_2 = √α₂·x_1 + √(1−α₂)·ε₂
+          = √α₂·[√α₁·x0 + √(1−α₁)·ε₁] + √(1−α₂)·ε₂
+          = √(α₁α₂)·x0 + [ √α₂·√(1−α₁)·ε₁ + √(1−α₂)·ε₂ ]
+  The bracket is two independent zero-mean Gaussians; by A+B its variance is
+      α₂(1−α₁) + (1−α₂)  =  1 − α₁α₂,
+  and by C it is one fresh noise √(1−α₁α₂)·ε. With ᾱ₂ = α₁α₂:
+      x_2 = √ᾱ₂·x0 + √(1−ᾱ₂)·ε.
+  By induction over t (each step folds one more α in):
+      x_t = √ᾱ·x0 + √(1−ᾱ)·ε,   ᾱ = ∏_{s≤t} α_s.        [QED]
+
+Why the coefficients are square roots — VARIANCE PRESERVATION (Var(x0)=1, x0 ⟂ ε):
+      Var(x_t) = (√ᾱ)²·Var(x_0) + (√(1−ᾱ))²·Var(ε)
+               =    ᾱ   ·   1      +    (1−ᾱ)   ·   1
+               =    ᾱ + (1 − ᾱ)
+               =    1                        ← for EVERY t
+signal power ᾱ + noise power (1−ᾱ) always sum to 1, so x_t neither blows up nor
+fades — it just trades signal for noise.
+'''
 
 
 def exp_3_closed_form(seed=0, T=1000):

@@ -36,18 +36,30 @@ mean/std of those draws to the closed form's predicted `√ᾱ·x0` and `√(1-�
 Mean and std match at every `t`. So the loop and the jump are the **same distribution** — we skip
 the loop. That one-liner is exactly what exp_1's dissolve drew and what the parent's train loop uses.
 
-**Why they collapse** (derivation, composing two steps):
+**Why they collapse into one jump** — compose two steps, leaning on three facts:
 
 ```
-  x_2 = √α_2·(√α_1·x0 + √(1-α_1)·ε_1) + √(1-α_2)·ε_2
-      = √(α_1α_2)·x0 + [ √α_2·√(1-α_1)·ε_1 + √(1-α_2)·ε_2 ]
+DERIVATION — the forward closed form  x_t = √ᾱ·x0 + √(1−ᾱ)·ε
+
+  Single step:  x_s = √α_s·x_{s−1} + √(1−α_s)·z_s,   z_s ~ N(0,I) iid.
+  Three facts:
+     (A) scaling by c scales VARIANCE by c²;
+     (B) independent Gaussians added → their variances add;
+     (C) a sum of Gaussians is Gaussian.
+  Compose two steps:
+      x_1 = √α₁·x0 + √(1−α₁)·ε₁
+      x_2 = √α₂·x_1 + √(1−α₂)·ε₂
+          = √α₂·[√α₁·x0 + √(1−α₁)·ε₁] + √(1−α₂)·ε₂
+          = √(α₁α₂)·x0 + [ √α₂·√(1−α₁)·ε₁ + √(1−α₂)·ε₂ ]
+  The bracket is two independent zero-mean Gaussians; by A+B its variance is
+      α₂(1−α₁) + (1−α₂)  =  1 − α₁α₂,
+  and by C it is one fresh noise √(1−α₁α₂)·ε.  With ᾱ₂ = α₁α₂:
+      x_2 = √ᾱ₂·x0 + √(1−ᾱ₂)·ε.
+  By induction over t (each step folds one more α in):
+      x_t = √ᾱ·x0 + √(1−ᾱ)·ε,   ᾱ = ∏_{s≤t} α_s.        [QED]
 ```
 
-The bracket is two independent zero-mean Gaussians, so their **variances add**:
-`α_2(1-α_1) + (1-α_2) = 1 - α_1α_2`. A sum of Gaussians is Gaussian, so the bracket is one fresh
-`√(1-α_1α_2)·ε`. With `ᾱ_2 = α_1α_2` that's `x_2 = √ᾱ_2·x0 + √(1-ᾱ_2)·ε` — and by induction over
-`t`, `x_t = √ᾱ·x0 + √(1-ᾱ)·ε`. The T steps fold into one because each step just multiplies one more
-`α` into `ᾱ`.
+The T steps fold into one because each step just multiplies one more `α` into `ᾱ`.
 
 ---
 
@@ -68,7 +80,13 @@ Take unit-variance data `x0 ~ N(0,1)` and measure `Var(x_t)` across `t`:
 `Var(x_t)` is pinned at **≈ 1 for every `t`**. The reason (`x0 ⊥ ε`, `Var(x0)=1`):
 
 ```
-  Var(x_t) = (√ᾱ)²·Var(x0) + (√(1-ᾱ))²·Var(ε) = ᾱ + (1-ᾱ) = 1
+Why the coefficients are square roots — VARIANCE PRESERVATION (Var(x0)=1, x0 ⟂ ε):
+      Var(x_t) = (√ᾱ)²·Var(x_0) + (√(1−ᾱ))²·Var(ε)
+               =    ᾱ   ·   1      +    (1−ᾱ)   ·   1
+               =    ᾱ + (1 − ᾱ)
+               =    1                        ← for EVERY t
+signal power ᾱ + noise power (1−ᾱ) always sum to 1, so x_t neither blows up nor
+fades — it just trades signal for noise.
 ```
 
 That's the whole point of the square roots: it's the **squares** that must sum to 1 (signal power
