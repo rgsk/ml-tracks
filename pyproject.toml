@@ -13,3 +13,9 @@ dependencies = [
     "gymnasium[classic-control]>=1.0",  # RL environments (CartPole, etc.)
     "ipykernel>=7.0",                   # Jupyter notebooks (.ipynb worksheets)
 ]
+
+[dependency-groups]
+dev = [
+    "jupytext>=1.19.4",
+    "nbconvert>=7.17.1",
+]
