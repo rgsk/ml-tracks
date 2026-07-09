@@ -43,6 +43,11 @@ Two structural facts fall out of that loop, and they're the whole reason convs b
   everywhere.
 - **Locality** — `out[o,i,j]` depends only on a small `kH×kW` window, not the whole image.
 
+Watch weight sharing happen: *one* 3×3 kernel walks across the digit and the feature map fills in
+pixel by pixel — the same detector fires wherever the stroke goes, nothing is position-specific.
+
+![one kernel sliding across the digit, feature map filling in](../figures/generated/02_slide.gif)
+
 > The kernel index and the input index move in the *same* direction — so this is technically
 > cross-**correlation**, not textbook convolution (which flips the kernel). Every framework does this
 > and calls it "conv." It only matters when you *hand-set* a kernel (next); a *learned* kernel just
