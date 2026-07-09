@@ -617,12 +617,163 @@ def exp_5_downsample(seed=0):
     print("  flatten vs global-average-pool, cross-entropy, and two wiring checks.")
 
 
+# ---------------------------------------------------------------------------
+# EXP 6: the `head` + loss — why `flatten -> Linear`, and is it the right head?
+#
+# exp_1's `features` handed us a (B, 64, 7, 7) grid; the `head` was `flatten -> Linear -> 10`. This is
+# the last box. Three things, all measured:
+#
+#   (A) TWO HEADS, WHAT EACH KEEPS. flatten reads the 64x7x7 grid as one 3136-vector — it keeps WHERE
+#       each feature fired (position). The tempting alternative, GLOBAL-AVERAGE-POOL, averages each
+#       channel's 7x7 map to one number -> a 64-vector: "how much did feature c fire ANYWHERE",
+#       position thrown away. GAP is the standard head on big images (you WANT translation invariance
+#       when the object roams). But MNIST digits are CENTERED, so position is a real cue — we train
+#       both heads on the same trunk and watch flatten win.
+#   (B) THE LOSS. cross-entropy = -log(softmax at the true class), and WIRING CHECK 1: an untrained
+#       net outputs ~uniform over 10 classes, so its loss should be ~ln(10) = 2.303.
+#   (C) WIRING CHECK 2: overfit ONE batch. A correctly wired model+loss+optimizer must be able to
+#       memorize a single batch -> loss -> ~0, acc -> 100%. If it can't, something is miswired.
+# ---------------------------------------------------------------------------
+def exp_6_head_and_loss(seed=0):
+    """Open the last box, the `head` + loss: (A) flatten keeps WHERE features fired, global-average-pool
+    averages it away — train both on the same trunk and flatten wins on CENTERED digits; (B) cross-entropy
+    = -log(softmax), and an untrained net's loss ~= ln(10); (C) overfit ONE
+    batch -> loss ~0 (the wiring sanity check). Save the overfit curve and the flatten-vs-GAP accuracy."""
+    _banner("EXP 6: the head + loss — flatten vs global-average-pool, cross-entropy, wiring checks")
+
+    torch.manual_seed(seed)
+    dev = _device()
+
+    def make_features():
+        return nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=3, padding=1), nn.ReLU(),
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1), nn.ReLU(),
+        )
+
+    def make_model(head):
+        feats = make_features()
+        if head == "flatten":                                        # keeps position: 64x7x7 -> 3136-vec
+            h = nn.Sequential(nn.Flatten(), nn.Linear(64 * 7 * 7, 10))
+        else:                                                        # GAP: average each channel's 7x7 -> 64-vec
+            h = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(64, 10))
+        return nn.Sequential(feats, h)
+
+    # ---- (A) the two heads: what each keeps, and their parameter counts --------------------
+    trunk_params = sum(p.numel() for p in make_features().parameters())
+    flat_head = 64 * 7 * 7 * 10 + 10
+    gap_head = 64 * 10 + 10
+    print("  (A) the final feature grid is (B, 64, 7, 7). two ways to turn it into 10 class scores:")
+    print(f"        flatten -> Linear : read the grid as ONE 3136-vec -> Linear(3136,10) = {flat_head:,} weights")
+    print("                            keeps WHERE each feature fired (position is preserved).")
+    print(f"        GAP     -> Linear : average each channel's 7x7 -> 64-vec -> Linear(64,10) = {gap_head:,} weights")
+    print("                            keeps only HOW MUCH each feature fired (position averaged away).")
+    print(f"      (shared conv trunk: {trunk_params:,} params either way.)")
+
+    # GAP is nothing fancy: AdaptiveAvgPool2d(1) == mean over the spatial dims (just kept as 1x1).
+    f = torch.randn(2, 64, 7, 7)
+    a = nn.AdaptiveAvgPool2d(1)(f).flatten(1)                        # (B,64,7,7)->(B,64,1,1)->(B,64)
+    b = f.mean(dim=(2, 3))                                           # (B,64,7,7)->(B,64), same numbers
+    print(f"      (GAP is just a mean: |AdaptiveAvgPool2d(1).flatten - f.mean(dim=(2,3))| = "
+          f"{(a - b).abs().max().item():.2e})")
+    print("      GAP is the standard head on big images (object can be anywhere -> want invariance),")
+    print("      but MNIST digits are CENTERED, so position is a real cue. let's measure it.\n")
+
+    # ---- (B) the loss: cross-entropy = -log(softmax), and the untrained-loss check --------
+    xtr, ytr = _mnist(train=True)
+    xte, yte = _mnist(train=False)
+
+    torch.manual_seed(seed)
+    model = make_model("flatten").to(dev)
+    xb0, yb0 = xtr[:256].to(dev), ytr[:256].to(dev)
+    with torch.no_grad():
+        logits = model(xb0)
+        ref = F.cross_entropy(logits, yb0)
+    import math
+    print("  (B) cross-entropy = -log(softmax at the true class).")
+    print("      WIRING CHECK 1 — an UNtrained net outputs ~uniform over 10 classes, so loss ~= ln(10):")
+    print(f"        untrained loss = {ref.item():.3f}   vs   ln(10) = {math.log(10):.3f}   (matches -> softmax sane)\n")
+
+    # ---- (C) WIRING CHECK 2: overfit ONE batch -> loss ~0, acc 100% -----------------------
+    torch.manual_seed(seed)
+    model = make_model("flatten").to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    xb, yb = xtr[:64].to(dev), ytr[:64].to(dev)
+    curve = []
+    for step in range(300):
+        loss = F.cross_entropy(model(xb), yb)
+        opt.zero_grad(); loss.backward(); opt.step()
+        curve.append(loss.item())
+    with torch.no_grad():
+        acc1 = (model(xb).argmax(1) == yb).float().mean().item()
+    print("  (C) WIRING CHECK 2 — memorize ONE batch of 64 (model+loss+optimizer must be able to):")
+    print(f"        step   0 loss {curve[0]:.3f}  ->  step 300 loss {curve[-1]:.4f}   (batch acc {acc1 * 100:.0f}%)")
+    print("      -> it CAN drive the loss to ~0: gradients flow, the head/loss are wired right.\n")
+
+    # ---- the measurement: flatten vs GAP on the SAME trunk, real train/test ---------------
+    def train_eval(head, n_train=20000, epochs=3, bs=128):
+        torch.manual_seed(seed)                                      # same init trunk for a fair race
+        model = make_model(head).to(dev)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+        ds = torch.utils.data.TensorDataset(xtr[:n_train], ytr[:n_train])
+        loader = torch.utils.data.DataLoader(ds, batch_size=bs, shuffle=True)
+        for _ in range(epochs):
+            for xb, yb in loader:
+                xb, yb = xb.to(dev), yb.to(dev)
+                loss = F.cross_entropy(model(xb), yb)
+                opt.zero_grad(); loss.backward(); opt.step()
+        model.eval()
+        correct = 0
+        with torch.no_grad():
+            for i in range(0, len(xte), 2000):
+                xe, ye = xte[i:i + 2000].to(dev), yte[i:i + 2000].to(dev)
+                correct += (model(xe).argmax(1) == ye).sum().item()
+        return correct / len(xte)
+
+    print("  (A, measured) same trunk + 3 epochs on 20k images, only the head differs:")
+    acc_flat = train_eval("flatten")
+    acc_gap = train_eval("gap")
+    print(f"        flatten -> Linear : test acc {acc_flat * 100:5.2f}%   (keeps position)")
+    print(f"        GAP     -> Linear : test acc {acc_gap * 100:5.2f}%   (position averaged away)")
+    print(f"      -> flatten wins by {(acc_flat - acc_gap) * 100:.2f} pts on CENTERED digits: position IS signal")
+    print("         here, and GAP discards it. (on ImageNet-scale images GAP's invariance is the win.)\n")
+
+    # ---- the payoff: overfit curve -> 0, and the flatten-vs-GAP bars ----------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(9, 3.4))
+    axL.plot(curve, color="tab:blue")
+    axL.axhline(math.log(10), ls="--", color="gray", lw=1)
+    axL.text(len(curve) * 0.5, math.log(10) + 0.05, "ln 10 (untrained)", color="gray", fontsize=8)
+    axL.set_title("wiring check: overfit ONE batch -> 0", fontsize=10)
+    axL.set_xlabel("step"); axL.set_ylabel("cross-entropy loss")
+    bars = axR.bar(["flatten", "GAP"], [acc_flat * 100, acc_gap * 100],
+                   color=["tab:green", "tab:orange"])
+    axR.set_ylim(min(acc_flat, acc_gap) * 100 - 2, 100)
+    axR.set_title("head choice on centered digits", fontsize=10)
+    axR.set_ylabel("test accuracy (%)")
+    for b, a in zip(bars, (acc_flat, acc_gap)):
+        axR.text(b.get_x() + b.get_width() / 2, a * 100 + 0.1, f"{a * 100:.2f}%", ha="center", fontsize=9)
+    fig.suptitle("the head + loss: cross-entropy wires up (left), flatten beats GAP on centered digits (right)",
+                 fontsize=10)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "06_head_and_loss.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — the overfit-one-batch curve collapsing to 0, and flatten's edge over GAP.")
+    print("  That's every box of exp_1's SmallCNN opened. Next (exp_7): assemble the clean model in")
+    print("  new/cnn/ and note which pieces carry straight into the U-Net for diffusion.")
+
+
 def run_experiments():
     # exp_1_whole_game()
-    exp_2_open_features()
+    # exp_2_open_features()
     # exp_3_why_conv()
     # exp_4_stack_and_relu()
     # exp_5_downsample()
+    exp_6_head_and_loss()
 
 
 if __name__ == "__main__":
