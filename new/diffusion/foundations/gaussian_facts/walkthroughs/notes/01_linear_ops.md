@@ -236,11 +236,11 @@ Adding a constant slides `Y` bodily but doesn't change how it _varies around its
 can't change the co-variation.
 
 **Property (2): scalars pull out — `Cov(X, a·Y) = a·Cov(X, Y)`.**
-First, `E[a·Y] = a·E[Y]` (scaling rule for the mean, exp_1), so the deviation of `a·Y` is
-`a·Y − a·E[Y] = a·(Y − E[Y])`. Then:
+First, `E[a·Y] = a·E[Y]`. Then:
 
 ```
   Cov(X, a·Y) = E[ (X − E[X]) · ( a·Y − E[a·Y] ) ]
+              = E[ (X − E[X]) · ( a·Y − a·E[Y] ) ]
               = E[ (X − E[X]) · a·( Y − E[Y] ) ]             ← factored out a
               = a · E[ (X − E[X])( Y − E[Y] ) ]              ← constant a leaves the expectation
               = a · Cov(X, Y)
