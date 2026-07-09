@@ -10,3 +10,7 @@ outputs/
 # downloaded datasets (re-fetched on demand), e.g. diffusion/data/mnist.npz
 diffusion/data/
 *.npz
+
+# jupytext-paired notebooks: the .py is source of truth, the .ipynb is regenerated
+# with `jupytext --to ipynb --execute` (outputs not committed)
+nb/*/walkthroughs/*.ipynb
