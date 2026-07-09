@@ -26,10 +26,12 @@ Gaussian yet** (holds for *any* distribution):
 
 ### 2. The Gaussian family
 `walkthroughs/gaussian_family.py` · `notes/02_gaussian_family.md` — now specialize to the normal:
-- the normal distribution: `μ, σ²`, the bell curve, the standard normal `N(0,1)`, z-scores
-- **reparameterization** `X = μ + σ·ε` (`ε~N(0,1)`) — the identity behind diffusion & VAEs
-- affine of a Gaussian stays Gaussian: `aX+b ~ N(aμ+b, a²σ²)`
-- **sum of independent Gaussians is Gaussian** (closure) — and why that's special
+- `exp_1` the normal distribution: `μ, σ²`, the bell curve, the standard normal `N(0,1)`, z-scores
+- `exp_2` **histogram & density** built by hand: bucketing, counts→density (`÷ N·width`), area = 1 —
+  why a measured histogram and an analytic PDF share an axis
+- `exp_3` **reparameterization** `X = μ + σ·ε` (`ε~N(0,1)`) — the identity behind diffusion & VAEs
+- `exp_4` affine of a Gaussian stays Gaussian: `aX+b ~ N(aμ+b, a²σ²)`
+- `exp_5` **sum of independent Gaussians is Gaussian** (closure) — and why that's special
 
 ### 3. Vectors & payoffs
 `walkthroughs/vectors_payoffs.py` · `notes/03_vectors_payoffs.md` — put it to work:

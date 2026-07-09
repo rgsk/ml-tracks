@@ -11,9 +11,10 @@ independent Gaussian" — so by the end of this section that step is not a black
 
 Layers (each an `exp_*`; run it, read it, say "next"):
   1. THE NORMAL: μ & σ² are the whole story, the bell curve, standard normal N(0,1), z-scores.  (here)
-  2. REPARAMETERIZATION:  X = μ + σ·ε with ε~N(0,1) — the identity behind diffusion & VAEs.
-  3. AFFINE stays Gaussian:  aX+b ~ N(aμ+b, a²σ²) — same bell, predictable parameters.
-  4. CLOSURE: sum of INDEPENDENT Gaussians is Gaussian — and why that's special (uniforms aren't).
+  2. HISTOGRAM & DENSITY: build a histogram BY HAND — bucketing, counts→density (÷ N·width), area=1.
+  3. REPARAMETERIZATION:  X = μ + σ·ε with ε~N(0,1) — the identity behind diffusion & VAEs.
+  4. AFFINE stays Gaussian:  aX+b ~ N(aμ+b, a²σ²) — same bell, predictable parameters.
+  5. CLOSURE: sum of INDEPENDENT Gaussians is Gaussian — and why that's special (uniforms aren't).
 """
 from __future__ import annotations
 
@@ -131,12 +132,122 @@ def exp_1_normal(seed=0):
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"\n  wrote {out} — left: three bells (μ shifts, σ widens); right: z-scoring collapses every")
-    print("  one onto the single standard normal N(0,1). Next (exp_2): reparameterization — running")
-    print("  that collapse BACKWARDS to sample any Gaussian from one fixed ε ~ N(0,1).")
+    print("  one onto the single standard normal N(0,1). Next (exp_2): where those density CURVES and")
+    print("  histograms come from — building one by hand from raw sample counts.")
+
+
+# ---------------------------------------------------------------------------
+# exp_2: HISTOGRAM & DENSITY — build the y-axis of exp_1 BY HAND.
+#
+# exp_1 drew smooth density curves and filled histograms and asserted they line up. Here we earn that:
+# a histogram is nothing but "chop the x-axis into bins, count how many samples fall in each," and
+# DENSITY is those counts put on a scale that doesn't depend on how many samples or how wide the bins:
+#   bin index of a sample x:  floor((x - lo) / width)        (which slot does it land in)
+#   count_i                 = how many samples landed in bin i
+#   density_i               = count_i / (N · width)          ← THE normalization matplotlib's
+#                                                              density=True applies for you
+# The payoff — a probability is an AREA, and the total area is 1:
+#   Σ_i  density_i · width  =  (Σ_i count_i) / N  =  1
+# Dividing by N kills the sample-count dependence; dividing by width kills the bin-width dependence,
+# so density is comparable across runs and across bin choices — which is exactly why exp_1 could plot
+# a measured histogram and an analytic PDF on the SAME axis. Bin width is a resolution knob (too few
+# → blocky and the peak is understated; too many → noisy), but the area is 1 no matter what.
+# ---------------------------------------------------------------------------
+def exp_2_histogram_density(seed=0):
+    """Build a histogram from scratch: bucket samples by floor((x-lo)/width), count per bin, then turn
+    counts into density via ÷(N·width) — the exact thing `density=True` does. Verify Σ density·width = 1,
+    match the hand-rolled bars to matplotlib's hist AND the analytic PDF, and show bin width is a
+    resolution knob that never changes the unit area. Figure: counts vs density (same bars, two rulers)
+    + a bin-width sweep."""
+    _banner("SECTION 2 · exp_2: HISTOGRAM & DENSITY — counts → density (÷ N·width), area = 1")
+
+    torch.manual_seed(seed)
+    N = 200_000
+    mu, sigma = 2.0, 0.5                              # reuse exp_1's narrow bell N(2, 0.25)
+    X = torch.normal(mean=mu, std=sigma, size=(N,))
+
+    lo, hi, nbins = 0.0, 4.0, 20                      # μ ± 4σ covers essentially all the mass
+    width = (hi - lo) / nbins
+    print(f"  X ~ N({mu}, {sigma**2}),  N={N:,} samples.  Bin the range [{lo}, {hi}] into {nbins} "
+          f"bins of width {width}.\n")
+
+    # STEP 1 — bucket & count, the whole of "a histogram", by hand.
+    bin_of = ((X - lo) / width).floor().long()        # which bin each sample lands in
+    inside = (bin_of >= 0) & (bin_of < nbins)         # drop the (few) samples outside [lo, hi]
+    counts = torch.bincount(bin_of[inside], minlength=nbins).float()
+    centers = lo + (torch.arange(nbins) + 0.5) * width
+    Nin = counts.sum()                                # in-range sample count (≈ N here)
+
+    # STEP 2 — counts → density, and the area-is-1 payoff.
+    density = counts / (Nin * width)                  # ← THE formula density=True applies
+    area = (density * width).sum().item()
+
+    print("  a few bins around the peak (counts are raw tallies; density = count / (N·width)):")
+    print(f"    {'bin center':>10} | {'count':>7} | {'count/N':>8} | {'density = count/(N·width)':>26}")
+    print(f"    {'-'*10}-+-{'-'*7}-+-{'-'*8}-+-{'-'*26}")
+    for i in range(6, 14):                            # bins straddling the peak at x=2
+        print(f"    {centers[i]:>10.2f} | {int(counts[i]):>7d} | {counts[i]/Nin:>8.4f} | "
+              f"{density[i]:>26.4f}")
+    print(f"\n  counts depend on N and width; DENSITY doesn't. And the area is exactly 1:")
+    print(f"    Σ density·width = {area:.4f}   (= Σcount / N = {int(counts.sum())}/{int(Nin)} = 1)\n")
+
+    # STEP 3 — three-way agreement: hand-rolled density == matplotlib density=True == analytic PDF.
+    peak_center = centers[density.argmax()].item()
+    print("  three independent computations of the peak-bin density agree:")
+    print(f"    hand-rolled   density[peak] = {density.max():.4f}   (at x≈{peak_center:.2f})")
+    print(f"    analytic PDF  N({peak_center:.1f};μ,σ²) = {_normal_pdf(torch.tensor(peak_center), mu, sigma):.4f}")
+    print(f"    (matplotlib's density=True computes the SAME count/(N·width) — plotted in the figure)\n")
+
+    # STEP 4 — bin width is a RESOLUTION knob; area stays 1 regardless.
+    print("  bin width is a resolution knob — area stays 1, only the detail changes:")
+    for nb in [8, 30, 120, 600]:
+        w = (hi - lo) / nb
+        b = ((X - lo) / w).floor().long()
+        ins = (b >= 0) & (b < nb)
+        c = torch.bincount(b[ins], minlength=nb).float()
+        d = c / (c.sum() * w)
+        print(f"    {nb:>4} bins (width {w:.3f}):  peak density {d.max():>6.3f}   area {(d*w).sum():.4f}")
+    print("    too FEW bins → blocky, peak UNDERSTATED; too MANY → spiky noise; area always 1.")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    grid = torch.linspace(lo, hi, 400)
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+
+    # LEFT: the SAME bars, two rulers — left axis = counts, right axis = density (count ÷ N·width).
+    axL.bar(centers.numpy(), counts.numpy(), width=width * 0.92, color="tab:orange", alpha=0.55,
+            edgecolor="white", linewidth=0.5)
+    axL.set_ylabel("count  (raw tally)"); axL.set_xlabel("x"); axL.set_ylim(0, counts.max().item() * 1.12)
+    axT = axL.twinx()                                 # second ruler on the SAME bars
+    axT.plot(grid.numpy(), _normal_pdf(grid, mu, sigma).numpy(), color="black", lw=2,
+             label="analytic density N(2,0.25)")
+    axT.set_ylabel("density  (= count / (N·width))")
+    axT.set_ylim(0, counts.max().item() * 1.12 / (Nin.item() * width))   # align the two rulers
+    axT.legend(loc="upper right", fontsize=8)
+    axL.set_title("same bars, two rulers: counts (left) vs density (right)")
+
+    # RIGHT: bin-width sweep — coarse→fine, all integrating to area 1 under the same PDF.
+    for nb, c in zip([8, 30, 120, 600], ["tab:red", "tab:green", "tab:blue", "tab:gray"]):
+        axR.hist(X.numpy(), bins=nb, range=(lo, hi), density=True, histtype="step", lw=1.5,
+                 color=c, label=f"{nb} bins")
+    axR.plot(grid.numpy(), _normal_pdf(grid, mu, sigma).numpy(), color="black", lw=2.2, label="PDF")
+    axR.set_title("bin width = resolution knob (area always 1)"); axR.set_xlabel("x")
+    axR.set_ylabel("density"); axR.legend(fontsize=8)
+
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "histogram_density.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — left: ONE set of bars read two ways (÷N·width turns counts into density,")
+    print("  matching the PDF); right: coarse→fine bins, all area 1. Next (exp_3): reparameterization —")
+    print("  sampling any Gaussian from one fixed ε ~ N(0,1), the z-score of exp_1 run forwards.")
 
 
 def run_experiments():
-    exp_1_normal()
+    # exp_1_normal()
+    exp_2_histogram_density()
 
 
 if __name__ == "__main__":

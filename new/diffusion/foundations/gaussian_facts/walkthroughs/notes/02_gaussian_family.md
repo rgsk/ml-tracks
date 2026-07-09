@@ -147,4 +147,90 @@ because it's a height. Only the **area** is capped at 1.
 
 ---
 
-_Numbers + figure: `python gaussian_family.py` (`exp_1_normal`)._
+## exp_2 — histogram & density, built by hand
+
+exp_1 drew smooth density **curves** and filled **histograms** and asserted they line up. This
+experiment _earns_ that — it builds a histogram from raw sample counts, so `density=True` stops being
+a magic matplotlib flag and becomes arithmetic you did yourself.
+
+### A histogram is just "bin the axis and count"
+
+Chop the x-range `[lo, hi]` into `nbins` bins of equal `width`, then drop each sample into its slot:
+
+```
+  bin index of a sample x  =  floor( (x - lo) / width )     which slot it lands in
+  count_i                  =  how many samples landed in bin i
+```
+
+That's the entire operation — no smoothness, no formula, just tallies. In code it's one line of
+`floor`, a mask to drop out-of-range samples, and `torch.bincount`. We use `X ~ N(2, 0.25)` (exp_1's
+narrow bell), 200k samples, `[0, 4]` into 20 bins of width 0.2.
+
+### Counts → density: divide out N and width
+
+Raw counts are unusable as a curve — they depend on **how many** samples you drew and **how wide**
+the bins are. Two divisions fix both:
+
+```
+  density_i = count_i / (N · width)
+                        │    └── kills the bin-width dependence
+                        └─────── kills the sample-count dependence
+```
+
+This is _exactly_ what matplotlib's `density=True` computes. And it makes the **area = 1** payoff
+fall out immediately — a probability is an area, and the total is 1:
+
+```
+  Σ_i density_i · width  =  Σ_i count_i / N  =  N/N  =  1
+```
+
+```
+  bin center |  count  | count/N | density = count/(N·width)
+  -----------+---------+---------+--------------------------
+       1.70  |  26478  | 0.1324  |          0.6620
+       1.90  |  31165  | 0.1558  |          0.7792   ← peak bin
+       2.10  |  30908  | 0.1546  |          0.7728
+       2.30  |  26692  | 0.1335  |          0.6673
+
+  Σ density·width = 1.0000   (= Σcount / N = 199986/199986 = 1)
+```
+
+**Three independent routes to the same peak height** confirm the formula: hand-rolled
+`density[peak] = 0.779`, the analytic PDF `N(1.9; 2, 0.25) = 0.782`, and matplotlib's own
+`density=True` (plotted) — all agree. That's why exp_1 could put a _measured_ histogram and an
+_analytic_ curve on the same axis: the `÷(N·width)` normalization is the bridge between them.
+
+### Bin width is a resolution knob — but the area is always 1
+
+Sweeping `nbins` on the _same_ samples changes only the resolution, never the area:
+
+```
+     8 bins (width 0.500):  peak density 0.683   area 1.0000    ← too coarse, peak UNDERSTATED
+    30 bins (width 0.133):  peak density 0.792   area 1.0000
+   120 bins (width 0.033):  peak density 0.805   area 1.0000
+   600 bins (width 0.007):  peak density 0.841   area 1.0000    ← too fine, spiky noise
+```
+
+Too **few** bins blur the peak into a flat plateau (the 8-bin case reads 0.68 instead of the true
+~0.80); too **many** bins and each holds so few samples that Poisson noise makes the top ragged. The
+`1/width` in the normalization is what keeps the **area locked at 1** through all of it — a narrower
+bin holds fewer counts but gets divided by a smaller width, and the two cancel.
+
+![counts vs density (same bars, two rulers) and a bin-width sweep](../figures/experiments/histogram_density.png)
+
+**Left:** _one_ set of bars read with **two rulers** — the left axis is raw `count` (0–31k), the
+right axis is `density` (0–0.8), and they differ by exactly the constant `N·width`. The black PDF
+sits on the density ruler and hugs the bar tops: `÷(N·width)` is the _only_ thing standing between a
+count histogram and the analytic density. **Right:** the bin-width sweep — coarse red (8 bins) is
+blocky and clips the peak, fine gray (600 bins) is noisy, and every one integrates to area 1 under
+the same bell.
+
+> **Tie back to exp_1 (and forward to diffusion).** This is why "measured histogram ≈ analytic PDF"
+> was allowed to be plotted together at all — and every time we later _check a claim by histogram_
+> (does `μ + σ·ε` really give `N(μ,σ²)`? does a sum of Gaussians land on the predicted bell?), this
+> `÷(N·width)` normalization is the quiet machinery making the measured bars and the predicted curve
+> directly comparable.
+
+---
+
+_Numbers + figures: `python gaussian_family.py` (`exp_1_normal`, `exp_2_histogram_density`)._
