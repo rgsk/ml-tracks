@@ -245,9 +245,103 @@ def exp_2_histogram_density(seed=0):
     print("  sampling any Gaussian from one fixed ε ~ N(0,1), the z-score of exp_1 run forwards.")
 
 
+# ---------------------------------------------------------------------------
+# exp_3: REPARAMETERIZATION — sample any Gaussian from one fixed ε ~ N(0,1).
+#
+# exp_1's z-score COLLAPSED any normal onto N(0,1):  z = (X - μ)/σ.  Run it FORWARDS and you can
+# BUILD any normal out of one standard one:
+#   ε ~ N(0,1)        one fixed, parameter-free source of randomness
+#   X = μ + σ·ε       →   X ~ N(μ, σ²)      (scale ε by σ, shift by μ)
+# The parameters (μ, σ) come out of Section 1's affine laws for free:
+#   E[μ + σ·ε] = μ + σ·E[ε] = μ + σ·0 = μ           (shift +μ, scale ×σ on a mean-0 ε)
+#   Var(μ + σ·ε) = σ²·Var(ε) = σ²·1 = σ²            (variance scales by σ² — the ×a² law)
+# and (exp_4 will prove) the SHAPE stays Gaussian, so X is exactly N(μ, σ²).
+#
+# Why this tiny identity is a cornerstone of diffusion & VAEs: it moves the randomness OUTSIDE the
+# parameters. "Sample from N(μ,σ²)" is a black box you can't differentiate w.r.t. μ or σ — the
+# randomness is tangled up inside. But X = μ + σ·ε is a plain deterministic function of (μ, σ) once ε
+# is drawn, so gradients flow straight through:  dX/dμ = 1,  dX/dσ = ε.  That "pathwise" derivative is
+# what lets you BACKPROP through a sampling step and train μ, σ (or a whole network that outputs them).
+# The diffusion forward sample  x_t = √ᾱ·x_0 + √(1-ᾱ)·ε  is literally this identity with μ=√ᾱ·x_0,
+# σ=√(1-ᾱ) — the reason we can write the noised image as a differentiable function of x_0 and ε.
+# ---------------------------------------------------------------------------
+def exp_3_reparameterization(seed=0):
+    """Reparameterization X = μ + σ·ε (ε~N(0,1)): build ANY Gaussian from one fixed standard-normal
+    draw. Verify mean→μ, var→σ² (Section 1's +d/×a² laws) and the histogram matches N(μ,σ²); show the
+    SAME ε underneath every target; and the pathwise view — for fixed ε, X is a straight differentiable
+    line in σ (slope ε), which is why gradients backprop through sampling. Figure: same-ε bells + the
+    fixed-ε lines."""
+    _banner("SECTION 2 · exp_3: REPARAMETERIZATION  X = μ + σ·ε,  ε ~ N(0,1)  →  X ~ N(μ, σ²)")
+
+    torch.manual_seed(seed)
+    n = 200_000
+    eps = torch.randn(n)                              # ONE fixed source of randomness, ε ~ N(0,1)
+
+    print("  draw ONE standard normal ε ~ N(0,1), then make any Gaussian by  X = μ + σ·ε:")
+    print(f"    ε itself:  mean {eps.mean():>+.3f}  var {eps.var():.3f}   (≈ N(0,1))\n")
+    print("  parameters come free from Section 1:  E[μ+σε]=μ+σ·0=μ,   Var(μ+σε)=σ²·1=σ²\n")
+
+    targets = [(0.0, 1.0), (2.0, 0.5), (-1.0, 1.5)]   # same trio as exp_1 — now GENERATED from one ε
+    print(f"  {'target':<12} | {'mean: μ':>16} | {'var: σ²':>18}")
+    print(f"  {'-'*12}-+-{'-'*16}-+-{'-'*18}")
+    built = {}
+    for mu, sigma in targets:
+        X = mu + sigma * eps                          # the reparameterization — no new randomness
+        built[(mu, sigma)] = X
+        print(f"  N({mu:>+.1f},{sigma**2:>.2f}) | pred {mu:>+.2f}  meas {X.mean():>+.3f} | "
+              f"pred {sigma**2:>.3f} meas {X.var():>.3f}")
+
+    # SAME ε underneath: the first few ε values map deterministically into every target.
+    print("\n  every X above is the SAME ε, just relocated/rescaled — first 5 draws:")
+    print(f"    {'ε':>8} | {'0 + 1·ε':>9} | {'2 + 0.5·ε':>10} | {'-1 + 1.5·ε':>11}")
+    print(f"    {'-'*8}-+-{'-'*9}-+-{'-'*10}-+-{'-'*11}")
+    for i in range(5):
+        e = eps[i].item()
+        print(f"    {e:>+8.3f} | {0+1*e:>+9.3f} | {2+0.5*e:>+10.3f} | {-1+1.5*e:>+11.3f}")
+
+    print("\n  differentiability (the whole point): given ε, X=μ+σ·ε is a PLAIN function of μ,σ —")
+    print("    dX/dμ = 1,   dX/dσ = ε.   Randomness sits OUTSIDE the parameters, so gradients flow")
+    print("    through the sample. 'Draw from N(μ,σ²)' directly is a non-differentiable black box.")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+
+    # LEFT: the SAME ε, dialed into three target bells — each histogram matches its N(μ,σ²) PDF.
+    grid = torch.linspace(-6, 6, 400)
+    for (mu, sigma), c in zip(targets, ["tab:blue", "tab:orange", "tab:green"]):
+        axL.hist(built[(mu, sigma)].numpy(), bins=140, density=True, alpha=0.35, color=c)
+        axL.plot(grid.numpy(), _normal_pdf(grid, mu, sigma).numpy(), color=c, lw=2,
+                 label=f"μ+σ·ε → N({mu:+.0f},{sigma**2:.2f})")
+    axL.set_title("one fixed ε ~ N(0,1), dialed into any Gaussian by μ+σ·ε")
+    axL.set_xlabel("x"); axL.set_ylabel("density"); axL.set_xlim(-6, 6); axL.legend(fontsize=8)
+
+    # RIGHT: pathwise view — for a handful of FIXED ε, X=μ+σ·ε is a straight line in σ (slope ε).
+    sig_grid = torch.linspace(0, 2, 50)
+    mu0 = 2.0
+    for e in [-2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0]:
+        axR.plot(sig_grid.numpy(), (mu0 + sig_grid * e).numpy(), lw=1.6, label=f"ε={e:+.1f}")
+    axR.scatter([0] * 7, [mu0] * 7, color="black", zorder=5)
+    axR.annotate("all meet at μ (σ=0)", xy=(0, mu0), xytext=(0.5, mu0 + 1.3),
+                 arrowprops=dict(arrowstyle="->", lw=1), fontsize=9)
+    axR.set_title("for fixed ε, X=μ+σ·ε is a straight, differentiable\nline in σ (slope ε) → gradient flows through")
+    axR.set_xlabel("σ  (with μ=2 fixed)"); axR.set_ylabel("X = μ + σ·ε"); axR.legend(fontsize=8, ncol=2)
+
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "reparameterization.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — left: one ε draw becoming three different bells; right: for each fixed ε,")
+    print("  X is a straight line in σ (deterministic & differentiable). Next (exp_4): why X stays")
+    print("  EXACTLY Gaussian — affine of a Gaussian is Gaussian, aX+b ~ N(aμ+b, a²σ²).")
+
+
 def run_experiments():
     # exp_1_normal()
-    exp_2_histogram_density()
+    # exp_2_histogram_density()
+    exp_3_reparameterization()
 
 
 if __name__ == "__main__":

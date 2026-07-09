@@ -233,4 +233,75 @@ the same bell.
 
 ---
 
-_Numbers + figures: `python gaussian_family.py` (`exp_1_normal`, `exp_2_histogram_density`)._
+## exp_3 — reparameterization: `X = μ + σ·ε`
+
+exp_1's z-score **collapsed** any normal onto `N(0,1)`: `z = (X−μ)/σ`. Run that same affine map
+**forwards** and you can _build_ any normal out of one standard one — the **reparameterization
+trick**:
+
+```
+  ε ~ N(0,1)        one fixed, parameter-free source of randomness
+  X = μ + σ·ε   →   X ~ N(μ, σ²)      (scale ε by σ, then shift by μ)
+```
+
+### The parameters come free from Section 1
+
+No new machinery — the mean and variance drop straight out of the affine laws (`μ+σε` is `a·ε+d`
+with `a=σ`, `d=μ`, on a mean-0/var-1 `ε`):
+
+```
+  E[μ + σ·ε] = μ + σ·E[ε] = μ + σ·0 = μ            (shift +μ, scale ×σ)
+  Var(μ + σ·ε) = σ²·Var(ε) = σ²·1 = σ²             (variance scales by σ² — the ×a² law)
+```
+
+and the shape stays Gaussian (exp_4 proves the closure), so `X` is _exactly_ `N(μ,σ²)`. Generating
+the same trio from exp_1 out of **one** `ε` confirms it:
+
+```
+  target        |  mean → μ            |  var → σ²
+  --------------+----------------------+---------------------
+  N(+0.0,1.00)  |  pred 0.00 meas 0.00 | pred 1.000 meas 1.000
+  N(+2.0,0.25)  |  pred 2.00 meas 2.00 | pred 0.250 meas 0.250
+  N(-1.0,2.25)  |  pred -1.0 meas -1.0 | pred 2.250 meas 2.251
+```
+
+Every one of those is the **same `ε`**, just relocated and rescaled — the first few draws map in
+lockstep across all three targets:
+
+```
+       ε    |  0 + 1·ε  |  2 + 0.5·ε |  -1 + 1.5·ε
+  ----------+-----------+------------+------------
+    -1.126  |  -1.126   |   +1.437   |   -2.689
+    -0.251  |  -0.251   |   +1.875   |   -1.376
+    +0.849  |  +0.849   |   +2.424   |   +0.273
+```
+
+### Why this tiny identity is a cornerstone
+
+It moves the **randomness outside the parameters**. "Sample from `N(μ,σ²)`" is a black box you can't
+differentiate w.r.t. `μ` or `σ` — the randomness is tangled up inside. But once `ε` is drawn,
+`X = μ + σ·ε` is a plain _deterministic_ function of `(μ,σ)`, so gradients flow straight through:
+
+```
+  dX/dμ = 1        dX/dσ = ε
+```
+
+This is the **pathwise derivative**, and it's what lets you _backprop through a sampling step_ and
+train `μ, σ` (or a whole network that outputs them) — the trick behind VAEs and diffusion.
+
+![one ε dialed into three bells; and X=μ+σε linear in σ for fixed ε](../figures/experiments/reparameterization.png)
+
+**Left:** one fixed `ε ~ N(0,1)` becomes any target bell via `μ+σ·ε`, each histogram landing on its
+`N(μ,σ²)` curve. **Right:** the pathwise view — fix a handful of `ε` values and plot `X = μ + σ·ε`
+against `σ` (with `μ=2`). Each is a **straight line** through `(σ=0, X=μ)` with **slope `ε`** —
+deterministic and differentiable, in contrast to the non-differentiable "just sample it" black box.
+
+> **This _is_ the diffusion forward sample.** `x_t = √ᾱ·x_0 + √(1-ᾱ)·ε` is exactly `μ + σ·ε` with
+> `μ = √ᾱ·x_0` and `σ = √(1-ᾱ)`. Reparameterization is _why_ we can write the noised image as a
+> differentiable function of `x_0` and `ε` — and (next section) why the whole forward chain collapses
+> to one closed-form Gaussian jump.
+
+---
+
+_Numbers + figures: `python gaussian_family.py` (`exp_1_normal`, `exp_2_histogram_density`,
+`exp_3_reparameterization`)._
