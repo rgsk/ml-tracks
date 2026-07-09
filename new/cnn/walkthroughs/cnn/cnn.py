@@ -266,9 +266,127 @@ def exp_2_open_features(seed=0):
     print("         flatten+MLP we could have reused?")
 
 
+# ---------------------------------------------------------------------------
+# EXP 3: why conv at all — vs the flatten+MLP we could have reused?
+#
+# exp_1's `head` already used nn.Flatten. So we *have* a flatten+dense on hand — why not skip
+# `features` and feed flattened pixels straight to a dense net? Because a flatten throws away the
+# two things that make an image an image, and a conv keeps both:
+#
+#   (A) LOCALITY + TRANSLATION. Flattening lays the 28x28 grid into a 784-vector, tying every weight
+#       to an ABSOLUTE pixel index — it has no idea index i and i+1 are neighbors, and the SAME digit
+#       shifted a few px lands on a nearly disjoint set of indices, so a dense layer sees an almost-new
+#       input it must relearn per position. A conv slides ONE kernel over every position, so shifting
+#       the input just SHIFTS the feature map: featmap(shift(x)) = shift(featmap(x)) — translation
+#       EQUIVARIANCE, which we verify to numerical noise.
+#   (B) PARAMETER BLOW-UP. A dense first layer 784 -> H costs 784*H weights (exp_1's aside: 784*768 =
+#       602,880). A conv learns one tiny 3x3 kernel per channel and REUSES it at all 784 positions —
+#       exp_1's first conv is 160 weights. ~3,700x fewer, and the right bias baked in.
+# ---------------------------------------------------------------------------
+def exp_3_why_conv(seed=0):
+    """Why the conv trunk earns its place over the flatten+MLP exp_1's head already contains:
+    (A) shift a digit and the flattened 784-vectors barely overlap (dense must relearn each position),
+    yet a conv's feature map merely SHIFTS with the input (equivariance, verified to ~0); (B) a dense
+    first layer costs ~600k weights vs a conv kernel's ~160. Save the digit, its shift, and the two
+    feature maps lining up."""
+    _banner("EXP 3: why conv, not flatten+MLP — locality, translation equivariance, param count")
+
+    # grab a clean '7' to shift around (shifts cleanly, mostly-centered strokes).
+    xte, yte = _mnist(train=False)
+    x = xte[(yte == 7).nonzero()[0].item():][:1]                   # (1,1,28,28) in [-1,1]
+    shift = 4                                                      # pixels down and right
+
+    # ---- (A) the flatten kills translation: pixel-overlap of a digit vs its shift ------------
+    # measure overlap in an INK-vs-background sense: map to [0,1] (background 0, ink 1) so the cosine
+    # reflects how much INK lands on the same coordinates, not the shared black background.
+    x01 = (x + 1) / 2                                              # [0,1]: background 0, ink 1
+    x01_shift = torch.roll(x01, shifts=(shift, shift), dims=(2, 3))
+    a, b = x01.flatten(), x01_shift.flatten()
+    cos_pix = (a @ b) / (a.norm() * b.norm() + 1e-12)             # pixel-overlap of the two vectors
+    print("  (A) a flatten+dense ties every weight to an ABSOLUTE pixel index.")
+    print(f"      shift the SAME '7' by ({shift},{shift}) px and compare the flattened 784-vectors:")
+    print(f"        pixel-overlap cosine(orig, shifted) = {cos_pix.item():.2f}"
+          "   (far below 1: little ink lands on the same coordinates)")
+    print("      -> to a dense layer the shifted digit is almost a NEW input; it must relearn the")
+    print("         digit at every position. Nothing is shared across space.\n")
+
+    # ---- a conv is translation-EQUIVARIANT: featmap(shift(x)) == shift(featmap(x)) -----------
+    # one fixed 3x3 kernel as our "feature". a DIAGONAL edge detector (sum-to-zero) traces the whole
+    # outline of the 7 — both the top horizontal stroke and the diagonal — so the map reads clearly.
+    kernel = torch.tensor([[-1., -1., 0.],
+                           [-1., 0., 1.],
+                           [0., 1., 1.]]).view(1, 1, 3, 3)        # (out=1,in=1,3,3)
+    fmap = F.conv2d(x, kernel, padding=1)                         # feature map of the original
+    x_shift = torch.roll(x, shifts=(shift, shift), dims=(2, 3))   # same digit, shifted in [-1,1]
+    fmap_of_shift = F.conv2d(x_shift, kernel, padding=1)          # conv of the shifted input
+    shift_of_fmap = torch.roll(fmap, shifts=(shift, shift), dims=(2, 3))  # shift of the original's map
+
+    # compare on the INTERIOR: torch.roll wraps at the border (matches an infinite-grid shift), so
+    # crop a margin = shift+1 and check where the two ways of wrapping correspond.
+    m = shift + 1
+    interior = (slice(None), slice(None), slice(m, 28 - m), slice(m, 28 - m))
+    diff = (fmap_of_shift[interior] - shift_of_fmap[interior]).abs().max().item()
+    scale = fmap.abs().max().item()
+    print("  a convolution slides ONE kernel over every position, so shifting the input just")
+    print("  shifts the feature map:  featmap(shift(x)) = shift(featmap(x)).  verify (interior):")
+    print(f"        max|featmap(shift(x)) - shift(featmap(x))| = {diff:.2e}   (feature scale ~{scale:.1f}"
+          " -> equal to numerical noise)")
+    print("      -> the conv gets the shifted digit's response FOR FREE. The same stroke detector")
+    print("         fires wherever the stroke goes.\n")
+
+    # ---- (B) the parameter count -------------------------------------------------------------
+    H = 768                                                       # exp_1's MLP-first-layer aside
+    dense_params = 784 * H + H
+    conv_out = 16                                                 # exp_1's first conv: Conv2d(1,16,3)
+    conv_params = conv_out * 1 * 3 * 3 + conv_out                 # one 3x3 kernel per out channel
+    print("  (B) parameter count of the FIRST layer:")
+    print(f"        dense 784 -> {H}       : {dense_params:>8,} weights (every pixel<->hidden pair)")
+    print(f"        conv 1 -> {conv_out} ch, 3x3  : {conv_params:>8,} weights (one small kernel, reused at 784 spots)")
+    print(f"      -> the conv does it with ~{dense_params // conv_params:,}x fewer weights AND the right")
+    print("         bias built in. This is why exp_1's model leads with a conv trunk, not a dense net.\n")
+
+    # ---- the payoff: digit, its shift, and the two feature maps lining up ---------------------
+    # bottom-middle (shift, then conv) and bottom-right (conv, then shift) are pixel-identical on the
+    # interior -> that IS featmap(shift x) == shift(featmap x). edge maps: diverging cmap centered at 0.
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    def _fm(t):
+        return t.squeeze().detach().cpu().numpy()
+
+    fig, ax = plt.subplots(2, 3, figsize=(9, 6))
+    panels = [
+        (0, 0, _to_img(x), "input  x", "gray"),
+        (0, 1, _to_img(x_shift), "shift(x)", "gray"),
+        (0, 2, None, "", None),
+        (1, 0, _fm(fmap), "featmap(x)", "coolwarm"),
+        (1, 1, _fm(fmap_of_shift), "featmap(shift(x))\n[shift, then conv]", "coolwarm"),
+        (1, 2, _fm(shift_of_fmap), "shift(featmap(x))\n[conv, then shift]", "coolwarm"),
+    ]
+    for r, c, img, title, cmap in panels:
+        a = ax[r][c]
+        a.set_xticks([]); a.set_yticks([])
+        if img is None:
+            a.axis("off"); continue
+        kw = dict(cmap=cmap) if cmap == "gray" else dict(cmap=cmap, vmin=-scale, vmax=scale)
+        a.imshow(img, **kw)
+        a.set_title(title, fontsize=11)
+    fig.suptitle(f"a conv is translation-EQUIVARIANT:  bottom-middle == bottom-right  "
+                 f"(max diff {diff:.1e})", fontsize=12)
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "03_equivariance.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — bottom-middle (shift, then conv) and bottom-right (conv, then shift) are")
+    print("  the same image: the property a flatten throws away and a conv keeps. Next (exp_4): why")
+    print("  conv -> relu -> conv, and what the ReLU between two convs actually buys.")
+
+
 def run_experiments():
     # exp_1_whole_game()
-    exp_2_open_features()
+    # exp_2_open_features()
+    exp_3_why_conv()
 
 
 if __name__ == "__main__":
