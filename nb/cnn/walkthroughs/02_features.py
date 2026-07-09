@@ -62,7 +62,7 @@ def to_img(x):
 # Output channel `o` slides its own kernel over the (padded) input; **each output cell is one windowed
 # multiply-and-sum**:
 #
-# $$\text{out}[o, i, j] = \sum_{\text{over the } k_H \times k_W \times C_{in} \text{ window}} \text{kernel}[o] \cdot \text{input\_window}$$
+# $$\text{out}[o, i, j] = \sum_{\text{over the } C_{in} \times k_H \times k_W \text{ window}} \text{kernel}[o] \cdot \text{input\_window}$$
 #
 # That's the *entire* operation — three loops (out-channel, row, col), each cell a dot product. The
 # from-scratch version lives in `custom/naive_conv2d.py`:
