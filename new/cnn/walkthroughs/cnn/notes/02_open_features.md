@@ -88,23 +88,38 @@ this and `features`.
 
 ## 3. The output-size formula (where `28 → 14 → 7` came from)
 
-Each conv's output size, per axis:
+A window of width `k` starting at the left needs `k` columns; padding adds `2p`; stride `s` takes
+every `s`-th start. So along **each** axis:
 
 ```
 out = floor( (in + 2p − k) / s ) + 1
 ```
 
-A window needs `k` columns; padding adds `2p`; stride `s` takes every `s`-th start. Plug in the three
-convs from exp_1's `features` and you get the pyramid you already watched:
+The three convs from exp_1's `features`, checked against `F.conv2d` — this *is* the pyramid you
+already watched:
 
-```
-stem  k3,s1,p1:  28 -> 28   (F.conv2d gives 28)     padding = k//2 keeps size
-down1 k3,s2,p1:  28 -> 14   (F.conv2d gives 14)     stride 2 halves it
-down2 k3,s2,p1:  14 ->  7   (F.conv2d gives  7)
-```
+| in | k | s | p | out | role |
+|---|---|---|---|---|---|
+| 28 | 3 | 1 | 1 | **28** | stem — **same size** (`padding = k//2` keeps it) |
+| 28 | 3 | 2 | 1 | **14** | down1 — **half** (stride 2 halves it) |
+| 14 | 3 | 2 | 1 | **7** | down2 — half again |
 
-So `28 → 14 → 7` wasn't arbitrary — it's this formula applied twice. *Why* halve at all (and grow
-channels while doing it) is exp_5.
+So `28 → 14 → 7` wasn't arbitrary — it's this formula applied twice. **Two configs are worth
+memorizing**, because every CNN is built from them:
+
+- `k3, s1, p1` → **preserves** size (`out = in`), so you can stack convs without the map shrinking.
+- `k3, s2, p1` → **halves** it — and, exactly, `out = ceil(in/2)`. This `ceil(in/2)` is the rule the
+  whole resolution pyramid rides on (exp_5), so it's worth pinning down on both even and odd inputs:
+
+| in | k | s | p | out | why |
+|---|---|---|---|---|---|
+| 6 | 3 | 1 | 1 | **6** | same size — preserved |
+| 5 | 3 | 1 | 1 | **5** | same size — preserved |
+| 6 | 3 | 2 | 1 | **3** | half — even halves exactly (`6/2`) |
+| 5 | 3 | 2 | 1 | **3** | half — odd rounds **up** (`ceil(5/2) = 3`) |
+
+`k3, s1, p1` always returns `in`; `k3, s2, p1` always returns `ceil(in/2)`. *Why* halve at all (and
+grow channels while doing it) is exp_5.
 
 ---
 
