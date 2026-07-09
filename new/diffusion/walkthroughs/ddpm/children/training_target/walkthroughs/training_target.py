@@ -373,10 +373,220 @@ def exp_3_eps_or_x0(seed=0, T=1000, batch_size=64):
     print("  Next (exp_4): ε and x0 are interchangeable, but NOT equally learnable — why we pick ε.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 4 (why ε wins): ε and x0 are interchangeable TARGETS (exp_3), but they are NOT the same
+# OBJECTIVE — the loss you minimize differs by a factor of SNR(t). That factor is the whole reason
+# DDPM regresses on ε.
+#
+#   DERIVATION — how a prediction error in ε maps into x0-space (same net, x_t & t held fixed):
+#     x0(ε) = (x_t − √(1-ᾱ)·ε) / √ᾱ                             (the exp_3 rearrangement)
+#     perturb ε → ε̂ = ε + δ, plug into the same formula, subtract the truth:
+#       x̂0 = (x_t − √(1-ᾱ)·(ε+δ)) / √ᾱ ,   x0 = (x_t − √(1-ᾱ)·ε) / √ᾱ
+#       x̂0 − x0 = [ −√(1-ᾱ)·δ ] / √ᾱ = −(√(1-ᾱ)/√ᾱ) · δ         (x_t cancels; linear in the error δ)
+#     square and average:
+#       MSE_x0 = ((1-ᾱ)/ᾱ) · MSE_ε = MSE_ε / SNR(t)             SNR(t) = ᾱ/(1-ᾱ)   (forward_process exp_7)
+#     ⇔  MSE_ε = SNR(t) · MSE_x0
+#
+# So one error, scored in the two targets, differs by SNR(t) — which sweeps ~8 orders across t.
+#   - Regressing on ε: the target is ε ~ N(0,1) at EVERY t — a fixed O(1) scale, so plain (unweighted)
+#     MSE puts every noise level on equal, well-conditioned footing. This is DDPM's "simple" loss.
+#   - Regressing on x0 with plain MSE would instead be SNR-weighted in ε-space: a few high-SNR (low-t)
+#     steps dominate the gradient and the high-t regime — where sampling STARTS — is ~ignored.
+# (This is about the OBJECTIVE's scale/conditioning. That a TRAINED net's achieved ε-loss still varies
+#  with t — some noise levels are intrinsically harder — is the separate point in exp_5.)
+# ---------------------------------------------------------------------------
+def exp_4_why_eps(seed=0, T=1000, batch_size=256, err_std=0.1):
+    """Why ε over x0: inject the SAME fixed-scale prediction error at every t, and score it in BOTH
+    targets. MSE_ε is flat (ε is ~N(0,1) at every t) while MSE_x0 swings ~8 orders — and the gap is
+    exactly SNR(t). ε is the scale-stable, well-conditioned target."""
+    _banner("LAYER 4: why ε wins — MSE_ε = SNR·MSE_x0, so ε is the scale-stable target")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+    x0 = _mnist(train=False)[:batch_size].to(dev)
+
+    ts = torch.linspace(1, T - 1, 60).long()
+    mse_eps, mse_x0, snr = [], [], []
+    for ti in ts:
+        ab = alpha_bars[ti]
+        eps = torch.randn_like(x0)
+        x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+        eps_hat = eps + err_std * torch.randn_like(eps)             # a FIXED-scale ε error at every t
+        x0_hat = (x_t - (1 - ab).sqrt() * eps_hat) / ab.sqrt()      # the SAME prediction, read as x0
+        mse_eps.append(((eps_hat - eps) ** 2).mean().item())
+        mse_x0.append(((x0_hat - x0) ** 2).mean().item())
+        snr.append((ab / (1 - ab)).item())
+    mse_eps, mse_x0, snr = map(lambda a: torch.tensor(a), (mse_eps, mse_x0, snr))
+    ratio = mse_eps / mse_x0
+
+    print(f"  inject the SAME ε-error (std {err_std} → MSE_ε ≈ {err_std**2:.2f}) at every t, score it both ways:")
+    print("      t     MSE_ε    MSE_x0      ratio      SNR(t)")
+    for k in [0, 12, 24, 36, 48, 59]:
+        print(f"    {ts[k].item():>4}   {mse_eps[k]:.4f}   {mse_x0[k]:>9.4f}   {ratio[k]:>9.2f}   {snr[k]:>9.2f}")
+    print(f"\n    MSE_ε: flat at ~{mse_eps.mean():.3f} (ε is ~N(0,1) every t).  "
+          f"MSE_x0: swings {mse_x0.min():.1e} → {mse_x0.max():.1e} ({mse_x0.max()/mse_x0.min():.0e}x).")
+    rel = (ratio - snr).abs() / snr
+    print(f"    ratio == SNR(t) to max rel-err {rel.max():.1e}  →  MSE_ε = SNR(t)·MSE_x0, exactly.\n")
+    print("  so predict ε: a fixed O(1) target at every noise level, plain MSE = balanced across t.")
+    print("  predicting x0 with plain MSE would be SNR-weighted — a few low-t steps swamp the gradient.\n")
+
+    # ---- payoff figure: the two objectives across t, and the exact SNR law -------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    axL.semilogy(ts, mse_eps, color="#2a7", lw=2.0, label="MSE_ε  (target = noise)")
+    axL.semilogy(ts, mse_x0, color="#c33", lw=2.0, label="MSE_x0  (target = image)")
+    axL.set_xlabel("timestep t"); axL.set_ylabel("loss for a FIXED ε-error (log)")
+    axL.set_title("same prediction error, two targets:\nMSE_ε flat, MSE_x0 swings ~8 orders", fontsize=10)
+    axL.legend(frameon=False, fontsize=9)
+    axR.loglog(snr, ratio, "o", ms=5, color="#36c", label="measured  MSE_ε / MSE_x0")
+    lo, hi = snr.min().item(), snr.max().item()
+    axR.loglog([lo, hi], [lo, hi], "--", color="#888", lw=1.2, label="y = SNR(t)")
+    axR.set_xlabel("SNR(t) = ᾱ/(1-ᾱ)"); axR.set_ylabel("MSE_ε / MSE_x0")
+    axR.set_title("the gap IS the SNR:\nMSE_ε = SNR(t) · MSE_x0", fontsize=10)
+    axR.legend(frameon=False, fontsize=9)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "04_why_eps.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — left: the two objectives across t; right: ratio lands on y=SNR.")
+    print("  ε is the scale-stable target: DDPM's L_simple = MSE(ε̂, ε), unweighted. Next (exp_5): even")
+    print("  with ε, per-t difficulty isn't flat — some noise levels are intrinsically harder to learn.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 5 (per-t difficulty): we chose ε and the loss is well-scaled (exp_4). But a TRAINED net does
+# NOT score the same loss at every t — some noise levels are intrinsically harder to predict ε at.
+# This is the last piece: the *achieved* per-t loss, and why the training curve is front-loaded.
+#
+# The achieved ε-loss at t tracks how much x_t pins ε down:
+#   - HIGH t (low SNR): x_t = √ᾱ·x0 + √(1-ᾱ)·ε ≈ ε   (√ᾱ→0, √(1-ᾱ)→1). ε is almost x_t itself →
+#     TRIVIAL, loss → ~0. The net barely has to do anything.
+#   - LOW t (high SNR): ε contributes only √(1-ᾱ)·ε (tiny) to x_t, and recovering it means estimating x0
+#     to SUB-PIXEL precision — ε = (x_t − √ᾱ·x0)/√(1-ᾱ), so any x0 error is amplified by 1/√(1-ᾱ) → ∞.
+#     HARDEST region. Its ceiling is Var(ε)=1 (what you'd get if x0 were unpredictable); on structured
+#     data like MNIST the net exploits the image prior and does better (~0.3 here) — still the top of the
+#     curve by far, and the slowest to improve.
+# So the per-t ε-loss DECREASES with t — the exact MIRROR of the "recover x0" difficulty in
+# forward_process exp_7 (high SNR = easy to see the signal = hard to isolate the noise). Consistent with
+# exp_4's MSE_ε = SNR·MSE_x0: ε is hard exactly where x0 is easy.
+# Consequence: training banks the easy high-t half FAST (loss drops steeply early), then grinds on the
+# low-t region — a front-loaded curve whose plateau is dominated by that hard high-SNR end.
+# ---------------------------------------------------------------------------
+def _per_t_loss(net, x0, alpha_bars, ts, dev):
+    """Mean MSE(ε̂, ε) at each t in `ts`, on the held-out x0 (fresh ε each t)."""
+    net.eval()
+    out = []
+    with torch.no_grad():
+        for ti in ts:
+            ab = alpha_bars[int(ti)]
+            eps = torch.randn_like(x0)
+            x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+            t = torch.full((x0.shape[0],), int(ti), device=dev, dtype=torch.long)
+            out.append(F.mse_loss(net(x_t, t), eps).item())
+    return torch.tensor(out)
+
+
+def exp_5_per_t_difficulty(seed=0, T=1000, epochs=6, batch_size=256, lr=2e-4, early_step=150):
+    """Even with the ε target, per-t loss isn't flat. Train a denoiser, snapshot its per-t loss EARLY
+    and FINAL: the easy high-t half (x_t ≈ ε) drops to ~0 fast, the hard low-t floor (ε buried,
+    ~irreducible) stays near 1. That gap is why the training curve is front-loaded."""
+    _banner("LAYER 5: per-t difficulty — ε-loss HIGHEST at low t (ε buried), ~0 at high t (x_t ≈ ε)")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    x0_tr = _mnist(train=True).to(dev)
+    x0_te = _mnist(train=False)[:1024].to(dev)                     # held-out, for the per-t curve
+    loader = torch.utils.data.DataLoader(torch.utils.data.TensorDataset(x0_tr),
+                                         batch_size=batch_size, shuffle=True)
+    ts = torch.linspace(1, T - 1, 40).long()
+
+    # borrow the parent's competent denoiser just to READ per-t loss off it (the U-Net itself is the
+    # parent's exp_4 box; here we only need a net good enough to expose the difficulty curve).
+    import sys
+    _DDPM = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))  # walkthroughs/ddpm (holds ddpm.py)
+    if _DDPM not in sys.path:
+        sys.path.insert(0, _DDPM)
+    # pyrefly: ignore [missing-import]
+    import ddpm
+    net = ddpm.TinyUNet().to(dev)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    print(f"  training a compact ε-denoiser ({sum(p.numel() for p in net.parameters()):,} params, "
+          f"{dev}) to read per-t loss off it...")
+    loss_early = None
+    step = 0
+    for ep in range(1, epochs + 1):
+        net.train()
+        run = 0.0
+        for (xb,) in loader:
+            x_t, t, eps = make_training_pair(xb, alpha_bars, T)
+            loss = F.mse_loss(net(x_t, t), eps)
+            opt.zero_grad(); loss.backward(); opt.step()
+            run += loss.item(); step += 1
+            if step == early_step:                                 # snapshot the half-baked net
+                loss_early = _per_t_loss(net, x0_te, alpha_bars, ts, dev)
+                net.train()
+        print(f"        epoch {ep}: train loss {run / len(loader):.4f}")
+    loss_final = _per_t_loss(net, x0_te, alpha_bars, ts, dev)
+    snr = (alpha_bars[ts] / (1 - alpha_bars[ts])).cpu()
+
+    print("\n  per-t test loss MSE(ε̂, ε) — NOT flat:")
+    print("      t      SNR(t)     early     final")
+    for k in [0, 8, 16, 24, 32, 39]:
+        print(f"    {ts[k].item():>4}   {snr[k].item():>9.2f}   {loss_early[k]:.3f}    {loss_final[k]:.3f}")
+    print(f"\n    low-t  (t={ts[0].item()}):  final loss {loss_final[0]:.3f}  — HARDEST (needs sub-pixel x0; ceiling Var ε=1, MNIST prior helps)")
+    print(f"    high-t (t={ts[-1].item()}): final loss {loss_final[-1]:.3f}  — trivial (x_t ≈ ε, near-identity)")
+    print(f"    the easy high-t half was ALREADY low after {early_step} steps; the low-t end is the slow part.")
+    print("    → averaged over t, the training curve drops steeply then plateaus on this hard end (front-loaded).\n")
+
+    # ---- payoff figure: per-t loss (early vs final), and vs SNR --------------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(10.5, 4.2))
+    axL.plot(ts, loss_early, color="#c93", lw=1.8, ls="--", label=f"early ({early_step} steps)")
+    axL.plot(ts, loss_final, color="#2a7", lw=2.2, label="final")
+    axL.axhline(1.0, color="#888", ls=":", lw=1.0, label="Var(ε) = 1 floor")
+    axL.annotate("hardest: needs sub-pixel x0\n(ceiling Var(ε)=1; MNIST prior helps)", xy=(ts[2], loss_final[2]),
+                 xytext=(140, 0.80), fontsize=8, color="#555",
+                 arrowprops=dict(arrowstyle="->", color="#999"))
+    axL.annotate("trivial\n(x_t ≈ ε)", xy=(ts[-3], loss_final[-3]), xytext=(650, 0.35), fontsize=8,
+                 color="#555", arrowprops=dict(arrowstyle="->", color="#999"))
+    axL.set_xlabel("timestep t"); axL.set_ylabel("test loss  MSE(ε̂, ε)")
+    axL.set_title("per-t difficulty: ε-loss high at low t, ~0 at high t\n"
+                  "(high-t learned first — why training is front-loaded)", fontsize=10)
+    axL.set_ylim(0, 1.15); axL.legend(frameon=False, fontsize=8)
+    axR.semilogx(snr, loss_final, "o-", ms=4, color="#2a7")
+    axR.axvline(1.0, color="#888", ls=":", lw=1.0)
+    axR.text(1.15, 0.15, "SNR=1\n(logSNR=0)", fontsize=8, color="#777")
+    axR.set_xlabel("SNR(t) = ᾱ/(1-ᾱ)   (log)"); axR.set_ylabel("final test loss MSE(ε̂, ε)")
+    axR.set_title("same curve vs SNR: ε is HARD where signal dominates\n"
+                  "(mirror of the 'recover x0' difficulty, exp_7)", fontsize=10)
+    axR.set_ylim(0, 1.15)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "05_per_t_difficulty.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — per-t loss (early vs final), and the same curve against SNR.")
+    print("  🎉 training_target box COMPLETE: the target is ε, loss = MSE(ε̂, ε); the floor is Var(ε)=1;")
+    print("  ε and x0 are interchangeable but ε is the scale-stable objective; and per-t difficulty")
+    print("  follows SNR. Next box up (parent ddpm exp_4): the DENOISER — why a U-Net + why t is an input.")
+
+
 def run_experiments():
     # exp_1_whole_game()
     # exp_2_why_one()
-    exp_3_eps_or_x0()
+    # exp_3_eps_or_x0()
+    # exp_4_why_eps()
+    exp_5_per_t_difficulty()
 
 
 if __name__ == "__main__":
