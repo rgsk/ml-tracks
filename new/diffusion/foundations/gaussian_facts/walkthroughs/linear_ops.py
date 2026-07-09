@@ -227,10 +227,217 @@ def exp_3_linearity(seed=0):
     print("  Next (exp_4): the VARIANCE of a sum — where dependence finally matters (covariance).")
 
 
+# ---------------------------------------------------------------------------
+# exp_4: VARIANCE OF SUMS — where dependence finally bites.
+#
+# The mean split cleanly over a sum no matter what (exp_3). The VARIANCE does not:
+#   Var(X + Y) = Var(X) + Var(Y) + 2·Cov(X, Y)
+# with the COVARIANCE  Cov(X,Y) = E[(X-EX)(Y-EY)] = E[XY] - E[X]E[Y]  measuring how X and Y move
+# TOGETHER (+ when they rise together, − when one rises as the other falls, 0 when unrelated).
+#   independent ⇒ Cov = 0  ⇒  variances simply ADD  (Var(X+Y) = Var(X)+Var(Y))
+#   positively dependent ⇒ Cov > 0 ⇒ sum is MORE spread than the naive add
+#   negatively dependent ⇒ Cov < 0 ⇒ sum is LESS spread (can even cancel to zero)
+# We show all three with the SAME marginals so only the dependence differs:
+#   Y_ind = U[0,2] independent  |  Y_pos = X (rises with X)  |  Y_neg = 2−X (falls as X rises)
+# All three Y's have the same mean and variance as X; only Cov changes — so any difference in
+# Var(X+Y) is PURELY the covariance term. This is "fact B" of the diffusion closed form: the noise z
+# is drawn INDEPENDENTLY of x, so Cov=0 and the signal/noise variances add — no cross term to spoil
+# the √α·x + √(1−α)·z bookkeeping.
+# ---------------------------------------------------------------------------
+def exp_4_variance_of_sums(seed=0):
+    """Var(X+Y)=Var(X)+Var(Y)+2Cov(X,Y). Same marginals, three dependence structures (independent,
+    Y=X, Y=2−X) so only Cov differs: variances ADD only when independent; positive dep inflates the
+    sum's spread, negative dep cancels it. Figure: the three scatters + measured vs naive-add bars."""
+    _banner("SECTION 1 · exp_4: VARIANCE OF SUMS  Var(X+Y) = Var(X)+Var(Y)+2·Cov(X,Y)")
+
+    torch.manual_seed(seed)
+    n = 500_000
+    X = torch.rand(n) * 2.0                       # X ~ Uniform[0,2], Var = 1/3
+    varX = X.var().item()
+
+    Y_ind = torch.rand(n) * 2.0                   # independent, SAME marginal as X (U[0,2])
+    Y_pos = X.clone()                             # Y = X:    perfectly, positively dependent
+    Y_neg = 2.0 - X                               # Y = 2−X:  perfectly, negatively dependent
+    # all three Y's are Uniform[0,2] → identical mean & variance; only the DEPENDENCE on X differs.
+
+    def cov(A, B):                                # Cov(A,B) = E[AB] − E[A]E[B]
+        return (A * B).mean().item() - A.mean().item() * B.mean().item()
+
+    print("  the VARIANCE of a sum carries a CROSS term the mean never had:")
+    print("    Var(X+Y) = Var(X) + Var(Y) + 2·Cov(X,Y)")
+    print("  Cov(X,Y) = E[(X−EX)(Y−EY)]: + move together, − move oppositely, 0 unrelated.\n")
+    print(f"  All three Y have the SAME marginal (U[0,2], Var≈{varX:.3f}) — only the dependence differs.")
+    print(f"  So any gap between Var(X+Y) and the naive Var(X)+Var(Y) is PURELY 2·Cov.\n")
+
+    print(f"  {'case':<24} | {'Cov(X,Y)':>8} | {'Var(X)+Var(Y)':>13} | {'measured Var(X+Y)':>17}")
+    print(f"  {'-'*24}-+-{'-'*8}-+-{'-'*13}-+-{'-'*17}")
+    cases = [
+        ("independent   (Y⟂X)", Y_ind),
+        ("positive dep  (Y=X)", Y_pos),
+        ("negative dep  (Y=2−X)", Y_neg),
+    ]
+    results = {}
+    for name, Y in cases:
+        c = cov(X, Y)
+        naive = varX + Y.var().item()             # what you'd get if you (wrongly) just added
+        meas = (X + Y).var().item()               # the truth, cross term included
+        results[name] = (c, naive, meas)
+        print(f"  {name:<24} | {c:>8.4f} | {naive:>13.4f} | {meas:>17.4f}")
+
+    print("\n  independent → Cov≈0 → variances ADD (naive = measured).")
+    print("  Y=X → Cov=Var(X)>0 → Var(2X)=4·Var(X), DOUBLE the naive add (the +2Cov piece).")
+    print("  Y=2−X → Cov=−Var(X)<0 → X+Y is the constant 2, Var=0: the spreads CANCEL.")
+    print("  Same marginals throughout — the ONLY thing that moved was how X and Y are related.")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axL, axR) = plt.subplots(1, 2, figsize=(11, 4.3))
+
+    # LEFT: SEE the three dependence structures — blob vs up-line vs down-line.
+    idx = torch.randperm(n)[:1500]
+    for (name, Y), color in zip(cases, ["tab:blue", "tab:green", "tab:red"]):
+        axL.scatter(X[idx].numpy(), Y[idx].numpy(), s=5, alpha=0.3, color=color,
+                    label=name.split("(")[0].strip())
+    axL.set_title("same marginals, different dependence"); axL.set_xlabel("X"); axL.set_ylabel("Y")
+    axL.legend(loc="upper center", fontsize=8)
+
+    # RIGHT: naive add (assumes Cov=0) vs the truth — they only agree when independent.
+    labels = list(results.keys())
+    naive = [results[k][1] for k in labels]
+    meas = [results[k][2] for k in labels]
+    xpos = torch.arange(len(labels)).numpy()
+    axR.bar(xpos - 0.2, naive, width=0.4, color="tab:gray", label="naive Var(X)+Var(Y)")
+    axR.bar(xpos + 0.2, meas, width=0.4, color="tab:purple", label="true Var(X+Y)")
+    axR.axhline(0, color="gray", lw=0.7)
+    axR.set_xticks(xpos); axR.set_xticklabels(["independent", "Y=X", "Y=2−X"])
+    axR.set_title("variances ADD only when independent (else off by 2·Cov)")
+    axR.set_ylabel("variance"); axR.legend()
+
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "variance_of_sums.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — left: three dependence shapes; right: naive add matches the truth ONLY")
+    print("  for the independent pair. That's fact B: diffusion's z⟂x is what makes the variances add.")
+
+
+# ---------------------------------------------------------------------------
+# exp_5: CORRELATION — covariance, normalized.
+#
+# Covariance (exp_4) carries the units and spread of X and Y, so its raw size means nothing on an
+# absolute scale. CORRELATION strips that out by dividing by each variable's own std:
+#   ρ(X,Y) = Cov(X,Y) / (σ_X · σ_Y)     (measure X and Y in units of their own std, then covary)
+# The payoff: ρ is DIMENSIONLESS and always lives in [-1, +1]:
+#   ρ = +1  perfect positive line (Y = aX+b, a>0)   |   ρ = 0  no LINEAR co-movement
+#   ρ = -1  perfect negative line (a<0)              |   0<|ρ|<1  a loose tendency
+# The bound is forced by "variance can't be negative": with z-scores U,V (var 1 each),
+#   Var(U±V) = 2 ± 2ρ ≥ 0  ⇒  -1 ≤ ρ ≤ 1, and ρ=±1 exactly when Var(U∓V)=0, i.e. a perfect line.
+# Two traps this experiment makes visible:
+#   • ρ=0 does NOT mean independent — only no LINEAR structure. Y=X² is fully dependent yet ρ≈0.
+#   • ρ=±1 means an exact straight line, not merely "strongly related".
+# ---------------------------------------------------------------------------
+def exp_5_correlation(seed=0):
+    """Correlation ρ=Cov/(σ_X·σ_Y): dimensionless, always in [-1,1]. Dial a target ρ by mixing signal
+    and independent noise (Y = ρ·X_z + √(1−ρ²)·Z) and confirm measured ρ tracks it; show the extremes
+    ρ=±1 are perfect lines and the ρ≈0 trap (independent AND the dependent Y=X²). Figure: a grid of
+    scatters, each titled with its measured ρ."""
+    _banner("SECTION 1 · exp_5: CORRELATION  ρ(X,Y) = Cov(X,Y) / (σ_X·σ_Y)  ∈ [-1, 1]")
+
+    torch.manual_seed(seed)
+    n = 500_000
+    X = torch.rand(n) * 2.0                        # Uniform[0,2]
+    Xz = (X - X.mean()) / X.std()                  # standardize X: mean 0, std 1 (a "z-score")
+
+    def corr(A, B):                                # ρ = Cov / (σ_A σ_B), all population (÷n)
+        a, b = A - A.mean(), B - B.mean()
+        cov = (a * b).mean()
+        return (cov / (a.pow(2).mean().sqrt() * b.pow(2).mean().sqrt())).item()
+
+    print("  covariance carries units & spread, so its raw size is unreadable. Normalize it:")
+    print("    ρ(X,Y) = Cov(X,Y) / (σ_X · σ_Y)  — dimensionless, and ALWAYS in [-1, +1].\n")
+
+    # DIAL a target ρ: Y = ρ·X_z + √(1-ρ²)·Z, Z⟂X standard normal. Then Cov(X_z,Y)=ρ, Var(Y)=1 ⇒ ρ.
+    print("  dial a target ρ by mixing signal X with independent noise Z:  Y = ρ·X_z + √(1−ρ²)·Z")
+    print(f"    {'target ρ':>9} | {'measured ρ':>10}")
+    print(f"    {'-'*9}-+-{'-'*10}")
+    targets = [-1.0, -0.5, 0.0, 0.5, 1.0]
+    panels = []                                    # (title, X-for-plot, Y, measured ρ)
+    for r in targets:
+        Z = torch.randn(n)
+        Y = r * Xz + (1 - r ** 2) ** 0.5 * Z
+        rho = corr(X, Y)
+        panels.append((f"target ρ={r:+.1f}", X, Y, rho))
+        print(f"    {r:>+9.1f} | {rho:>+10.3f}")
+
+    print("\n  measured ρ tracks the dial and never leaves [-1,1]. The extremes are special:")
+    print("    ρ=+1 → the noise term vanishes → Y is an exact straight line in X (a>0).")
+    print("    ρ=-1 → same, negative slope.  These are the ONLY ways to hit ±1.\n")
+
+    # THE ρ≈0 TRAP: independent (ρ≈0, as expected) vs Y=X² (fully DEPENDENT, yet ρ≈0).
+    # NOTE: X² only decorrelates when X is SYMMETRIC around its mean (up- & down-branches cancel).
+    # Our U[0,2] X sits on one side, so there X² is nearly linear (ρ≈+0.97). Use a symmetric U[-1,1].
+    Xs = torch.rand(n) * 2.0 - 1.0                  # Uniform[-1,1]: symmetric about 0
+    Y_ind = torch.rand(n) * 2.0
+    Y_sq = Xs ** 2
+    rho_ind, rho_sq = corr(X, Y_ind), corr(Xs, Y_sq)
+    panels.append(("Y=X²  (X sym, dependent!)", Xs, Y_sq, rho_sq))
+    print("  ρ=0 does NOT mean independent — only NO LINEAR co-movement:")
+    print(f"    independent Y            ρ = {rho_ind:+.3f}   (expected ≈0)")
+    print(f"    Y = X², X~U[-1,1] (dep.)  ρ = {rho_sq:+.3f}   ← ρ≈0 yet Y is fully determined by X!")
+    print("    (X² decorrelates only when X is SYMMETRIC — the parabola's two branches cancel.)")
+    print("  correlation is BLIND to nonlinear structure — it only sees straight-line co-movement.")
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    idx = torch.randperm(n)[:1500]
+    fig, axes = plt.subplots(2, 3, figsize=(12, 7))
+    for ax, (title, XX, YY, rho) in zip(axes.ravel(), panels):
+        color = "tab:purple" if title.startswith("Y=X²") else "teal"
+        ax.scatter(XX[idx].numpy(), YY[idx].numpy(), s=5, alpha=0.3, color=color)
+        ax.set_title(f"{title}\nmeasured ρ = {rho:+.2f}", fontsize=10)
+        ax.set_xlabel("X"); ax.set_ylabel("Y")
+    fig.suptitle("correlation: +1 and −1 are perfect lines; ρ≈0 misses nonlinear dependence (Y=X²)",
+                 fontsize=12)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "correlation.png")
+    fig.savefig(out, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — scatters tightening to a line as |ρ|→1, and the Y=X² panel: a clear")
+    print("  curve with ρ≈0. That's the punchline: correlation measures LINEAR co-movement only.")
+
+    # THE SYMMETRY CAVEAT, side by side: same rule Y=X², two supports for X.
+    #   one-sided X~U[0,2]  → only the RIGHT branch → nearly monotonic → ρ≈+0.97 (looks linear!)
+    #   symmetric X~U[-1,1] → BOTH branches → they cancel → ρ≈0
+    rho_sq_1side = corr(X, X ** 2)
+    fig2, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.3))
+    ax1.scatter(X[idx].numpy(), (X[idx] ** 2).numpy(), s=6, alpha=0.3, color="tab:orange")
+    ax1.set_title(f"one-sided  X~U[0,2]:  ρ = {rho_sq_1side:+.2f}\nonly the right branch → nearly a line",
+                  fontsize=10)
+    ax1.set_xlabel("X"); ax1.set_ylabel("Y = X²")
+    ax2.scatter(Xs[idx].numpy(), Y_sq[idx].numpy(), s=6, alpha=0.3, color="tab:purple")
+    ax2.set_title(f"symmetric  X~U[-1,1]:  ρ = {rho_sq:+.2f}\nboth branches cancel → decorrelated",
+                  fontsize=10)
+    ax2.set_xlabel("X"); ax2.set_ylabel("Y = X²")
+    fig2.suptitle("SAME rule Y=X², opposite ρ — the ρ≈0 trap needs X symmetric about its mean",
+                  fontsize=12)
+    fig2.tight_layout()
+    out2 = os.path.join(_FIGS, "correlation_x2_symmetry.png")
+    fig2.savefig(out2, dpi=130, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"  wrote {out2} — SAME Y=X², but one-sided X gives ρ≈+0.97 (looks linear) while symmetric")
+    print("  X gives ρ≈0. Decorrelation is not a property of X² — it needs the SYMMETRY.")
+
+
 def run_experiments():
     # exp_1_mean()
     # exp_2_variance()
-    exp_3_linearity()
+    # exp_3_linearity()
+    # exp_4_variance_of_sums()
+    exp_5_correlation()
 
 
 if __name__ == "__main__":
