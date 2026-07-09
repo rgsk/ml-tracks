@@ -383,10 +383,234 @@ def exp_3_why_conv(seed=0):
     print("  conv -> relu -> conv, and what the ReLU between two convs actually buys.")
 
 
+# ---------------------------------------------------------------------------
+# EXP 4: why `conv -> relu -> conv`? Depth, the receptive field, and the load-bearing ReLU.
+#
+# exp_1's `features` didn't stack bare convs — it stacked conv -> relu -> conv -> relu -> ... Two
+# questions that stack answers, and both need measuring:
+#
+#   (A) WHY STACK AT ALL (receptive field). One k3 conv: each output sees a 3x3 input patch. Put a
+#       second k3 on top and each of ITS outputs sees a 3x3 patch of the first map, which each spans
+#       3x3 of the input -> 5x5 of the ORIGINAL. Depth widens the window WITHOUT bigger kernels:
+#           RF_L = 1 + L·(k-1)      (k3, stride 1: +2 per layer -> 3, 5, 7, ...)
+#       We perturb ONE input pixel and count how many outputs move: 3x3 after one conv, 5x5 after two.
+#       This is how a small-kernel net eventually "sees" a whole 28x28 digit.
+#   (B) WHY THE RELU (it's load-bearing). A conv is LINEAR, and two linear convs compose into... ONE
+#       linear conv (a bigger kernel) — depth bought NOTHING. We prove it: the 2-conv no-activation
+#       stack's IMPULSE RESPONSE is a 5x5 kernel keq, and conv(x, keq) reproduces the whole stack to
+#       ~0. Drop a ReLU between the convs and superposition breaks (f(x1+x2) != f(x1)+f(x2)), so it can
+#       no longer equal ANY single conv. The ReLU is exactly what lets stacked layers compose
+#       edges -> strokes -> parts instead of collapsing back to one edge detector.
+# ---------------------------------------------------------------------------
+def exp_4_stack_and_relu(seed=0):
+    """Why exp_1 stacks conv -> relu -> conv: (A) depth grows the receptive field — perturb one input
+    pixel, count moved outputs: 3x3 after one k3 conv, 5x5 after two, 7x7 after three (RF = 1+L(k-1));
+    (B) the ReLU is load-bearing — a linear 2-conv stack collapses to a single 5x5 conv (reproduced to
+    ~0), and a ReLU between them breaks that (superposition fails), so depth+nonlinearity buys real
+    capacity. Save the growing receptive field."""
+    _banner("EXP 4: conv -> relu -> conv — receptive field grows with depth, and ReLU makes it matter")
+
+    torch.manual_seed(seed)
+
+    # ---- (A) receptive field grows with depth --------------------------------------------
+    # perturb ONE center pixel and count how many OUTPUT pixels move, after 1/2/3 stacked k3 convs.
+    # use ones-kernels so contributions can't cancel — we're counting reach, not values.
+    S = 15
+    base = torch.zeros(1, 1, S, S)
+    pert = base.clone(); pert[0, 0, S // 2, S // 2] = 1.0          # a single lit pixel at the center
+    ones = torch.ones(1, 1, 3, 3)
+
+    def n_layers(x, n):
+        for _ in range(n):
+            x = F.conv2d(x, ones, padding=1)
+        return x
+
+    masks = {}
+    print("  (A) perturb ONE center input pixel; count OUTPUT pixels that move (an output cell's")
+    print("      receptive field), after 1/2/3 stacked k3 convs:")
+    for L in (1, 2, 3):
+        moved = (n_layers(pert, L) - n_layers(base, L)).abs() > 0
+        masks[L] = moved[0, 0]
+        ys, xs = moved[0, 0].nonzero(as_tuple=True)
+        h = ys.max().item() - ys.min().item() + 1
+        w = xs.max().item() - xs.min().item() + 1
+        rf = 1 + L * (3 - 1)                                       # RF_L = 1 + L·(k-1) for k3, stride1
+        print(f"        {L} conv{'s' if L > 1 else ' '}: moved block {h}x{w}     (formula RF = 1 + {L}·2 = {rf})")
+    print("      -> depth widens the window with small kernels; ~3 k3 convs + a stride-2 (exp_5)")
+    print("         already let an output cell 'see' most of a 28x28 digit.\n")
+
+    # ---- (B) why the ReLU: a LINEAR conv stack collapses to one conv ----------------------
+    C = 8
+    w1 = torch.randn(C, 1, 3, 3) * 0.3                             # 1 -> C
+    w2 = torch.randn(1, C, 3, 3) * 0.3                             # C -> 1
+
+    def linear_stack(x):                                          # two convs, NO activation
+        return F.conv2d(F.conv2d(x, w1, padding=1), w2, padding=1)
+
+    def relu_stack(x):                                            # same, ReLU between them
+        return F.conv2d(F.relu(F.conv2d(x, w1, padding=1)), w2, padding=1)
+
+    # the equivalent single kernel = the stack's IMPULSE RESPONSE (delta in -> response out), FLIPPED:
+    # F.conv2d is cross-correlation, so its impulse response is the kernel flipped; flip back to
+    # recover a kernel that reproduces the stack under F.conv2d.
+    delta = torch.zeros(1, 1, 9, 9); delta[0, 0, 4, 4] = 1.0
+    imp = linear_stack(delta)[:, :, 2:7, 2:7]                      # 5x5 impulse response around center
+    keq = torch.flip(imp, dims=(2, 3))                            # -> the equivalent 5x5 kernel
+
+    x = torch.randn(1, 1, 20, 20)
+    single = F.conv2d(x, keq, padding=2)                          # ONE 5x5 conv
+    interior = (slice(None), slice(None), slice(2, 18), slice(2, 18))
+    collapse = (linear_stack(x)[interior] - single[interior]).abs().max().item()
+    print("  (B) a convolution is LINEAR, so composing two of them (no activation) is still ONE conv.")
+    print("      the 2-layer linear stack's impulse response is a 5x5 kernel keq; conv(x, keq)")
+    print(f"      reproduces the whole stack:  max|linear_stack(x) - conv(x, keq)| = {collapse:.2e}")
+    print("      -> depth WITHOUT a nonlinearity buys nothing: two layers = one bigger kernel.\n")
+
+    # superposition test: a linear map satisfies f(x1+x2)=f(x1)+f(x2); ReLU breaks it.
+    x1, x2 = torch.randn(1, 1, 20, 20), torch.randn(1, 1, 20, 20)
+    lin_resid = (linear_stack(x1 + x2) - linear_stack(x1) - linear_stack(x2)).abs().max().item()
+    relu_resid = (relu_stack(x1 + x2) - relu_stack(x1) - relu_stack(x2)).abs().max().item()
+    print("      now drop a ReLU between the two convs and test superposition f(x1+x2) =? f(x1)+f(x2):")
+    print(f"        linear stack residual = {lin_resid:.2e}   (linear: holds)")
+    print(f"        ReLU   stack residual = {relu_resid:.3f}      (broken: NOT any single conv)")
+    print("      -> ReLU is what lets stacked convs compose edges->strokes->parts instead of")
+    print("         collapsing to one edge detector. Nonlinearity is what makes depth mean something.\n")
+
+    # ---- the payoff: watch the receptive field grow 3x3 -> 5x5 -> 7x7 ---------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 3, figsize=(3 * 2.4, 2.7))
+    for ax, L in zip(axes, (1, 2, 3)):
+        rf = 1 + L * (3 - 1)
+        ax.imshow(masks[L].cpu().numpy(), cmap="Reds", vmin=0, vmax=1)
+        ax.plot(S // 2, S // 2, "b+", markersize=10, markeredgewidth=2)   # the one perturbed pixel
+        ax.set_title(f"{L} conv{'s' if L > 1 else ''}  ->  RF {rf}x{rf}", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("receptive field of ONE output cell grows with depth (blue + = perturbed input pixel)",
+                 fontsize=10)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "04_receptive_field.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — the window an output cell sees widens 3x3 -> 5x5 -> 7x7 with each stacked")
+    print("  conv. Next (exp_5): stride-2 downsampling (28->14->7) + growing channels — how late")
+    print("  layers get a receptive field covering the WHOLE digit without dozens of layers.")
+
+
+# ---------------------------------------------------------------------------
+# EXP 5: why `stride=2` (H/2, W/2) and ×2 channels? The 28->14->7 resolution pyramid.
+#
+# exp_4 stacked stride-1 convs: the map stays 28x28 and the receptive field crept up by (k-1)=2 per
+# layer -> you'd need ~14 layers for one cell to "see" a whole 28x28 digit. exp_1 instead DOWNSAMPLED:
+# two of its convs used stride=2, halving H,W (28->14->7) while DOUBLING channels (16->32->64). Three
+# things that buys, each measured:
+#
+#   (A) THE PYRAMID. A stride-2 k3,p1 conv outputs ceil(in/2) (the exp_2 size formula) -> 28->14->7.
+#       We rebuild exp_1's exact features stack and check the shapes.
+#   (B) RECEPTIVE FIELD EXPLODES. RF_L = RF_{L-1} + (k-1)·∏(strides so far): once you've downsampled,
+#       every later (k-1) step is worth `stride` INPUT pixels. Measured by autograd (which input pixels
+#       a central output cell actually depends on): stride-1 gives RF 3/5/7, stride-2 gives 3/7/15 —
+#       ~4 stride-2 layers cover 28 where stride-1 needs ~14.
+#   (C) CHANNELS GROW FOR FREE. Each stride-2 stage cuts positions 4x, so DOUBLING channels still
+#       multiplies the activation footprint C·H·W by 2·(1/4) = 1/2 (and conv FLOPs drop too). That's
+#       the universal CNN shape: resolution DOWN, channels UP.
+# ---------------------------------------------------------------------------
+def exp_5_downsample(seed=0):
+    """Why exp_1 downsamples with stride-2 and doubles channels: (A) a stride-2 k3 conv halves H,W —
+    the 28->14->7 pyramid, shapes checked; (B) the receptive field (measured in INPUT pixels via
+    autograd) grows far faster with stride (3/7/15 vs 3/5/7) because the stride product multiplies
+    every later step; (C) each downsample quarters positions, so doubling channels still shrinks the
+    footprint C·H·W. Save the receptive field of a late cell on a real digit, stride-1 vs stride-2."""
+    _banner("EXP 5: stride-2 downsampling — 28->14->7, channels up: the resolution pyramid")
+
+    torch.manual_seed(seed)
+
+    # ---- (A) the resolution pyramid: exp_1's exact features stack -------------------------
+    x = torch.randn(1, 1, 28, 28)
+    stem = torch.nn.Conv2d(1, 16, kernel_size=3, padding=1)               # 28 -> 28 (stride 1)
+    down1 = torch.nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1)   # 28 -> 14
+    down2 = torch.nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)   # 14 -> 7
+    h0 = stem(x); h1 = down1(F.relu(h0)); h2 = down2(F.relu(h1))
+    print("  (A) exp_1's features: a stride-1 stem, then two STRIDE-2 convs, DOUBLING channels each:")
+    print(f"      {tuple(x.shape)} --stem(1->16,s1)--> {tuple(h0.shape)}"
+          f" --down1(16->32,s2)--> {tuple(h1.shape)} --down2(32->64,s2)--> {tuple(h2.shape)}")
+    print("      spatial pyramid 28 -> 28 -> 14 -> 7  (k3,s2,p1 -> out = ceil(in/2), the exp_2 formula)\n")
+
+    # ---- (B) receptive field: stride MULTIPLIES the reach of every later step -------------
+    # Measure RF in INPUT pixels EXACTLY: pick one central OUTPUT cell, backprop to the input, and the
+    # input pixels with nonzero gradient are precisely the ones it depends on.
+    S = 31
+    ones = torch.ones(1, 1, 3, 3)
+
+    def rf(n_layers, stride):
+        xin = torch.zeros(1, 1, S, S, requires_grad=True)
+        y = xin
+        for _ in range(n_layers):
+            y = F.conv2d(y, ones, stride=stride, padding=1)
+        c = y.shape[-1] // 2                                   # a central output cell
+        y[0, 0, c, c].backward()
+        m = xin.grad[0, 0].abs() > 0                           # input pixels it depends on
+        ys, _ = m.nonzero(as_tuple=True)
+        return ys.max().item() - ys.min().item() + 1          # RF side length, in input pixels
+
+    print("  (B) receptive field of ONE output cell, in INPUT pixels (autograd: which input pixels")
+    print("      the cell actually depends on), for stride-1 vs stride-2 stacks of k3 convs:")
+    print("        layers |  stride-1 RF  |  stride-2 RF")
+    for L in (1, 2, 3):
+        print(f"           {L}    |      {rf(L, 1):>2}       |      {rf(L, 2):>2}")
+    print("      RF_L = RF_{L-1} + (k-1)·∏(strides): the stride PRODUCT multiplies every later step.")
+    print("      -> ~14 stride-1 convs to reach RF 28, but only ~4 stride-2 (3->7->15->31): stride is")
+    print("         how a small-kernel net comes to 'see' the whole digit.\n")
+
+    # ---- (C) why channels grow as resolution shrinks: the footprint stays bounded ---------
+    print("  (C) footprint C·H·W per stage. once channels DOUBLE while area QUARTERS, each downsample")
+    print("      multiplies the footprint by 2·(1/4) = 1/2 — resolution traded for depth cheaply:")
+    prev = None
+    for name, t in (("input", x), ("stem  1->16", h0), ("down1 16->32", h1), ("down2 32->64", h2)):
+        c, hh, ww = t.shape[1], t.shape[2], t.shape[3]
+        v = c * hh * ww
+        ratio = "(input)" if prev is None else f"×{v / prev:.2f} vs prev"
+        print(f"        {name:<12} {c:>2}·{hh}·{ww} = {v:>5} values   {ratio}")
+        prev = v
+    print("      -> stride-2 conv FLOPs drop ~4x per stage too, which is what makes deep, wide late")
+    print("         layers affordable.\n")
+
+    # ---- the payoff: RF of a late cell on a real digit, stride-1 vs stride-2 --------------
+    # draw the exact RF box (from rf() above) centered on a real '3' after 3 convs, both strides.
+    xte, yte = _mnist(train=False)
+    digit = _to_img(xte[(yte == 3).nonzero()[0].item():][:1])     # a real '3', 28x28 in [0,1]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, axes = plt.subplots(1, 2, figsize=(2 * 2.6, 2.9))
+    for ax, stride in zip(axes, (1, 2)):
+        r = rf(3, stride)                                         # RF side after 3 convs
+        ax.imshow(digit, cmap="gray")
+        lo = 14 - r / 2                                           # box centered on the 28x28 digit
+        rect = plt.Rectangle((lo, lo), r, r, fill=False, edgecolor="red", lw=2)
+        ax.add_patch(rect)
+        ax.set_title(f"3 stride-{stride} convs\nRF {r}x{r} pixels", fontsize=10)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("what ONE late output cell sees — same depth, stride-2 reaches far more of the digit",
+                 fontsize=9)
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "05_downsample_rf.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — same 3 convs, but the stride-2 cell's receptive field (15x15) covers half")
+    print("  the digit where the stride-1 cell (7x7) sees a sliver. Next (exp_6): the head + loss —")
+    print("  flatten vs global-average-pool, cross-entropy, and two wiring checks.")
+
+
 def run_experiments():
     # exp_1_whole_game()
     # exp_2_open_features()
-    exp_3_why_conv()
+    # exp_3_why_conv()
+    # exp_4_stack_and_relu()
+    exp_5_downsample()
 
 
 if __name__ == "__main__":

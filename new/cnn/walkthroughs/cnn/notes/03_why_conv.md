@@ -6,8 +6,6 @@ the two things that make an image an image, and a conv keeps both: **(A)** local
 structure (shift a digit → a dense net sees a near-new input, a conv's output just shifts), and
 **(B)** the parameter count. Run it with `python cnn.py` (`exp_3_why_conv`).
 
-> Open this in the Markdown preview (`Cmd/Ctrl+Shift+V`) so the figure shows inline.
-
 ---
 
 ## 1. The thing we're arguing against: flatten + dense
