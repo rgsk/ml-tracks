@@ -229,8 +229,7 @@ Substitute that into the covariance definition:
   Cov(X, Y + c) = E[ (X − E[X]) · ( (Y + c) − E[Y + c] ) ]
                 = E[ (X − E[X]) · ( Y + c − (E[Y] + c) ) ]
                 = E[ (X − E[X]) · ( Y − E[Y] ) ]
-
-                = Cov(X, Y)                                   ∎
+                = Cov(X, Y)
 ```
 
 Adding a constant slides `Y` bodily but doesn't change how it _varies around its own centre_, so it
@@ -244,7 +243,7 @@ First, `E[a·Y] = a·E[Y]` (scaling rule for the mean, exp_1), so the deviation 
   Cov(X, a·Y) = E[ (X − E[X]) · ( a·Y − E[a·Y] ) ]
               = E[ (X − E[X]) · a·( Y − E[Y] ) ]             ← factored out a
               = a · E[ (X − E[X])( Y − E[Y] ) ]              ← constant a leaves the expectation
-              = a · Cov(X, Y)                                ∎
+              = a · Cov(X, Y)
 ```
 
 The last step uses `E[a·Z] = a·E[Z]` again (this time with `Z = (X−EX)(Y−EY)`): a constant factor
@@ -340,7 +339,7 @@ _is_ the dial — and the measurement confirms it, never leaving `[−1,1]`:
 
 and `ρ=±1` is reached **exactly** when one of those variances hits `0` — i.e. `U±V` is a constant,
 meaning X and Y lie on a perfect straight line. That's why `Y=X` (`ρ=+1`) and `Y=2−X` (`ρ=−1`) from
-exp_4 were the _extreme_ covariances available.
+exp*4 were the \_extreme* covariances available.
 
 ### Two traps the figure makes visible
 
@@ -364,7 +363,7 @@ is uncorrelated with X" is a statement about the _symmetry of X_, not about squa
 
 > **Why this matters for diffusion:** independence gives `ρ=0`, but `ρ=0` alone is a _weaker_
 > guarantee. When we insist the noise `ε` is **independent** of `x0` (not merely uncorrelated), we
-> get the full "variances add, cross term vanishes" of exp_4 _and_ — once everything is Gaussian
+> get the full "variances add, cross term vanishes" of exp*4 \_and* — once everything is Gaussian
 > (Section 2) — uncorrelated actually _does_ upgrade to independent. Correlation is the linear
 > shadow of the dependence covariance already measures.
 
