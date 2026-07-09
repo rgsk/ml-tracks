@@ -41,14 +41,27 @@ broadcasts over pixels — the classic forgotten-reshape bug.
 ## Wiring check A — untrained ≈ 1.0
 
 ```
-  untrained loss         = 1.0074
-  predict-all-zeros loss = 1.0066     (= E‖ε‖² = Var(ε) ≈ 1)
+  untrained output      : mean +0.0000, std 0.0304    ← what the fresh net actually emits
+  untrained loss vs ε   = 1.0074
+  predict-all-zeros loss= 1.0066     (= E‖ε‖² = Var(ε) ≈ 1)
 ```
 
-A fresh net has learned nothing, and it lands at the same place as **predicting all zeros**: `≈ 1.0`.
-That's the "do nothing" floor — the target `ε` is unit Gaussian, so the best *constant* guess is its
-mean `0`, which scores its variance, `1`. **Any loss below 1 is genuinely-learned noise structure**
-(the parent's `0.0235` = ~98% of the variance explained). *Why the floor is exactly 1 is exp_2.*
+Look at *what the net outputs*, not just its loss: at init the weights are tiny, so the output is
+**≈ 0** — centered at zero, spread `~0.03` (≈30× smaller than `ε`'s unit scale). The fresh net *is*
+the zero-predictor, and that's *why* its loss matches `predict-all-zeros ≈ 1.0`.
+
+The chain matters, because "loss ≈ 1" and "outputs ≈ 0" are **not** the same statement. For any
+constant prediction `c` against `ε ~ N(0,1)`:
+
+```
+  loss(c) = E[(c − ε)²] = (c − E[ε])² + Var(ε) = c² + 1
+```
+
+so `c = 0` scores exactly `1` (the floor), `c = 1` (all ones) scores `2`, etc. **Only predicting the
+mean of `ε` (which is 0) hits 1** — lots of other guesses score *above* it. The mean/std readout is
+the conclusive evidence that the untrained net really is sitting at that `c ≈ 0` minimum, not some
+other constant. **Any loss below 1 is genuinely-learned noise structure** (the parent's `0.0235` =
+~98% of the variance explained). *Why the floor is exactly `Var(ε)` is exp_2.*
 
 ---
 

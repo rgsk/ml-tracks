@@ -58,6 +58,11 @@ def _device():
     return "cuda" if torch.cuda.is_available() else "cpu"
 
 
+def _to_img(x):
+    """(1,28,28)-ish tensor in [-1,1] -> HxW numpy in [0,1] for imshow."""
+    return ((x.squeeze().clamp(-1, 1) + 1) / 2).cpu().numpy()
+
+
 def _mnist(train=True):
     """MNIST images (N,1,28,28) in [-1,1], from the cached npz. No torchvision."""
     import numpy as np
@@ -171,12 +176,16 @@ def exp_1_whole_game(seed=0, T=1000, batch_size=16, steps=600, lr=1e-3):
     # ---- (A) untrained net: the do-nothing floor --------------------------------------------
     net = _TinyDenoiser().to(dev)
     with torch.no_grad():
-        loss0 = F.mse_loss(net(x_t, t), eps).item()
+        eps_hat = net(x_t, t)                                      # what the fresh net actually outputs
+        loss0 = F.mse_loss(eps_hat, eps).item()
     zeros_loss = F.mse_loss(torch.zeros_like(eps), eps).item()     # predict nothing at all
     print("  (A) wiring check — an UNTRAINED net has learned nothing:")
-    print(f"        untrained loss        = {loss0:.4f}")
+    # WHY it matches the floor: look at what it outputs. At init the weights are tiny, so the
+    # output is ≈0 — centered at 0 with a spread ~30x smaller than ε's. It IS the zero-predictor.
+    print(f"        untrained output      : mean {eps_hat.mean():+.4f}, std {eps_hat.std():.4f}   (≈ 0 — outputs almost nothing)")
+    print(f"        untrained loss vs ε   = {loss0:.4f}")
     print(f"        predict-all-zeros loss= {zeros_loss:.4f}   (= E‖ε‖² = Var(ε) ≈ 1 — the floor)")
-    print("        both ≈ 1.0: guessing gets you here. below 1 = real learning.  (why 1 exactly: exp_2)\n")
+    print("        outputs ≈0  ⇒  loss ≈ Var(ε) = 1. (a constant c scores c²+1, so ONLY c=0 hits 1; exp_2.)\n")
 
     # ---- (B) overfit ONE batch: proof the objective is learnable ----------------------------
     opt = torch.optim.Adam(net.parameters(), lr=lr)
@@ -214,8 +223,160 @@ def exp_1_whole_game(seed=0, T=1000, batch_size=16, steps=600, lr=1e-3):
     print("  (exp_2): why the untrained floor is EXACTLY 1 — the predict-nothing baseline.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 2 (why ≈ 1): the do-nothing floor is Var(target). Make it exact, then measure it.
+#
+# exp_1 showed an untrained net outputs ≈0 and scores ≈1. Both facts come from one little theorem:
+# the best CONSTANT you can predict for a target Y is its mean, and the loss you're left with is its
+# variance. Nothing about diffusion — it's the "predict the average" baseline every regression has.
+#
+#   DERIVATION  — best constant c for target Y, under squared error:
+#     E[(c - Y)²] = E[c² - 2cY + Y²]                       expand
+#                 = c² - 2c·E[Y] + E[Y²]                   linearity of E
+#                 = c² - 2c·μ + (σ² + μ²)                  E[Y²] = Var + mean² = σ² + μ²
+#                 = (c - μ)² + σ²                          complete the square   (μ=E[Y], σ²=Var Y)
+#     minimized at c = μ, with minimum value σ².     →  best constant = the MEAN, its loss = the VARIANCE.
+#
+#   For the diffusion target Y = ε ~ N(0, I):  μ = 0,  σ² = 1   →   the floor is exactly 1.
+#   (And ε is unit-variance at EVERY t, so this floor is a flat 1 across all noise levels — the thing
+#    that makes ε such a convenient target. The contrast with a Var(x0) that MOVES with t is exp_4.)
+# ---------------------------------------------------------------------------
+def exp_2_why_one(seed=0, n=8192):
+    """Why the untrained floor is exactly 1: predicting the best constant for ε costs Var(ε). Sweep
+    the constant c, watch MSE(c, ε) trace the parabola (c-μ)²+σ², bottoming out at c=mean=0 with
+    value var=1. Anything a real net scores BELOW 1 is learned structure."""
+    _banner("LAYER 2: why ≈ 1 — the do-nothing floor is Var(target), and for ε that's 1")
+
+    torch.manual_seed(seed)
+    eps = torch.randn(n, 1, 28, 28)                                # a big pile of the target ε ~ N(0,I)
+    mu, var = eps.mean().item(), eps.var().item()
+    print("  the target here is ε ~ N(0, I):")
+    print(f"    measured  mean(ε) = {mu:+.4f}   var(ε) = {var:.4f}   (→ theory says floor = var = 1)\n")
+
+    # ---- sweep the constant predictor c and watch the parabola ------------------------------
+    cs = torch.linspace(-1.0, 1.0, 41)
+    losses = torch.tensor([F.mse_loss(torch.full_like(eps, c.item()), eps).item() for c in cs])
+    parabola = (cs - mu) ** 2 + var                                # the derived (c-μ)²+σ²
+    i_min = int(torch.argmin(losses))
+    print("  predict a CONSTANT c for every pixel, measure MSE(c, ε):")
+    print("      c      MSE(c,ε)   (c-μ)²+σ²")
+    for c, m, p in list(zip(cs, losses, parabola))[::8]:           # every 8th row
+        mark = "  <- min" if abs(c.item() - cs[i_min].item()) < 1e-6 else ""
+        print(f"    {c.item():+.2f}    {m.item():.4f}     {p.item():.4f}{mark}")
+    print(f"    best constant c* = {cs[i_min].item():+.2f}  (= mean ε)   loss there = {losses[i_min].item():.4f}  (= var ε = the floor)\n")
+
+    # ---- what "below the floor" means --------------------------------------------------------
+    parent_loss = 0.0235                                           # the parent's trained loss (ddpm exp_1)
+    print("  so the floor isn't hard-coded — it's what 'predict the average' costs:")
+    print(f"    a trained net that scores {parent_loss} explains 1 - {parent_loss}/{var:.2f} = "
+          f"{1 - parent_loss / var:.1%} of ε's variance (an R²).")
+    print("    every value BELOW 1 is genuinely-learned noise structure; at/above 1 = no better than guessing.\n")
+
+    # ---- payoff figure: the parabola, its minimum, the 'learning' region --------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(6.4, 4.2))
+    ax.axhspan(0, var, color="#3b6", alpha=0.08)
+    ax.text(0.0, var * 0.5, "below the floor =\nlearned structure", ha="center", va="center",
+            fontsize=9, color="#2a7")
+    ax.plot(cs, parabola, color="#888", lw=1.4, label="(c − μ)² + σ²  (derived)")
+    ax.scatter(cs, losses, s=16, color="#36c", zorder=3, label="measured  MSE(c, ε)")
+    ax.axhline(var, color="#c33", ls="--", lw=1.2, label=f"floor = Var(ε) = {var:.2f}")
+    ax.scatter([cs[i_min]], [losses[i_min]], s=70, color="#c33", zorder=4,
+               marker="v", label=f"best constant  c*=mean(ε)={cs[i_min].item():.2f}")
+    ax.set_xlabel("constant prediction c"); ax.set_ylabel("loss = MSE(c, ε)")
+    ax.set_title("the do-nothing floor: best constant = mean(ε) = 0, loss = Var(ε) = 1\n"
+                 "(any constant other than the mean scores ABOVE 1)", fontsize=10)
+    ax.set_ylim(bottom=0); ax.legend(frameon=False, fontsize=8, loc="upper center")
+    fig.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "02_floor.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — the loss parabola, its minimum at the mean, the floor at Var(ε).")
+    print("  The floor = Var(target). Next (exp_3): the target isn't even unique — given (x_t, t) we")
+    print("  could regress on x0 instead of ε, and the two pin each other down.")
+
+
+# ---------------------------------------------------------------------------
+# LAYER 3 (ε or x0?): the target isn't unique. The closed form is ONE linear equation tying three
+# quantities at a given t, so fixing any two pins the third:
+#
+#     x_t = √ᾱ_t · x0 + √(1-ᾱ_t) · ε
+#
+#   solve for ε :   ε  = (x_t − √ᾱ_t · x0) / √(1-ᾱ_t)
+#   solve for x0:   x0 = (x_t − √(1-ᾱ_t) · ε) / √ᾱ_t
+#
+# The net only ever sees (x_t, t). Given that, x0 and ε determine each other EXACTLY — so "predict ε"
+# and "predict x0" are the SAME job in two coordinate systems. A net trained on one can be converted
+# to the other analytically, no retraining. (Which one to actually pick is exp_4 — they are NOT equally
+# easy to learn, even though they're interchangeable here.)
+# ---------------------------------------------------------------------------
+def exp_3_eps_or_x0(seed=0, T=1000, batch_size=64):
+    """The target isn't unique: given (x_t, t), ε and x0 pin each other down. Recover each from the
+    other with the rearranged closed form and confirm it's exact (~1e-6). Then SEE it: from x_t and the
+    true ε, reconstruct the clean digit at every t."""
+    _banner("LAYER 3: ε or x0? — one closed form, two interchangeable targets")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    # ---- numeric check: recover ε from x0, and x0 from ε, over a real batch -------------------
+    x0 = _mnist(train=False)[:batch_size].to(dev)
+    x_t, t, eps = make_training_pair(x0, alpha_bars, T)
+    ab = alpha_bars[t].view(-1, 1, 1, 1)
+    eps_from_x0 = (x_t - ab.sqrt() * x0) / (1 - ab).sqrt()          # solve the closed form for ε
+    x0_from_eps = (x_t - (1 - ab).sqrt() * eps) / ab.sqrt()         # ...and for x0
+    print("  the closed form x_t = √ᾱ·x0 + √(1-ᾱ)·ε ties (x_t, x0, ε): fix two, the third is pinned.")
+    print("  the net sees only (x_t, t) — given that, ε and x0 determine each other. recover each:")
+    print(f"    ε  from (x_t, x0):  max|ε̂ − ε|   = {(eps_from_x0 - eps).abs().max().item():.2e}")
+    print(f"    x0 from (x_t, ε) :  max|x̂0 − x0| = {(x0_from_eps - x0).abs().max().item():.2e}")
+    print("    both ~machine-zero → the two targets carry the SAME information (interchangeable).\n")
+    print("  so 'predict ε' vs 'predict x0' is a choice of PARAMETRIZATION, not of information; a net")
+    print("  trained on one converts to the other with these formulas. WHICH to pick (they aren't equally")
+    print("  easy to learn) is exp_4.\n")
+
+    # ---- see it: from x_t and the true ε, rebuild the clean digit at every t -----------------
+    digit = _mnist(train=False)[7:8].to(dev)                        # one held-out digit
+    ts = [50, 100, 200, 400, 600, 800]
+    e = torch.randn_like(digit)                                     # ONE noise field, mixed in more each col
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rows, cols = 3, len(ts)
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 1.15, rows * 1.25))
+    row_labels = ["x0  (clean)", "x_t  (noised)", "x̂0 from (x_t, ε)"]
+    for j, ti in enumerate(ts):
+        abj = alpha_bars[ti]
+        x_ti = abj.sqrt() * digit + (1 - abj).sqrt() * e
+        x0_hat = (x_ti - (1 - abj).sqrt() * e) / abj.sqrt()         # recover x0 from the TRUE ε
+        for i, img in enumerate([digit, x_ti, x0_hat]):
+            ax = axes[i, j]
+            ax.imshow(_to_img(img), cmap="gray"); ax.set_xticks([]); ax.set_yticks([])
+            if i == 0:
+                ax.set_title(f"t={ti}", fontsize=9)
+            if j == 0:
+                ax.set_ylabel(row_labels[i], fontsize=9)
+    fig.suptitle("given x_t and the noise ε, the clean image is PINNED:  x̂0 = (x_t − √(1-ᾱ)·ε)/√ᾱ\n"
+                 "exact recovery at every t → ε and x0 are the same information", fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "03_eps_or_x0.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — bottom row (recovered x0) matches the top row (clean) at every t.")
+    print("  (Recovery is EXACT because ε is the true noise; with a net's ε̂ the 1/√ᾱ factor amplifies")
+    print("   its error at high t — a sampling concern, not a target one.)")
+    print("  Next (exp_4): ε and x0 are interchangeable, but NOT equally learnable — why we pick ε.")
+
+
 def run_experiments():
-    exp_1_whole_game()
+    # exp_1_whole_game()
+    # exp_2_why_one()
+    exp_3_eps_or_x0()
 
 
 if __name__ == "__main__":
