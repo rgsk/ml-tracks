@@ -121,6 +121,35 @@ memorizing**, because every CNN is built from them:
 `k3, s1, p1` always returns `in`; `k3, s2, p1` always returns `ceil(in/2)`. *Why* halve at all (and
 grow channels while doing it) is exp_5.
 
+### What is the padding actually doing?
+
+Both clean sizes above came from `p = k//2`. Turn padding **off** (`p = 0`) and the same convs stop
+behaving:
+
+| in | k | s | p | out | what broke |
+|---|---|---|---|---|---|
+| 28 | 3 | 1 | 0 | 26 | stride-1 **shrinks by `k−1`** — one layer eats a 1px border |
+| 28 | 5 | 1 | 0 | 24 | bigger kernel → bigger shrink (`k−1 = 4`) |
+| 28 | 3 | 2 | 0 | 13 | strided, unpadded → **13**, not the clean `14 = ceil(28/2)` |
+
+So padding isn't cosmetic — it counteracts the `k−1` a window loses at the border:
+
+- **stride 1:** `p = k//2` cancels the shrink *exactly*, giving `out = in`. Without it, every layer
+  peels off `k−1` pixels — stack three unpadded `k3` convs and you've silently lost 6 (`28 → 22`).
+- **stride 2:** `p = 1` is what lands you on the clean `ceil(in/2)` (14) instead of 13, so the
+  `28 → 14 → 7` pyramid stays exact.
+
+The same-size padding is `p = k//2` — `k3 → 1`, `k5 → 2`, `k7 → 3` — because a stride-1 conv shrinks
+by `k−1`, and `k//2` on *each* side adds back exactly those columns. Worked for `k5`: the unpadded
+`k5, s1, p0` shrank by `k−1 = 4` (28 → 24), and `p = 2` on each side replaces those 4 —
+
+```
+k5, s1, p2:  out = floor( (28 + 2·2 − 5) / 1 ) + 1 = 27 + 1 = 28   ✓ same size
+```
+
+This only comes out whole for **odd** `k`: an even kernel can't be symmetrically padded to preserve
+size, which is why conv kernels are almost always odd (3, 5, 7).
+
 ---
 
 ## Recap

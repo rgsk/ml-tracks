@@ -262,8 +262,20 @@ def exp_2_open_features(seed=0):
                                (14, 3, 2, 1, "down2 k3,s2,p1")]:
         real = F.conv2d(torch.zeros(1, 1, inp, inp), torch.zeros(1, 1, k, k), stride=s, padding=p).shape[-1]
         print(f"        {role}:  {inp:>2} -> {out_size(inp, k, s, p):>2}   (F.conv2d gives {real})")
-    print("      -> 28 -> 14 -> 7, exactly the shrink you saw. Next (exp_3): why conv at all, vs the")
-    print("         flatten+MLP we could have reused?")
+    print("      -> 28 -> 14 -> 7, exactly the shrink you saw.\n")
+
+    # what does the padding p do? drop it (p=0) and the same convs no longer keep the clean sizes:
+    print("      the padding's whole job: turn off p and watch the sizes break.")
+    for inp, k, s, p, role in [(28, 3, 1, 0, "k3,s1,p0 (stem, unpadded)"),
+                               (28, 5, 1, 0, "k5,s1,p0 (bigger kernel)"),
+                               (28, 3, 2, 0, "k3,s2,p0 (down, unpadded)")]:
+        real = F.conv2d(torch.zeros(1, 1, inp, inp), torch.zeros(1, 1, k, k), stride=s, padding=p).shape[-1]
+        print(f"        {role:<26}:  {inp:>2} -> {out_size(inp, k, s, p):>2}   (F.conv2d gives {real})")
+    print("      -> s1 unpadded SHRINKS by k-1 every layer (28->26): stack 3 and you've lost 6")
+    print("         pixels for nothing. p = k//2 (for k3, 3//2 = p1) exactly cancels that -> same size.")
+    print("         s2 unpadded gives 13.")
+    print("         not the clean 14 = ceil(28/2). So p keeps stride-1 same-size and stride-2 at ceil(in/2).")
+    print("      Next (exp_3): why conv at all, vs the flatten+MLP we could have reused?")
 
 
 # ---------------------------------------------------------------------------
@@ -607,10 +619,10 @@ def exp_5_downsample(seed=0):
 
 def run_experiments():
     # exp_1_whole_game()
-    # exp_2_open_features()
+    exp_2_open_features()
     # exp_3_why_conv()
     # exp_4_stack_and_relu()
-    exp_5_downsample()
+    # exp_5_downsample()
 
 
 if __name__ == "__main__":
