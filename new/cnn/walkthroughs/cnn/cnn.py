@@ -187,6 +187,7 @@ def exp_2_open_features(seed=0):
     (c) the output-size formula that produced exp_1's 28->14->7 pyramid."""
     _banner("EXP 2: open `features` — a Conv2d is a sliding multiply-and-sum (feature maps, sizes)")
 
+    # pyrefly: ignore [missing-import]
     from custom.naive_conv2d import naive_conv2d
 
     # ---- (a) rebuild the conv op from scratch and match F.conv2d --------------------------
