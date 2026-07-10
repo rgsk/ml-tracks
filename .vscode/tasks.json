@@ -1,0 +1,24 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      // Rebuild + execute the paired notebook for the file you're looking at.
+      // Uses the sibling .py as source, so it works whether the .py OR the .ipynb is focused.
+      "label": "jupytext: rebuild current notebook",
+      "type": "shell",
+      "command": "uv run jupytext --to ipynb --execute \"${fileDirname}/${fileBasenameNoExtension}.py\"",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true,
+        "close": true
+      },
+      // Ctrl+Shift+B runs this with no extra keybinding needed.
+      "group": { "kind": "build", "isDefault": true }
+    }
+  ]
+}
