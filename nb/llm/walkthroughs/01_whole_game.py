@@ -50,7 +50,7 @@ def _repo_root() -> Path:
 
 ROOT = _repo_root()
 DATA = ROOT / "nb" / "llm" / "data" / "input.txt"  # tinyshakespeare (~1MB), track-local
-CKPT_DIR = ROOT / "nb" / "llm" / "checkpoints"
+CKPT_DIR = ROOT / "nb" / "llm" / "artifacts" / "checkpoints"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 torch.manual_seed(1337)

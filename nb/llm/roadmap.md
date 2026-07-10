@@ -53,8 +53,9 @@ nb/llm/
   custom/                    <- from-scratch impls (softmax, cross_entropy, layer/rms-norm, attention);
                                 each runs standalone as a self-test, matched against torch to ~0
   model.py                   <- the cleaned-up GPT, assembled once we understand each piece
-  tokenizer/                 <- trained BPE merges cached here (built by 02, loaded by later notebooks)
-  checkpoints/               <- gpt.pt: trained by 01, loaded by later notebooks (no retrain)
+  artifacts/                 <- generated files (gitignored), mirrors llm/artifacts/ layout
+    tokenizer/               <- trained BPE merges cached here (built by 02, loaded by later notebooks)
+    checkpoints/             <- gpt.pt: trained by 01, loaded by later notebooks (no retrain)
 ```
 
 Notebooks stay independent: `01` trains and **saves `checkpoints/gpt.pt`**; later notebooks **load it

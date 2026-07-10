@@ -9,7 +9,7 @@ artifacts/
 outputs/
 
 # downloaded datasets (re-fetched on demand), e.g. diffusion/data/mnist.npz
-diffusion/data/
+data/
 *.npz
 nb/llm/data/input.txt
 
