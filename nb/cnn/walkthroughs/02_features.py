@@ -112,7 +112,7 @@ print("  -> our 3 loops ARE F.conv2d.")
 # A trained conv *learns* its kernels. To build intuition we **set** four `3×3` kernels by hand and
 # fire them at a real `3` (with `padding=1`, keeping 28×28):
 #
-# ```
+# ```-
 # identity          vertical edge     horizontal edge    blur (box)
 # copies input      Sobel-x: L↔R      Sobel-y: U↕D       local average
 #
