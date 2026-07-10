@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     cell_markers: '"""'
 #     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
@@ -12,14 +13,16 @@
 # ---
 
 # %% [markdown]
-# # CNN · 01 — the whole game
-#
-# Top-down: before we take anything apart, let's build a **real CNN, train it, and watch it read
-# digits**. By the end of this notebook you have a working ~99% MNIST classifier and a rough mental
-# map of its parts. *Why* each part is shaped the way it is — that's `02` onward, each opening one box
-# of *this exact model*.
-#
-# > This is the map. Every later notebook zooms into **one box you already ran here.**
+"""
+# CNN · 01 — the whole game
+
+Top-down: before we take anything apart, let's build a **real CNN, train it, and watch it read
+digits**. By the end of this notebook you have a working ~99% MNIST classifier and a rough mental
+map of its parts. *Why* each part is shaped the way it is — that's `02` onward, each opening one box
+of *this exact model*.
+
+> This is the map. Every later notebook zooms into **one box you already ran here.**
+"""
 
 # %%
 from pathlib import Path
@@ -70,19 +73,22 @@ def to_img(x):
 
 
 # %% [markdown]
-# ## The model in one breath
-#
-# Rough narration, no rigor yet — just enough that it isn't a black box:
-#
-# - **`features`** turns raw pixels into feature maps. Each `Conv2d` slides small learnable filters
-#   over the image to detect local patterns (edges → strokes → parts). The `stride=2` convs **halve
-#   the spatial size** (28 → 14 → 7) while we **double the channels** (16 → 32 → 64): coarser in
-#   space, richer per location. Out comes a small `64 × 7 × 7` grid of feature vectors.
-# - **`head`** flattens that grid into one `3136`-vector and a `Linear` maps it to **10 class scores**.
-# - **`ReLU`** is the nonlinearity between convs (why it's load-bearing is `04`).
-#
-# That's it — `raw pixels → features → 10 scores`. *Why* conv (not a dense net)? Why `stride=2` and
-# doubling channels? Why flatten (not average-pool)? All deferred — `02`–`06` open each box in turn.
+"""
+## The model in one breath
+
+Rough narration, no rigor yet — just enough that it isn't a black box:
+
+- **`features`** turns raw pixels into feature maps. Each `Conv2d` slides small learnable filters
+  over the image to detect local patterns (edges → strokes → parts). The `stride=2` convs **halve
+  the spatial size** (28 → 14 → 7) while we **double the channels** (16 → 32 → 64): coarser in
+  space, richer per location. Out comes a small `64 × 7 × 7` grid of feature vectors.
+- **`head`** flattens that grid into one `3136`-vector and a `Linear` maps it to **10 class scores**.
+- **`ReLU`** is the nonlinearity between convs (why it's load-bearing is `04`).
+
+That's it — `raw pixels → features → 10 scores`. *Why* conv (not a dense net)? Why `stride=2` and
+doubling channels? Why flatten (not average-pool)? All deferred — `02`–`06` open each box in turn.
+"""
+
 
 # %%
 class SmallCNN(nn.Module):
@@ -109,10 +115,12 @@ print(f"params: {n_params:,} total")
 print(f"(for scale, one MLP dense layer 784x768 alone is {784 * 768:,})")
 
 # %% [markdown]
-# ## Watch it learn
-#
-# Train on all 60k MNIST images, cross-entropy loss, Adam, 5 epochs. We print test accuracy before
-# training (≈ chance) and after each epoch — watch it climb.
+"""
+## Watch it learn
+
+Train on all 60k MNIST images, cross-entropy loss, Adam, 5 epochs. We print test accuracy before
+training (≈ chance) and after each epoch — watch it climb.
+"""
 
 # %%
 EPOCHS, BATCH, LR = 5, 128, 1e-3
@@ -150,11 +158,13 @@ for ep in range(1, EPOCHS + 1):
     print(f"  epoch {ep}         : train loss {run / len(loader):.4f}   test acc {test_acc() * 100:5.2f}%")
 
 # %% [markdown]
-# From ~chance to **~99% in a few seconds** — a real digit reader in ~55k params, while a single MLP
-# dense layer (`784×768`) alone would be ~600k. The convolutional structure does a lot with very few
-# weights; *why* is the whole rest of the walkthrough.
-#
-# We save the trained weights so the later notebooks can load this exact model instead of retraining.
+"""
+From ~chance to **~99% in a few seconds** — a real digit reader in ~55k params, while a single MLP
+dense layer (`784×768`) alone would be ~600k. The convolutional structure does a lot with very few
+weights; *why* is the whole rest of the walkthrough.
+
+We save the trained weights so the later notebooks can load this exact model instead of retraining.
+"""
 
 # %%
 ckpt = CKPT_DIR / "smallcnn.pt"
@@ -162,9 +172,11 @@ torch.save(model.state_dict(), ckpt)
 print(f"saved trained weights -> {ckpt.relative_to(ROOT)}")
 
 # %% [markdown]
-# ## Read held-out digits
-#
-# The payoff — predictions on 40 test digits the model never trained on (green = correct, red = wrong).
+"""
+## Read held-out digits
+
+The payoff — predictions on 40 test digits the model never trained on (green = correct, red = wrong).
+"""
 
 # %%
 model.eval()
@@ -190,18 +202,20 @@ n_correct = (preds == yte[idxs].cpu()).sum().item()
 print(f"{n_correct}/40 correct on this held-out sample.")
 
 # %% [markdown]
-# ## The map — what we open next
-#
-# You now have a working model and a rough picture. Every notebook below picks **one box you just
-# ran** and explains why it's built that way — measured, not asserted:
-#
-# | next | opens | the question |
-# |---|---|---|
-# | `02` | `Conv2d` inside `features` | what does a conv actually *compute*? (build one from scratch) |
-# | `03` | conv vs the MLP we had | why not just flatten + dense? (locality, translation equivariance) |
-# | `04` | `conv → relu → conv` | why depth, and why the ReLU between them is load-bearing |
-# | `05` | `stride=2`, ×2 channels | why downsample — more reach in fewer layers, bounded cost |
-# | `06` | `flatten → Linear` head | is flatten the right head? (vs global-average-pool) + wiring checks |
-# | `07` | the whole model | assemble the clean version; what carries into the diffusion U-Net |
-#
-# Next: **`02` — open `features`: what is a `Conv2d`, really?**
+"""
+## The map — what we open next
+
+You now have a working model and a rough picture. Every notebook below picks **one box you just
+ran** and explains why it's built that way — measured, not asserted:
+
+| next | opens | the question |
+|---|---|---|
+| `02` | `Conv2d` inside `features` | what does a conv actually *compute*? (build one from scratch) |
+| `03` | conv vs the MLP we had | why not just flatten + dense? (locality, translation equivariance) |
+| `04` | `conv → relu → conv` | why depth, and why the ReLU between them is load-bearing |
+| `05` | `stride=2`, ×2 channels | why downsample — more reach in fewer layers, bounded cost |
+| `06` | `flatten → Linear` head | is flatten the right head? (vs global-average-pool) + wiring checks |
+| `07` | the whole model | assemble the clean version; what carries into the diffusion U-Net |
+
+Next: **`02` — open `features`: what is a `Conv2d`, really?**
+"""

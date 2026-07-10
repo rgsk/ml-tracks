@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     cell_markers: '"""'
 #     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
@@ -12,16 +13,18 @@
 # ---
 
 # %% [markdown]
-# # CNN · 06 — the `head` + loss: `flatten → Linear`, and is it the right head?
-#
-# `01`'s `features` handed us a `(B, 64, 7, 7)` grid; the `head` turned it into 10 class scores with
-# `flatten → Linear`, and the loss was cross-entropy. This is the **last box**. Three things, all
-# measured:
-#
-# - **(A)** two heads — `flatten` keeps *where* each feature fired, global-average-pool averages it
-#   away; on centered digits, flatten wins,
-# - **(B)** the loss — cross-entropy = `−log(softmax)`, which doubles as a wiring check,
-# - **(C)** the other wiring check — a correctly wired net must overfit one batch to ~0.
+"""
+# CNN · 06 — the `head` + loss: `flatten → Linear`, and is it the right head?
+
+`01`'s `features` handed us a `(B, 64, 7, 7)` grid; the `head` turned it into 10 class scores with
+`flatten → Linear`, and the loss was cross-entropy. This is the **last box**. Three things, all
+measured:
+
+- **(A)** two heads — `flatten` keeps *where* each feature fired, global-average-pool averages it
+  away; on centered digits, flatten wins,
+- **(B)** the loss — cross-entropy = `−log(softmax)`, which doubles as a wiring check,
+- **(C)** the other wiring check — a correctly wired net must overfit one batch to ~0.
+"""
 
 # %%
 import math
@@ -65,15 +68,17 @@ class SmallCNN(nn.Module):
 print(f"device: {DEV}")
 
 # %% [markdown]
-# ## (A) Two heads — what each keeps
-#
-# The final grid is `(B, 64, 7, 7)`: 64 feature channels, each a `7×7` map of *where that feature
-# fired*. Two ways to collapse it to 10 scores:
-#
-# - **`flatten → Linear`**: read the whole grid as one `3136`-vector → `Linear(3136, 10)`. Keeps
-#   **where** each feature fired — position is preserved.
-# - **`GAP → Linear`**: average each channel's `7×7` map → `64`-vector → `Linear(64, 10)`. Keeps only
-#   **how much** each feature fired anywhere — position averaged away.
+"""
+## (A) Two heads — what each keeps
+
+The final grid is `(B, 64, 7, 7)`: 64 feature channels, each a `7×7` map of *where that feature
+fired*. Two ways to collapse it to 10 scores:
+
+- **`flatten → Linear`**: read the whole grid as one `3136`-vector → `Linear(3136, 10)`. Keeps
+  **where** each feature fired — position is preserved.
+- **`GAP → Linear`**: average each channel's `7×7` map → `64`-vector → `Linear(64, 10)`. Keeps only
+  **how much** each feature fired anywhere — position averaged away.
+"""
 
 # %%
 trunk_params = sum(p.numel() for p in SmallCNN().features.parameters())
@@ -87,10 +92,12 @@ print("                      keeps only HOW MUCH each feature fired (position av
 print(f"  (shared conv trunk: {trunk_params:,} params either way.)")
 
 # %% [markdown]
-# GAP isn't a special op — it's literally a mean over the spatial dims, just kept as a `1×1` "image"
-# (which is why the head is `AdaptiveAvgPool2d(1)` **then** `Flatten`). `AdaptiveAvgPool2d(k)` is the
-# general form — it pools to any `k×k` grid regardless of input size; at `k=1` it's exactly this global
-# mean.
+"""
+GAP isn't a special op — it's literally a mean over the spatial dims, just kept as a `1×1` "image"
+(which is why the head is `AdaptiveAvgPool2d(1)` **then** `Flatten`). `AdaptiveAvgPool2d(k)` is the
+general form — it pools to any `k×k` grid regardless of input size; at `k=1` it's exactly this global
+mean.
+"""
 
 # %%
 # GAP is nothing fancy: AdaptiveAvgPool2d(1) == mean over the spatial dims (just kept as 1x1)
@@ -100,24 +107,28 @@ b = f.mean(dim=(2, 3))                         # (B,64,7,7)->(B,64), same number
 print(f"  (GAP is just a mean: |AdaptiveAvgPool2d(1).flatten - f.mean(dim=(2,3))| = {(a - b).abs().max().item():.2e})")
 
 # %% [markdown]
-# Global-average-pool is the **standard** head on big images (ResNet, etc.): when the object can sit
-# anywhere in the frame, averaging over position gives you translation *invariance*, which is exactly
-# what you want. But MNIST digits are **centered** — *where* a stroke sits is a genuine cue (a
-# horizontal bar near the top vs. the middle helps separate a `7` from a `2`). So here, throwing
-# position away should hurt. We'll train both heads on the same trunk and same init and watch — but
-# first, the loss and the wiring checks.
+"""
+Global-average-pool is the **standard** head on big images (ResNet, etc.): when the object can sit
+anywhere in the frame, averaging over position gives you translation *invariance*, which is exactly
+what you want. But MNIST digits are **centered** — *where* a stroke sits is a genuine cue (a
+horizontal bar near the top vs. the middle helps separate a `7` from a `2`). So here, throwing
+position away should hurt. We'll train both heads on the same trunk and same init and watch — but
+first, the loss and the wiring checks.
+"""
 
 # %% [markdown]
-# ## (B) The loss — cross-entropy = `−log(softmax)`
-#
-# The loss is one line: softmax the 10 logits into probabilities, take the negative log of the
-# probability at the **true** class. That's all `F.cross_entropy` does — and it gives a free wiring
-# check.
-#
-# > **Check 1 — untrained loss ≈ `ln 10`.** A fresh net's logits are ~arbitrary, so softmax is roughly
-# > *uniform* over 10 classes → probability `~1/10` at the true class → loss `~ −ln(1/10) = ln 10 ≈
-# > 2.303`. If an untrained net's loss came out far from `ln(#classes)`, the softmax/label wiring is
-# > wrong before you've trained a single step.
+"""
+## (B) The loss — cross-entropy = `−log(softmax)`
+
+The loss is one line: softmax the 10 logits into probabilities, take the negative log of the
+probability at the **true** class. That's all `F.cross_entropy` does — and it gives a free wiring
+check.
+
+> **Check 1 — untrained loss ≈ `ln 10`.** A fresh net's logits are ~arbitrary, so softmax is roughly
+> *uniform* over 10 classes → probability `~1/10` at the true class → loss `~ −ln(1/10) = ln 10 ≈
+> 2.303`. If an untrained net's loss came out far from `ln(#classes)`, the softmax/label wiring is
+> wrong before you've trained a single step.
+"""
 
 # %%
 xtr, ytr = load_mnist(train=True)
@@ -132,13 +143,15 @@ print("WIRING CHECK 1 — an UNtrained net outputs ~uniform over 10 classes, so 
 print(f"  untrained loss = {ref.item():.3f}   vs   ln(10) = {math.log(10):.3f}   (matches -> softmax sane)")
 
 # %% [markdown]
-# ## (C) The other wiring check — overfit one batch
-#
-# > **Check 2 — memorize ONE batch.** A correctly wired model + loss + optimizer *must* be able to
-# > drive the loss to ~0 on a single small batch (it can just memorize it). Take 64 images, run 300
-# > Adam steps on only those. This is the **first** thing to run on any new model: if it *can't*
-# > overfit one batch, don't bother training on the full set — something (a detached tensor, a frozen
-# > layer, a label mismatch) is broken.
+"""
+## (C) The other wiring check — overfit one batch
+
+> **Check 2 — memorize ONE batch.** A correctly wired model + loss + optimizer *must* be able to
+> drive the loss to ~0 on a single small batch (it can just memorize it). Take 64 images, run 300
+> Adam steps on only those. This is the **first** thing to run on any new model: if it *can't*
+> overfit one batch, don't bother training on the full set — something (a detached tensor, a frozen
+> layer, a label mismatch) is broken.
+"""
 
 # %%
 torch.manual_seed(SEED)
@@ -157,10 +170,13 @@ print(f"  step 0 loss {curve[0]:.3f}  ->  step 300 loss {curve[-1]:.4f}   (batch
 print("  -> it CAN drive the loss to ~0: gradients flow, the head/loss are wired right.")
 
 # %% [markdown]
-# ## (A, measured) flatten vs GAP on the same trunk
-#
-# Same trunk, same init, 3 epochs on 20k images — **only the head differs.** On centered digits,
-# position is signal, so flatten should beat GAP.
+"""
+## (A, measured) flatten vs GAP on the same trunk
+
+Same trunk, same init, 3 epochs on 20k images — **only the head differs.** On centered digits,
+position is signal, so flatten should beat GAP.
+"""
+
 
 # %%
 def train_eval(head, n_train=20000, epochs=3, bs=128):
@@ -192,9 +208,11 @@ print(f"  -> flatten wins by {(acc_flat - acc_gap) * 100:.2f} pts on CENTERED di
 print("     here, and GAP discards it. (on ImageNet-scale images GAP's invariance is the win.)")
 
 # %% [markdown]
-# A big gap — GAP is *not* a free swap on centered digits. The lesson isn't "GAP is bad"; it's that a
-# head encodes an assumption. GAP assumes *position shouldn't matter*; flatten assumes *it should*.
-# Match the head to the data.
+"""
+A big gap — GAP is *not* a free swap on centered digits. The lesson isn't "GAP is bad"; it's that a
+head encodes an assumption. GAP assumes *position shouldn't matter*; flatten assumes *it should*.
+Match the head to the data.
+"""
 
 # %%
 fig, (axL, axR) = plt.subplots(1, 2, figsize=(9, 3.4))
@@ -215,20 +233,22 @@ fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# ## Recap
-#
-# | part | claim | payoff |
-# |---|---|---|
-# | head | flatten keeps position, GAP averages it away | ~97% vs ~72% on centered digits |
-# | loss | cross-entropy = `−log(softmax)` | untrained loss `2.30 ≈ ln 10` |
-# | wiring | model+loss+opt can memorize one batch | loss `→ 0.0000`, batch acc 100% |
-#
-# **One-sentence compression:** the head is a *choice* — `flatten` keeps position (a real cue on
-# centered digits, so it beats GAP here) while GAP's translation-invariance is what you'd want on big
-# images — and cross-entropy is just `−log(softmax)`, cheap enough to double as two sanity checks
-# (untrained loss ≈ `ln 10`, and a one-batch overfit to 0) that catch a miswired net before you waste
-# a training run.
-#
-# That's every box of `01`'s `SmallCNN` opened. Next: **`07` — assemble the clean model** and note
-# which pieces (conv trunk, downsampling, the resolution-down/channels-up shape) carry straight into
-# the U-Net we'll build for diffusion.
+"""
+## Recap
+
+| part | claim | payoff |
+|---|---|---|
+| head | flatten keeps position, GAP averages it away | ~97% vs ~72% on centered digits |
+| loss | cross-entropy = `−log(softmax)` | untrained loss `2.30 ≈ ln 10` |
+| wiring | model+loss+opt can memorize one batch | loss `→ 0.0000`, batch acc 100% |
+
+**One-sentence compression:** the head is a *choice* — `flatten` keeps position (a real cue on
+centered digits, so it beats GAP here) while GAP's translation-invariance is what you'd want on big
+images — and cross-entropy is just `−log(softmax)`, cheap enough to double as two sanity checks
+(untrained loss ≈ `ln 10`, and a one-batch overfit to 0) that catch a miswired net before you waste
+a training run.
+
+That's every box of `01`'s `SmallCNN` opened. Next: **`07` — assemble the clean model** and note
+which pieces (conv trunk, downsampling, the resolution-down/channels-up shape) carry straight into
+the U-Net we'll build for diffusion.
+"""

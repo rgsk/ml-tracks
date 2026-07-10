@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     cell_markers: '"""'
 #     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
@@ -12,15 +13,17 @@
 # ---
 
 # %% [markdown]
-# # CNN · 03 — why conv at all, not the flatten+MLP we already had?
-#
-# `01`'s `head` already starts with `nn.Flatten`. So we *have* a flatten+dense on hand — why not drop
-# `features` entirely and feed flattened pixels straight into a dense net? Because a flatten throws
-# away the two things that make an image an image, and a conv keeps both:
-#
-# - **(A)** locality + translation structure — shift a digit and a dense net sees a near-new input,
-#   while a conv's output just *shifts* (translation **equivariance**),
-# - **(B)** the parameter count — one shared kernel vs a weight per (pixel, hidden) pair.
+"""
+# CNN · 03 — why conv at all, not the flatten+MLP we already had?
+
+`01`'s `head` already starts with `nn.Flatten`. So we *have* a flatten+dense on hand — why not drop
+`features` entirely and feed flattened pixels straight into a dense net? Because a flatten throws
+away the two things that make an image an image, and a conv keeps both:
+
+- **(A)** locality + translation structure — shift a digit and a dense net sees a near-new input,
+  while a conv's output just *shifts* (translation **equivariance**),
+- **(B)** the parameter count — one shared kernel vs a weight per (pixel, hidden) pair.
+"""
 
 # %%
 import torch
@@ -30,25 +33,27 @@ import matplotlib.pyplot as plt
 from cnn.train import load_mnist, to_img
 
 # %% [markdown]
-# ## (A) The thing we're arguing against: flatten + dense
-#
-# `nn.Flatten` lays the `(1, 28, 28)` grid into a `784`-vector, row-major, so pixel `(r, c)` lands at
-# index `i = r·28 + c`. A dense layer then computes `y = W @ x_flat`, and `W[h, i]` is the weight from
-# hidden unit `h` to **pixel index `i`**. Two consequences, and they're the whole problem:
-#
-# - **Index = absolute position.** `W[h, i]` is tied to one fixed pixel. The layer has no idea that
-#   index `i` and `i+1` are physical neighbors — you could permute all 784 indices, retrain, and get
-#   the identical model. Spatial adjacency isn't represented.
-# - **Every position gets its own weights.** Nothing learned at one location is shared with any other.
-#
-# ### A shift wrecks the flattened vector
-#
-# Take a clean `7` and shift it down-and-right by 4px. To your eye it's the *same digit*. But the ink
-# at index `i = r·28 + c` moves to `(r+4)·28 + (c+4) = i + 116` — every ink pixel jumps ~116 slots, so
-# the original and shifted vectors have their ink in nearly **disjoint** coordinate sets. Measure the
-# overlap as a cosine — but first map to `[0,1]` (background 0, ink 1), so the dot product counts
-# **only ink overlap**, not the hundreds of shared background pixels (in the native `[-1,1]`, two
-# background pixels contribute `(−1)·(−1) = +1` and dominate the sum).
+"""
+## (A) The thing we're arguing against: flatten + dense
+
+`nn.Flatten` lays the `(1, 28, 28)` grid into a `784`-vector, row-major, so pixel `(r, c)` lands at
+index `i = r·28 + c`. A dense layer then computes `y = W @ x_flat`, and `W[h, i]` is the weight from
+hidden unit `h` to **pixel index `i`**. Two consequences, and they're the whole problem:
+
+- **Index = absolute position.** `W[h, i]` is tied to one fixed pixel. The layer has no idea that
+  index `i` and `i+1` are physical neighbors — you could permute all 784 indices, retrain, and get
+  the identical model. Spatial adjacency isn't represented.
+- **Every position gets its own weights.** Nothing learned at one location is shared with any other.
+
+### A shift wrecks the flattened vector
+
+Take a clean `7` and shift it down-and-right by 4px. To your eye it's the *same digit*. But the ink
+at index `i = r·28 + c` moves to `(r+4)·28 + (c+4) = i + 116` — every ink pixel jumps ~116 slots, so
+the original and shifted vectors have their ink in nearly **disjoint** coordinate sets. Measure the
+overlap as a cosine — but first map to `[0,1]` (background 0, ink 1), so the dot product counts
+**only ink overlap**, not the hundreds of shared background pixels (in the native `[-1,1]`, two
+background pixels contribute `(−1)·(−1) = +1` and dominate the sum).
+"""
 
 # %%
 xte, yte = load_mnist(train=False)
@@ -67,21 +72,23 @@ print("  -> to a dense layer the shifted digit is almost a NEW input; it must re
 print("     at every position. Nothing is shared across space.")
 
 # %% [markdown]
-# ## A conv is translation-*equivariant* (the exact 0)
-#
-# A conv slides **one** kernel over every position (`02`). The claim: `featmap(shift(x)) =
-# shift(featmap(x))`. Let `S` = shift, `C` = correlate-with-kernel; equivariance is `C(Sx) = S(Cx)`.
-# The whole proof is three lines, and it's *why* convs are special:
-#
-# $$(Cx)[p] = \sum_j k[j]\, x[p+j], \qquad (Sx)[q] = x[q-s]$$
-#
-# $$C(Sx)[p] = \sum_j k[j]\,(Sx)[p+j] = \sum_j k[j]\, x[p+j-s]$$
-#
-# $$S(Cx)[p] = (Cx)[p-s] = \sum_j k[j]\, x[p-s+j]$$
-#
-# The last two are identical term by term, so `C(Sx)[p] = S(Cx)[p]`. It works **only** because `C`
-# uses the same `k` everywhere and depends purely on the *relative* offset `j`. Slide the picture,
-# slide the answer — exactly. Let's verify it to numerical noise.
+r"""
+## A conv is translation-*equivariant* (the exact 0)
+
+A conv slides **one** kernel over every position (`02`). The claim: `featmap(shift(x)) =
+shift(featmap(x))`. Let `S` = shift, `C` = correlate-with-kernel; equivariance is `C(Sx) = S(Cx)`.
+The whole proof is three lines, and it's *why* convs are special:
+
+$$(Cx)[p] = \sum_j k[j]\, x[p+j], \qquad (Sx)[q] = x[q-s]$$
+
+$$C(Sx)[p] = \sum_j k[j]\,(Sx)[p+j] = \sum_j k[j]\, x[p+j-s]$$
+
+$$S(Cx)[p] = (Cx)[p-s] = \sum_j k[j]\, x[p-s+j]$$
+
+The last two are identical term by term, so `C(Sx)[p] = S(Cx)[p]`. It works **only** because `C`
+uses the same `k` everywhere and depends purely on the *relative* offset `j`. Slide the picture,
+slide the answer — exactly. Let's verify it to numerical noise.
+"""
 
 # %%
 # one fixed 3x3 kernel as our "feature": a diagonal edge detector (sum-to-zero) traces the 7's outline
@@ -134,24 +141,28 @@ fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# **How to read it:** top row is the input `7` and its shift. **Bottom-middle** = shift *then*
-# convolve (`C(Sx)`); **bottom-right** = convolve *then* shift (`S(Cx)`). The digit region is
-# pixel-identical — that *is* the identity above. The same stroke detector fires wherever the stroke
-# goes. (The faint border band is where `torch.roll` wraps and the two wrappings don't correspond —
-# why we compared only the interior.)
-#
-# > **The deep point.** A conv **is** a linear map — a dense matrix with special structure (one kernel
-# > tiled across a huge, mostly-zero matrix), precisely the **shift-equivariant** subclass. So
-# > `conv ⊂ dense`: a dense layer *could* represent this conv, but only by learning all ~600k weights
-# > into that exact pattern, and only if training showed it every shift. The conv **hard-codes** the
-# > structure in ~160 weights — that's the *inductive bias*.
+"""
+**How to read it:** top row is the input `7` and its shift. **Bottom-middle** = shift *then*
+convolve (`C(Sx)`); **bottom-right** = convolve *then* shift (`S(Cx)`). The digit region is
+pixel-identical — that *is* the identity above. The same stroke detector fires wherever the stroke
+goes. (The faint border band is where `torch.roll` wraps and the two wrappings don't correspond —
+why we compared only the interior.)
+
+> **The deep point.** A conv **is** a linear map — a dense matrix with special structure (one kernel
+> tiled across a huge, mostly-zero matrix), precisely the **shift-equivariant** subclass. So
+> `conv ⊂ dense`: a dense layer *could* represent this conv, but only by learning all ~600k weights
+> into that exact pattern, and only if training showed it every shift. The conv **hard-codes** the
+> structure in ~160 weights — that's the *inductive bias*.
+"""
 
 # %% [markdown]
-# ## (B) The parameter blow-up
-#
-# Weight sharing isn't just elegant, it's **cheap**. Count the *first* layer — a dense layer ties one
-# independent weight to every (pixel, hidden) pair, while a conv learns one small kernel per output
-# channel and reuses it at all 784 positions.
+"""
+## (B) The parameter blow-up
+
+Weight sharing isn't just elegant, it's **cheap**. Count the *first* layer — a dense layer ties one
+independent weight to every (pixel, hidden) pair, while a conv learns one small kernel per output
+channel and reuses it at all 784 positions.
+"""
 
 # %%
 H = 768                                 # 01's MLP-first-layer aside
@@ -166,19 +177,21 @@ print(f"  -> ~{dense_params // conv_params:,}x fewer weights AND the right bias 
 print("     And the dense layer GROWS with image size; the conv's kernel count is size-independent.")
 
 # %% [markdown]
-# ## Recap
-#
-# | part | claim | payoff |
-# |---|---|---|
-# | flatten | ties every weight to an absolute pixel index | a 4px shift → cosine ≈ 0.08 (near-new input) |
-# | equivariance | one shared kernel ⇒ `featmap(shift x) = shift(featmap x)` | verified to ~0 on the interior |
-# | params | share one kernel over all positions | 602,880 → 160, **~3,768×** fewer |
-#
-# **One-sentence compression:** a flatten+dense layer ties every weight to an *absolute* pixel, so a
-# 4px shift is a brand-new input (cosine ≈ 0.08) it must relearn with ~600k position-specific weights;
-# a conv slides one *shared* 160-weight kernel, so a shift just shifts the output (proven exact) — far
-# fewer weights and the right bias for free.
-#
-# Next: **`04` — why `conv → relu → conv`?** Depth grows the receptive field, and *without* the ReLU a
-# stack of convs collapses back to a single conv (we'll measure the collapse, and that a ReLU breaks
-# it).
+"""
+## Recap
+
+| part | claim | payoff |
+|---|---|---|
+| flatten | ties every weight to an absolute pixel index | a 4px shift → cosine ≈ 0.08 (near-new input) |
+| equivariance | one shared kernel ⇒ `featmap(shift x) = shift(featmap x)` | verified to ~0 on the interior |
+| params | share one kernel over all positions | 602,880 → 160, **~3,768×** fewer |
+
+**One-sentence compression:** a flatten+dense layer ties every weight to an *absolute* pixel, so a
+4px shift is a brand-new input (cosine ≈ 0.08) it must relearn with ~600k position-specific weights;
+a conv slides one *shared* 160-weight kernel, so a shift just shifts the output (proven exact) — far
+fewer weights and the right bias for free.
+
+Next: **`04` — why `conv → relu → conv`?** Depth grows the receptive field, and *without* the ReLU a
+stack of convs collapses back to a single conv (we'll measure the collapse, and that a ReLU breaks
+it).
+"""
