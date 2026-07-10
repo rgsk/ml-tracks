@@ -228,10 +228,6 @@ encode consistent with training.
 
 
 # %%
-def decode(ids: list[int], vocab: dict[int, bytes]) -> str:
-    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
-
-
 def encode(text: str, merges: dict[tuple[int, int], int]) -> list[int]:
     ids = list(text.encode("utf-8"))
     while len(ids) >= 2:
@@ -243,14 +239,21 @@ def encode(text: str, merges: dict[tuple[int, int], int]) -> list[int]:
     return ids
 
 
+def decode(ids: list[int], vocab: dict[int, bytes]) -> str:
+    return b"".join(vocab[i] for i in ids).decode("utf-8", errors="replace")
+
+
 # round-trip on a 200k slice (encode is O(merges·len), so a slice keeps it quick)
 slice_ = text[:200_000]
 enc = encode(slice_, merges)
 assert decode(enc, vocab) == slice_, "round-trip lost information!"
 print("round-trip on 200k chars: exact ✓")
-print(f"  {slice_[:41]!r}")
-print(f"  -> {len(encode(sample_line, merges))} BPE tokens "
+
+#%%
+print(f"{sample_line}")
+print(f"-> {len(encode(sample_line, merges))} BPE tokens "
       f"(vs {len(sample_line)} chars)")
+
 
 # %% [markdown]
 """
