@@ -1,6 +1,7 @@
 practice/
 .venv
 __pycache__
+*.egg-info/
 checkpoints/
 
 # generated files: training checkpoints + tokenizer cache (rebuilt on demand)

@@ -42,7 +42,7 @@ def _repo_root() -> Path:
 
 
 ROOT = _repo_root()
-DATA = ROOT / "new" / "diffusion" / "data" / "mnist.npz"   # shared MNIST cache (no torchvision)
+DATA = ROOT / "nb" / "data" / "mnist.npz"                  # nb-local MNIST cache (downloaded on demand, no torchvision)
 CKPT_DIR = ROOT / "nb" / "cnn" / "checkpoints"
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -51,6 +51,12 @@ print(f"device: {DEV}")
 
 def load_mnist(train=True):
     """MNIST images (N,1,28,28) in [-1,1] and labels (N,), from the cached npz. No torchvision."""
+    if not DATA.exists():                                          # self-contained: fetch on first use
+        DATA.parent.mkdir(parents=True, exist_ok=True)
+        import urllib.request
+        print(f"  downloading MNIST npz (~11MB) -> {DATA.relative_to(ROOT)} ...")
+        urllib.request.urlretrieve(
+            "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz", DATA)
     d = np.load(DATA)
     x = d["x_train"] if train else d["x_test"]                 # (N,28,28) uint8 [0,255]
     y = d["y_train"] if train else d["y_test"]

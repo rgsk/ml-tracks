@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "pytorch-practice"
 version = "0.1.0"
@@ -19,6 +23,12 @@ dev = [
     "jupytext>=1.19.4",
     "nbconvert>=7.17.1",
 ]
+
+# Expose the CNN track as an importable package so notebooks do `from cnn.train import ...`
+# with no sys.path juggling. Only nb/cnn is packaged (the other tracks are still loose scripts).
+[tool.setuptools]
+package-dir = {"" = "nb"}
+packages = ["cnn", "cnn.custom"]
 
 [tool.jupytext]
 # Keep paired-notebook headers clean: strip the format_version / jupytext_version

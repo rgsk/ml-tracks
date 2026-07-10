@@ -25,35 +25,15 @@
 
 # %%
 import math
-from pathlib import Path
-
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
+from cnn.train import load_mnist
 
-def _repo_root() -> Path:
-    here = Path.cwd()
-    for d in (here, *here.parents):
-        if (d / "pyproject.toml").exists():
-            return d
-    return here
-
-
-ROOT = _repo_root()
-DATA = ROOT / "new" / "diffusion" / "data" / "mnist.npz"
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 0
-
-
-def load_mnist(train=True):
-    d = np.load(DATA)
-    x = d["x_train"] if train else d["x_test"]
-    y = d["y_train"] if train else d["y_test"]
-    x = (torch.from_numpy(x).float() / 127.5 - 1.0).unsqueeze(1)   # (N,1,28,28) in [-1,1]
-    return x, torch.from_numpy(y).long()
 
 
 class SmallCNN(nn.Module):

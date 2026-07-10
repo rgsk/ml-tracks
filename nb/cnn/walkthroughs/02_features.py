@@ -22,38 +22,11 @@
 # - **(c)** the output-size formula that produced `01`'s `28 → 14 → 7` pyramid.
 
 # %%
-import sys
-from pathlib import Path
-
-import numpy as np
 import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-
-def _repo_root() -> Path:
-    here = Path.cwd()
-    for d in (here, *here.parents):
-        if (d / "pyproject.toml").exists():
-            return d
-    return here
-
-
-ROOT = _repo_root()
-DATA = ROOT / "new" / "diffusion" / "data" / "mnist.npz"   # shared MNIST cache
-sys.path.insert(0, str(ROOT / "nb" / "cnn"))               # so `from custom... import ...` works
-
-
-def load_mnist(train=True):
-    d = np.load(DATA)
-    x = d["x_train"] if train else d["x_test"]
-    y = d["y_train"] if train else d["y_test"]
-    x = (torch.from_numpy(x).float() / 127.5 - 1.0).unsqueeze(1)   # (N,1,28,28) in [-1,1]
-    return x, torch.from_numpy(y).long()
-
-
-def to_img(x):
-    return ((x.squeeze().clamp(-1, 1) + 1) / 2).cpu().numpy()
+from cnn.train import load_mnist, to_img
 
 # %% [markdown]
 # ## (a) A conv is a sliding-window multiply-and-sum
@@ -78,7 +51,7 @@ def to_img(x):
 # Let's confirm it *is* `F.conv2d` — one cell by hand, then the whole map.
 
 # %%
-from custom.naive_conv2d import naive_conv2d
+from cnn.custom.naive_conv2d import naive_conv2d
 
 torch.manual_seed(0)
 x = torch.randn(1, 1, 6, 6)

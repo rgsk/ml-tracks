@@ -6,7 +6,7 @@ held-out prediction figure. The teaching notebooks 01 and 06 deliberately keep t
 (seeing the loop is the lesson); this module is what 07 imports to demonstrate the finished artifact,
 and what runs as a script to (re)generate the checkpoint + figure:
 
-    python nb/cnn/train.py        # load-or-train -> checkpoints/smallcnn.pt, figure -> outputs/cnn/
+    python -m cnn.train           # load-or-train -> checkpoints/smallcnn.pt, figure -> outputs/cnn/
 
 Every plotting helper RETURNS its figure and only writes a file when given `save_path`, so the same
 function renders inline in a notebook and saves to outputs/ from the CLI.
@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 
-from model import SmallCNN
+from cnn.model import SmallCNN
 
 # --- paths (anchored to the repo root, so this works from any cwd) ---
 _HERE = Path(__file__).resolve().parent                        # nb/cnn
@@ -34,7 +34,7 @@ def _repo_root() -> Path:
 
 
 ROOT = _repo_root()
-DATA = ROOT / "new" / "diffusion" / "data" / "mnist.npz"       # shared MNIST cache (no torchvision)
+DATA = ROOT / "nb" / "data" / "mnist.npz"                      # nb-local MNIST cache (downloaded on demand, no torchvision)
 CKPT = ROOT / "nb" / "cnn" / "checkpoints" / "smallcnn.pt"     # trained weights (gitignored)
 OUTPUTS = _HERE / "outputs"                                    # saved figures (gitignored)
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
@@ -42,6 +42,12 @@ DEV = "cuda" if torch.cuda.is_available() else "cpu"
 
 def load_mnist(train=True):
     """MNIST images (N,1,28,28) in [-1,1] and labels (N,), from the cached npz. No torchvision."""
+    if not DATA.exists():                                          # self-contained: fetch on first use
+        DATA.parent.mkdir(parents=True, exist_ok=True)
+        import urllib.request
+        print(f"  downloading MNIST npz (~11MB) -> {DATA.relative_to(ROOT)} ...")
+        urllib.request.urlretrieve(
+            "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz", DATA)
     d = np.load(DATA)
     x = d["x_train"] if train else d["x_test"]
     y = d["y_train"] if train else d["y_test"]

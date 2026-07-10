@@ -31,24 +31,10 @@
 # just demonstrating the finished artifact, we import the reusable helpers.
 
 # %%
-import sys
-from pathlib import Path
-
 import torch
 import matplotlib.pyplot as plt
 
-
-def _repo_root() -> Path:
-    here = Path.cwd()
-    for d in (here, *here.parents):
-        if (d / "pyproject.toml").exists():
-            return d
-    return here
-
-
-sys.path.insert(0, str(_repo_root() / "nb" / "cnn"))   # so `from model/train import ...` resolve
-
-from train import load_mnist, test_acc, plot_predictions, CKPT, ROOT, DEV
+from cnn.train import load_mnist, test_acc, plot_predictions, CKPT, ROOT, DEV
 
 print(f"device: {DEV}")
 
@@ -60,7 +46,7 @@ print(f"device: {DEV}")
 # to `(B, 10)` class scores.
 
 # %%
-from model import SmallCNN
+from cnn.model import SmallCNN
 
 model = SmallCNN().to(DEV)
 n_params = sum(p.numel() for p in model.parameters())
