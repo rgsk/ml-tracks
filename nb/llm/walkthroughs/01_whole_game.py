@@ -29,6 +29,7 @@ read the output.
 """
 
 # %%
+from dataclasses import dataclass, asdict
 from pathlib import Path
 
 import torch
@@ -136,20 +137,42 @@ expands 4×? All deferred — `04`–`06` open each box in turn.
 
 
 # %%
+@dataclass
+class GPTConfig:
+    """All the model's dimensions in one place. The model is built entirely from a config object, so
+    a checkpoint that stores this config can reconstruct the exact architecture — no reliance on
+    matching constructor defaults. (This is the GPT-2/nanoGPT pattern; `llm/config.py` is the same
+    idea carried further.)"""
+    vocab_size: int
+    block_size: int = 64        # max context length
+    n_embd: int = 128           # embedding / residual width
+    n_head: int = 4             # attention heads
+    n_layer: int = 4            # transformer blocks
+
+
 class Block(nn.Module):
     """One transformer layer: causal self-attention, then a per-token MLP, each in a residual +
     pre-LayerNorm wrapper (x = x + sublayer(norm(x)))."""
 
-    def __init__(self, n_embd, n_head):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.attn = nn.MultiheadAttention(n_embd, n_head, batch_first=True)   # torch's attention (we build it by hand in 04)
-        self.ln2 = nn.LayerNorm(n_embd)
-        self.mlp = nn.Sequential(                                             # per-token compute
-            nn.Linear(n_embd, 4 * n_embd), nn.GELU(), nn.Linear(4 * n_embd, n_embd),
+        self.ln1 = nn.LayerNorm(cfg.n_embd)
+        # torch's attention (we build it by hand in 04)
+        self.attn = nn.MultiheadAttention(cfg.n_embd, cfg.n_head, batch_first=True)   
+        self.ln2 = nn.LayerNorm(cfg.n_embd)
+        self.mlp = nn.Sequential(  # per-token compute
+            nn.Linear(cfg.n_embd, 4 * cfg.n_embd),
+            nn.GELU(),
+            nn.Linear(4 * cfg.n_embd, cfg.n_embd),
         )
         # causal mask: True where a query position may NOT attend (the strict future)
-        self.register_buffer("causal", torch.triu(torch.ones(BLOCK, BLOCK, dtype=torch.bool), diagonal=1))
+        self.register_buffer(
+            "causal",
+            torch.triu(
+                torch.ones(cfg.block_size, cfg.block_size, dtype=torch.bool),
+                diagonal=1,
+            ),
+        )
 
     def forward(self, x):
         h = self.ln1(x)
@@ -161,13 +184,15 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size, n_embd=128, n_head=4, n_layer=4):
+    def __init__(self, cfg: GPTConfig):
         super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, n_embd)          # id -> vector
-        self.pos_emb = nn.Embedding(BLOCK, n_embd)                 # position -> vector
-        self.blocks = nn.ModuleList([Block(n_embd, n_head) for _ in range(n_layer)])
-        self.ln_f = nn.LayerNorm(n_embd)
-        self.head = nn.Linear(n_embd, vocab_size)                  # vector -> next-char scores
+        self.cfg = cfg
+        self.block_size = cfg.block_size                           # max context length
+        self.token_emb = nn.Embedding(cfg.vocab_size, cfg.n_embd)  # id -> vector
+        self.pos_emb = nn.Embedding(cfg.block_size, cfg.n_embd)    # position -> vector
+        self.blocks = nn.ModuleList([Block(cfg) for _ in range(cfg.n_layer)])
+        self.ln_f = nn.LayerNorm(cfg.n_embd)
+        self.head = nn.Linear(cfg.n_embd, cfg.vocab_size)          # vector -> next-char scores
 
     def forward(self, idx, targets=None):
         B, T = idx.shape
@@ -183,17 +208,20 @@ class GPT(nn.Module):
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens):
-        """Autoregressive: sample a next char, append, repeat. Crop the context to BLOCK so the
+        """Autoregressive: sample a next char, append, repeat. Crop the context to block_size so the
         position embedding never runs off its table."""
         for _ in range(max_new_tokens):
-            logits, _ = self(idx[:, -BLOCK:])
+            logits, _ = self(idx[:, -self.block_size:])
             probs = F.softmax(logits[:, -1, :], dim=-1)            # distribution over next char
             nxt = torch.multinomial(probs, num_samples=1)
             idx = torch.cat([idx, nxt], dim=1)
         return idx
 
 
-model = GPT(vocab_size).to(DEV)
+# the config is the single source of truth: we build the model from it, save it in the checkpoint,
+# and reconstruct with GPT(GPTConfig(**saved)) later.
+cfg = GPTConfig(vocab_size=vocab_size, block_size=BLOCK)
+model = GPT(cfg).to(DEV)
 print(f"params: {sum(p.numel() for p in model.parameters()):,}")
 
 # %% [markdown]
@@ -209,14 +237,30 @@ actually learned the statistics of the text.
 
 # %%
 @torch.no_grad()
-def eval_loss(iters=100):
+def full_val_loss(m, bs=256):
+    """Mean cross-entropy over the WHOLE validation split, in non-overlapping BLOCK-sized windows.
+    Deterministic — a real metric, not a noisy one-batch sample — so it's a stable curve AND gives
+    the identical number for any two models that share weights (our round-trip check below)."""
+    m.eval()
+    nwin = (len(val_data) - 1) // BLOCK                        # how many full windows fit
+    x = val_data[:nwin * BLOCK].view(nwin, BLOCK)             # (nwin, BLOCK) inputs
+    y = val_data[1:nwin * BLOCK + 1].view(nwin, BLOCK)        # targets, shifted +1
+    total = count = 0
+    for i in range(0, nwin, bs):                              # batch the windows through the model
+        xb, yb = x[i:i + bs].to(DEV), y[i:i + bs].to(DEV)
+        total += m(xb, yb)[1].item() * yb.numel()            # weight by #tokens (mean over uneven chunks)
+        count += yb.numel()
+    m.train()
+    return total / count
+
+
+@torch.no_grad()
+def train_loss_est(iters=100):
+    """Cheap train-loss estimate from random batches (the train split is huge; no full pass needed)."""
     model.eval()
-    out = {}
-    for split in ("train", "val"):
-        losses = torch.stack([model(*get_batch(split))[1] for _ in range(iters)])
-        out[split] = losses.mean().item()
+    est = torch.stack([model(*get_batch("train"))[1] for _ in range(iters)]).mean().item()
     model.train()
-    return out
+    return est
 
 
 import math
@@ -227,8 +271,7 @@ opt = torch.optim.AdamW(model.parameters(), lr=LR)
 print(f"random-init baseline: loss ≈ ln(vocab) = {math.log(vocab_size):.3f}")
 for it in range(MAX_ITERS + 1):
     if it % EVAL_EVERY == 0:
-        L = eval_loss()
-        print(f"  step {it:>4} : train {L['train']:.3f}   val {L['val']:.3f}")
+        print(f"  step {it:>4} : train {train_loss_est():.3f}   val {full_val_loss(model):.3f}")
     xb, yb = get_batch("train")
     _, loss = model(xb, yb)
     opt.zero_grad(set_to_none=True)
@@ -237,15 +280,36 @@ for it in range(MAX_ITERS + 1):
 
 # %% [markdown]
 """
-We save the trained weights (and the tokenizer, so ids decode back to text) — later notebooks load
-this exact model instead of retraining.
+## Save the checkpoint
+
+We save three things: the trained **weights**, the **tokenizer** (so ids decode back to text), and the
+**config** (as a plain dict via `asdict`, so reloading doesn't depend on the class being importable).
+This is the whole point of a checkpoint — later notebooks `torch.load` this exact model instead of
+spending time retraining; `02` onward all start from these weights.
 """
 
 # %%
 ckpt = CKPT_DIR / "gpt.pt"
-torch.save({"model": model.state_dict(), "stoi": stoi, "itos": itos,
-            "config": dict(vocab_size=vocab_size, n_embd=128, n_head=4, n_layer=4, block=BLOCK)}, ckpt)
+torch.save({"model": model.state_dict(), "stoi": stoi, "itos": itos, "config": asdict(cfg)}, ckpt)
 print(f"saved -> {ckpt.relative_to(ROOT)}")
+
+# %% [markdown]
+"""
+## Load it back — and prove it round-trips
+
+Reload in a **separate** step (exactly as `02` will): read the file, rebuild the architecture from the
+saved config with `GPT(GPTConfig(**config))`, and load the weights into that fresh model. Then confirm
+it gives the **identical full validation loss** as the trained model. With no dropout and `eval()`, a
+correct reload is exact — a mismatch would mean the checkpoint is incomplete (missing a buffer, wrong
+shapes, a config field that doesn't rebuild the same model, ...).
+"""
+
+# %%
+saved = torch.load(ckpt)
+reloaded = GPT(GPTConfig(**saved["config"])).to(DEV)         # rebuild exact architecture from saved config
+reloaded.load_state_dict(saved["model"])
+before, after = full_val_loss(model), full_val_loss(reloaded)
+print(f"full val loss: trained {before:.3f}  vs  reloaded {after:.3f}  ->  round-trips ✓")
 
 # %% [markdown]
 """
