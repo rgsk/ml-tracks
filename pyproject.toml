@@ -26,6 +26,8 @@ dev = [
 
 # Expose the CNN track as an importable package so notebooks do `from cnn.train import ...`
 # with no sys.path juggling. Only nb/cnn is packaged (the other tracks are still loose scripts).
+# NB: this repo is a flat multi-track root, so setuptools auto-discovery can't guess what to ship
+# (it errors on "multiple top-level packages") — the explicit package-dir + packages is required.
 [tool.setuptools]
 package-dir = {"" = "nb"}
 packages = ["cnn"]
