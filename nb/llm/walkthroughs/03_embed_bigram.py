@@ -30,7 +30,8 @@ Two ideas, one payoff:
 2. **The bigram model.** Predict the next token from the **current token alone** — no
    context, no attention. It's an embedding table whose rows *are* the next-token
    scores. Train it with the exact same loop `01` used and watch it converge to a floor
-   well above `01`'s number. That gap is everything attention buys us (`04`).
+   well above `01`'s number. That gap is what context buys us — `04` starts closing it and
+   `05`'s attention finishes the job.
 
 We stay **character-level** here (same 65-token vocab as `01`) on purpose: the bigram's
 loss is then in the *same units* as `01`'s transformer, so "the floor it had to beat" is
@@ -67,8 +68,9 @@ print(f"device: {DEV}")
 
 Same character tokenizer and same `get_batch` as `01`. This little harness — encode
 the corpus to one long tensor, split 90/10, grab random `BLOCK`-length chunks with
-targets shifted one step left — is the **reusable training skeleton**. `04`–`06` swap
-in a bigger model but keep this exact data path, so it's worth fixing here once.
+targets shifted one step left — is the **reusable training skeleton**. Every later
+notebook swaps in a bigger model but keeps this exact data path, so it's worth fixing
+here once.
 """
 
 # %%
@@ -129,7 +131,7 @@ print(f"lookup == one-hot @ weight ? {torch.allclose(lookup, onehot, atol=1e-6)}
 
 The token embedding gives every id a vector, but it says nothing about **where** in the
 sequence a token sits — the same `"e"` gets the same vector whether it's first or
-last. Attention (`04`) is order-blind by construction, so `01` added a second table,
+last. Attention (`05`) is order-blind by construction, so `01` added a second table,
 `pos_emb`, indexed by *position* `0, 1, 2, …`, and summed the two: `token_emb[id] +
 pos_emb[pos]`. Now each input vector encodes both *what* the token is and *where* it is.
 
@@ -274,7 +276,7 @@ The bigram already crushes the uniform baseline just by learning letter-pair sta
 (`q`→`u`, space after `.`, capitals after `\n`). But it plateaus far above the
 transformer, because "the single previous character" throws away almost everything.
 Every 0.1 nats below this floor is the model learning to *use context* — which is what
-`04`'s attention exists to do.
+`04` (combining more than one previous token) and then `05`'s attention exist to do.
 """
 
 # %%
@@ -301,6 +303,7 @@ print(decode(model.generate(start, max_new_tokens=300)[0].tolist()))
 """
 You now have the two primitives every later notebook stands on: **embeddings** (id →
 vector) and the **train/generate skeleton**, plus a concrete **floor** to beat. Next,
-`04` opens the box that closes the gap — **self-attention**: letting each token look
-back at the earlier ones instead of predicting from a single character.
+`04` takes the first step past the floor — **combining more than one previous token**
+(concatenate vs average) — and shows why a *learned, weighted* combination is needed,
+which is exactly the **self-attention** that `05` builds.
 """

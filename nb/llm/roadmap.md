@@ -39,17 +39,18 @@ nb/llm/
     01_whole_game.py   ⇄ .ipynb   the whole game: build a small GPT, train, generate text
     02_tokenizer.py    ⇄ .ipynb   open the input: chars → BPE, what a "token" is (encode/decode)
     03_embed_bigram.py ⇄ .ipynb   token/position embeddings + the bigram baseline (the floor to beat)
-    04_attention.py    ⇄ .ipynb   the heart: self-attention — Q/K/V, the causal mask, single→multi-head
-    05_mlp_block.py    ⇄ .ipynb   per-token MLP + the Block: residuals + pre-norm, why depth stacks
-    06_train_craft.py  ⇄ .ipynb   the training loop: AdamW, weight init, LR warmup+cosine, grad clip
-    07_sampling.py     ⇄ .ipynb   turning logits into text: temperature, top-k, top-p, greedy
-    08_rmsnorm.py      ⇄ .ipynb   drop LayerNorm's centering — scale by RMS (simpler, same quality)
-    09_swiglu.py       ⇄ .ipynb   a gated feed-forward that learns more per parameter
-    10_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
-    11_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
-    12_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
-    13_sft.py          ⇄ .ipynb   base → instruction-follower: continue training with loss masking
-    14_lora.py         ⇄ .ipynb   freeze the base, train tiny low-rank adapters (~1% of the params)
+    04_context_combine.py ⇄ .ipynb combine >1 previous token: concat (Bengio MLP) vs average — road to attn
+    05_attention.py    ⇄ .ipynb   the heart: self-attention — Q/K/V, the causal mask, single→multi-head
+    06_mlp_block.py    ⇄ .ipynb   per-token MLP + the Block: residuals + pre-norm, why depth stacks
+    07_train_craft.py  ⇄ .ipynb   the training loop: AdamW, weight init, LR warmup+cosine, grad clip
+    08_sampling.py     ⇄ .ipynb   turning logits into text: temperature, top-k, top-p, greedy
+    09_rmsnorm.py      ⇄ .ipynb   drop LayerNorm's centering — scale by RMS (simpler, same quality)
+    10_swiglu.py       ⇄ .ipynb   a gated feed-forward that learns more per parameter
+    11_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
+    12_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
+    13_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
+    14_sft.py          ⇄ .ipynb   base → instruction-follower: continue training with loss masking
+    15_lora.py         ⇄ .ipynb   freeze the base, train tiny low-rank adapters (~1% of the params)
   custom/                    <- from-scratch impls (softmax, cross_entropy, layer/rms-norm, attention);
                                 each runs standalone as a self-test, matched against torch to ~0
   model.py                   <- the cleaned-up GPT, assembled once we understand each piece
@@ -82,23 +83,31 @@ model also needs **position** information, and the simplest possible LM — pred
 the current one alone. This is the **floor** `01` had to beat; it also fixes the training-loop and
 `generate` skeleton every later notebook reuses.
 
-**`04` — the heart: self-attention.** Why a fixed context window needs tokens to *look at each other*.
+**`04` — combining context: concat vs average.** The bigram only sees one token; to beat its floor
+you must use *more than one*. The two classic ways to collapse a window of token-vectors into a
+prediction: **concatenate** them (the Bengio 2003 neural LM — keeps order, but a rigid, parameter-
+hungry window) and **average** them (a bag-of-chars — scales to any length but destroys order and
+can't focus). Measured payoff: concat crushes the floor, while a uniform average lands *worse* than
+the bigram despite 8× the context. That "how you combine matters more than how much" is exactly what
+sets up attention — a *learned, weighted* average.
+
+**`05` — the heart: self-attention.** Why a fixed context window needs tokens to *look at each other*.
 Build attention from scratch: **query/key/value**, the scaled dot-product, the **causal mask** (a
 token may only attend to the past), softmax weights → weighted sum of values. Then single-head →
 **multi-head** (several attention "views" in parallel) and the fused projection. The one box that most
 defines a transformer.
 
-**`05` — the MLP and the Block.** After tokens mix (attention), each token is processed independently
+**`06` — the MLP and the Block.** After tokens mix (attention), each token is processed independently
 by a small **MLP** (Linear → activation → Linear) — the per-token "compute". Then the **Block** that
 `01` stacked: attention and MLP each wrapped in a **residual + pre-norm**, and *why* that wrapping is
 what lets you stack depth without the signal blowing up or vanishing (measured).
 
-**`06` — the training loop, properly.** Open `01`'s `train()` call: **AdamW** (and why decoupled weight
+**`07` — the training loop, properly.** Open `01`'s `train()` call: **AdamW** (and why decoupled weight
 decay), sane **weight init** (GPT-2 scaled-residual std) and the init-loss sanity check (`≈ ln(vocab)`),
 **LR warmup + cosine decay**, and **gradient clipping**. Each is a knob you can turn off and watch the
 loss curve get worse.
 
-**`07` — from logits to text: sampling.** The decode-time trio: **temperature** (sharpen/flatten the
+**`08` — from logits to text: sampling.** The decode-time trio: **temperature** (sharpen/flatten the
 distribution), **top-k** (keep the k most likely), **top-p / nucleus** (keep the smallest set summing to
 p), and greedy as the T→0 limit. See how each changes the samples; note which knobs matter for
 open-ended text vs. exact-answer tasks.
@@ -108,29 +117,29 @@ open-ended text vs. exact-answer tasks.
 Swap the 2019 pieces for what Llama/Mistral/Qwen actually use — **one delta per notebook**, each a
 small measured upgrade on the model you built.
 
-**`08` — RMSNorm.** Drop LayerNorm's centering; just scale by root-mean-square. Simpler, one fewer
+**`09` — RMSNorm.** Drop LayerNorm's centering; just scale by root-mean-square. Simpler, one fewer
 param vector, same quality — and *why* the re-centering turned out not to matter.
 
-**`09` — SwiGLU.** Replace the Linear→GELU→Linear feed-forward with a **gated** variant (a second
+**`10` — SwiGLU.** Replace the Linear→GELU→Linear feed-forward with a **gated** variant (a second
 branch multiplied element-wise) that learns more per parameter. Used by Llama/PaLM.
 
-**`10` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
+**`11` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
 score depends only on the *relative* distance between tokens — no length cap baked in. The change that
 unlocks longer context and cache-friendly generation.
 
-**`11` — KV-cache.** During generation, don't recompute past keys/values every step — cache and reuse
-them. The core inference speedup; and why RoPE (`10`) makes a real sliding-window cache possible.
+**`12` — KV-cache.** During generation, don't recompute past keys/values every step — cache and reuse
+them. The core inference speedup; and why RoPE (`11`) makes a real sliding-window cache possible.
 
-**`12` — GQA / MQA.** The KV-cache stores K/V for every head. Share them across **groups** of heads to
+**`13` — GQA / MQA.** The KV-cache stores K/V for every head. Share them across **groups** of heads to
 shrink the cache a lot with minimal quality loss — how long contexts get served cheaply.
 
 ## Phase C — base model → assistant (supervised)
 
-**`13` — SFT.** A base model only predicts next tokens; it doesn't *follow instructions*. Continue
+**`14` — SFT.** A base model only predicts next tokens; it doesn't *follow instructions*. Continue
 training on (instruction, good answer) pairs with **loss masking** — only the answer positions count.
 The first step from raw LM to assistant.
 
-**`14` — LoRA.** Freeze the base, train tiny low-rank **adapters** instead — same task quality, ~1% of
+**`15` — LoRA.** Freeze the base, train tiny low-rank **adapters** instead — same task quality, ~1% of
 the trainable params, hot-swappable per task. The last *supervised* rung.
 > Preference/RL alignment — reward modeling, PPO-RLHF, DPO, GRPO — is the **`nb/rl/` Phase 3** track,
 > which imports this model directly. That's the bridge; follow it there.
