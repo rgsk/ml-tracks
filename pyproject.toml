@@ -19,3 +19,9 @@ dev = [
     "jupytext>=1.19.4",
     "nbconvert>=7.17.1",
 ]
+
+[tool.jupytext]
+# Keep paired-notebook headers clean: strip the format_version / jupytext_version
+# fields (they churn on every jupytext upgrade) AND the filter line itself, so a
+# `--sync` / `--to ipynb` leaves the `.py` header stable with no diff noise.
+notebook_metadata_filter = "-jupytext.text_representation.jupytext_version,-jupytext.text_representation.format_version,-jupytext.notebook_metadata_filter"
