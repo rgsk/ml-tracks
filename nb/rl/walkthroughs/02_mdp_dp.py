@@ -1,6 +1,7 @@
 # ---
 # jupyter:
 #   jupytext:
+#     cell_markers: '"""'
 #     formats: ipynb,py:percent
 #     text_representation:
 #       extension: .py
@@ -12,21 +13,23 @@
 # ---
 
 # %% [markdown]
-# # RL · 02 — MDPs & dynamic programming: valuing a sequence of decisions
-#
-# In `01` there was **one state** — pulling an arm changed nothing. A **Markov Decision Process** adds
-# the thing that makes RL *RL*: you're in a state `s`, take action `a`, land in a new state `s'`
-# (stochastically), collect reward `r`, and repeat. Now a choice has *consequences down the line*, so a
-# good action isn't the one with the best immediate reward — it's the one that sets up the best *future*.
-#
-# When you **know the model** (`p(s'|s,a)` and `r`), you don't need to learn from experience at all —
-# you can **plan** the optimal policy directly with **dynamic programming**. That's this notebook, and
-# it matters because it's the **ground truth** every later model-free method (`03` MC/TD, `04`
-# Q-learning) is secretly trying to approximate from samples.
-#
-# Top-down: we'll build the classic 4×3 slippery gridworld, then **run value iteration and watch the
-# optimal value light up the grid and the arrows snap to the best path** — before deriving why the
-# backups converge.
+"""
+# RL · 02 — MDPs & dynamic programming: valuing a sequence of decisions
+
+In `01` there was **one state** — pulling an arm changed nothing. A **Markov Decision Process** adds
+the thing that makes RL *RL*: you're in a state `s`, take action `a`, land in a new state `s'`
+(stochastically), collect reward `r`, and repeat. Now a choice has *consequences down the line*, so a
+good action isn't the one with the best immediate reward — it's the one that sets up the best *future*.
+
+When you **know the model** (`p(s'|s,a)` and `r`), you don't need to learn from experience at all —
+you can **plan** the optimal policy directly with **dynamic programming**. That's this notebook, and
+it matters because it's the **ground truth** every later model-free method (`03` MC/TD, `04`
+Q-learning) is secretly trying to approximate from samples.
+
+Top-down: we'll build the classic 4×3 slippery gridworld, then **run value iteration and watch the
+optimal value light up the grid and the arrows snap to the best path** — before deriving why the
+backups converge.
+"""
 
 # %%
 import numpy as np
@@ -39,28 +42,31 @@ _DIRS = {UP: (-1, 0), RIGHT: (0, 1), DOWN: (1, 0), LEFT: (0, -1)}
 _ARROWS = {UP: "↑", RIGHT: "→", DOWN: "↓", LEFT: "←"}
 
 # %% [markdown]
-# ## The environment — a slippery gridworld as an explicit MDP
-#
-# The Russell & Norvig 4×3 world:
-#
-# ```
-#   . . . +1        start at bottom-left (2,0)
-#   . # . -1        # is a wall you can't enter
-#   . . . .         +1 / -1 are terminal (absorbing)
-# ```
-#
-# Actions move UP/RIGHT/DOWN/LEFT, but the floor is **slippery**: with prob `0.8` you go where you
-# intended, and `0.1` each you veer to one of the two **perpendicular** directions. Bumping a wall or
-# edge leaves you in place. Every non-terminal move costs `-0.04` (a "living reward" that makes dawdling
-# expensive) — so the slip is what makes `p(s'|s,a)` interesting and the policy near the `-1` trap
-# non-obvious (you'll see the optimal policy deliberately steer *away* from the trap even when that's
-# the long way round).
-#
-# The class exposes exactly what the DP algorithms consume, and nothing gridworld-specific — so the
-# routines below work on **any** tabular MDP:
-#
-# - `nS, nA, gamma`
-# - `P[s][a] = list of (prob, s_next, reward, done)` outcomes summing to prob 1.
+"""
+## The environment — a slippery gridworld as an explicit MDP
+
+The Russell & Norvig 4×3 world:
+
+```
+  . . . +1        start at bottom-left (2,0)
+  . # . -1        # is a wall you can't enter
+  . . . .         +1 / -1 are terminal (absorbing)
+```
+
+Actions move UP/RIGHT/DOWN/LEFT, but the floor is **slippery**: with prob `0.8` you go where you
+intended, and `0.1` each you veer to one of the two **perpendicular** directions. Bumping a wall or
+edge leaves you in place. Every non-terminal move costs `-0.04` (a "living reward" that makes dawdling
+expensive) — so the slip is what makes `p(s'|s,a)` interesting and the policy near the `-1` trap
+non-obvious (you'll see the optimal policy deliberately steer *away* from the trap even when that's
+the long way round).
+
+The class exposes exactly what the DP algorithms consume, and nothing gridworld-specific — so the
+routines below work on **any** tabular MDP:
+
+- `nS, nA, gamma`
+- `P[s][a] = list of (prob, s_next, reward, done)` outcomes summing to prob 1.
+"""
+
 
 # %%
 class GridWorld:
@@ -124,8 +130,11 @@ for prob, ns, r, done in env.P[env.s2i[env.start]][RIGHT]:
     print(f"  p={prob:.1f} -> {env.states[ns]}  reward={r:+.2f}  done={done}")
 
 # %% [markdown]
-# A small helper to **see** any `(V, policy)` on the grid — a value heatmap with the greedy action
-# drawn as an arrow in each cell. We'll lean on this for the payoff.
+"""
+A small helper to **see** any `(V, policy)` on the grid — a value heatmap with the greedy action
+drawn as an arrow in each cell. We'll lean on this for the payoff.
+"""
+
 
 # %%
 def draw_grid(env, V, policy=None, ax=None, title=""):
@@ -154,22 +163,25 @@ def draw_grid(env, V, policy=None, ax=None, title=""):
 
 
 # %% [markdown]
-# ## The two value functions, and the Bellman equations
-#
-# - `V^π(s)` = expected discounted return starting in `s`, then following policy `π`.
-# - `Q^π(s,a)` = same, but **force action `a` first**, then follow `π`.
-#
-# They're tied together by the **Bellman equations** — a value equals immediate reward plus discounted
-# value of where you land:
-#
-# $$Q^\pi(s,a) = \sum_{s'} p(s'\mid s,a)\,\big[\,r + \gamma\,V^\pi(s')\,\big] \qquad\text{(one-step lookahead)}$$
-# $$V^\pi(s) = \sum_a \pi(a\mid s)\,Q^\pi(s,a) \qquad\text{(expectation backup)}$$
-#
-# The **optimal** value takes the best action instead of averaging over `π`:
-#
-# $$V^*(s) = \max_a \sum_{s'} p(s'\mid s,a)\,\big[\,r + \gamma\,V^*(s')\,\big] \qquad\text{(optimality backup)}$$
-#
-# `q_from_v` is that one-step lookahead — the shared core every routine below calls.
+r"""
+## The two value functions, and the Bellman equations
+
+- `V^π(s)` = expected discounted return starting in `s`, then following policy `π`.
+- `Q^π(s,a)` = same, but **force action `a` first**, then follow `π`.
+
+They're tied together by the **Bellman equations** — a value equals immediate reward plus discounted
+value of where you land:
+
+$$Q^\pi(s,a) = \sum_{s'} p(s'\mid s,a)\,\big[\,r + \gamma\,V^\pi(s')\,\big] \qquad\text{(one-step lookahead)}$$
+$$V^\pi(s) = \sum_a \pi(a\mid s)\,Q^\pi(s,a) \qquad\text{(expectation backup)}$$
+
+The **optimal** value takes the best action instead of averaging over `π`:
+
+$$V^*(s) = \max_a \sum_{s'} p(s'\mid s,a)\,\big[\,r + \gamma\,V^*(s')\,\big] \qquad\text{(optimality backup)}$$
+
+`q_from_v` is that one-step lookahead — the shared core every routine below calls.
+"""
+
 
 # %%
 def q_from_v(env, V, s, gamma):
@@ -184,16 +196,19 @@ def q_from_v(env, V, s, gamma):
 
 
 # %% [markdown]
-# ## Policy evaluation — and why it's *secretly a linear solve*
-#
-# **Iterative policy evaluation**: sweep the expectation backup `V(s) ← Σ_a π(a|s) Q(s,a)` until `V^π`
-# stops moving. But the Bellman expectation equation is **linear** in `V`, so `V^π` has a closed form:
-#
-# $$V^\pi = (I - \gamma P^\pi)^{-1} r^\pi$$
-#
-# where `P^π(s,s') = Σ_a π(a|s) p(s'|s,a)` and `r^π(s)` is the expected immediate reward. That's a nice
-# interview point — *evaluation is just a linear system*; the DP sweep is one cheap iterative way to
-# solve it without inverting a matrix. We implement both and check they agree.
+r"""
+## Policy evaluation — and why it's *secretly a linear solve*
+
+**Iterative policy evaluation**: sweep the expectation backup `V(s) ← Σ_a π(a|s) Q(s,a)` until `V^π`
+stops moving. But the Bellman expectation equation is **linear** in `V`, so `V^π` has a closed form:
+
+$$V^\pi = (I - \gamma P^\pi)^{-1} r^\pi$$
+
+where `P^π(s,s') = Σ_a π(a|s) p(s'|s,a)` and `r^π(s)` is the expected immediate reward. That's a nice
+interview point — *evaluation is just a linear system*; the DP sweep is one cheap iterative way to
+solve it without inverting a matrix. We implement both and check they agree.
+"""
+
 
 # %%
 def policy_evaluation(env, policy, gamma, theta=1e-10):
@@ -233,14 +248,17 @@ assert np.allclose(V_iter, V_exact, atol=1e-6)
 print(f"iterative eval matches the (I-γPπ)⁻¹rπ solve  (max diff {np.abs(V_iter-V_exact).max():.2e}) ✅")
 
 # %% [markdown]
-# ## Policy iteration and value iteration
-#
-# Two ways to reach the *optimal* policy from the model:
-#
-# - **Policy iteration**: evaluate `π`, then act **greedily** w.r.t. `V^π` to get a strictly better `π`;
-#   repeat. Provably converges to `π*` (usually in very few iterations).
-# - **Value iteration**: skip full evaluation — just sweep the **optimality** backup `V(s) ← max_a
-#   Q(s,a)` directly, then read the greedy policy off `V*`.
+"""
+## Policy iteration and value iteration
+
+Two ways to reach the *optimal* policy from the model:
+
+- **Policy iteration**: evaluate `π`, then act **greedily** w.r.t. `V^π` to get a strictly better `π`;
+  repeat. Provably converges to `π*` (usually in very few iterations).
+- **Value iteration**: skip full evaluation — just sweep the **optimality** backup `V(s) ← max_a
+  Q(s,a)` directly, then read the greedy policy off `V*`.
+"""
+
 
 # %%
 def policy_improvement(env, V, gamma):
@@ -278,9 +296,11 @@ def value_iteration(env, gamma, theta=1e-10):
 
 
 # %% [markdown]
-# **Wiring checks** — the two algorithms must agree on `V*` and `π*`; the optimal value must dominate
-# the random policy everywhere; and the greedy policy (intended moves) must actually walk from the
-# start to the `+1` goal.
+"""
+**Wiring checks** — the two algorithms must agree on `V*` and `π*`; the optimal value must dominate
+the random policy everywhere; and the greedy policy (intended moves) must actually walk from the
+start to the `+1` goal.
+"""
 
 # %%
 pi_pol, pi_V = policy_iteration(env, env.gamma)
@@ -301,11 +321,13 @@ print("V* dominates V^random everywhere  ✅")
 print(f"greedy rollout reaches +1 goal:  {path}  ✅")
 
 # %% [markdown]
-# ## The payoff — the optimal plan, and V spreading out from the goal
-#
-# **Top row:** the random policy's values vs the optimal `V*` with the optimal policy's arrows. Notice
-# the optimal policy in the cell just below the `-1` trap points **away** from it — it would rather take
-# the slippery long way than risk a slip into `-1`.
+"""
+## The payoff — the optimal plan, and V spreading out from the goal
+
+**Top row:** the random policy's values vs the optimal `V*` with the optimal policy's arrows. Notice
+the optimal policy in the cell just below the `-1` trap points **away** from it — it would rather take
+the slippery long way than risk a slip into `-1`.
+"""
 
 # %%
 fig, (a1, a2) = plt.subplots(1, 2, figsize=(9, 3.4))
@@ -315,9 +337,11 @@ fig.tight_layout()
 plt.show()
 
 # %% [markdown]
-# **Watch V propagate.** Value iteration starts at `V=0` everywhere; each sweep pushes value one more
-# step outward from the `+1` goal. Here are the first few sweeps — the "good news" of the goal
-# diffusing backward through the grid until it stabilises.
+"""
+**Watch V propagate.** Value iteration starts at `V=0` everywhere; each sweep pushes value one more
+step outward from the `+1` goal. Here are the first few sweeps — the "good news" of the goal
+diffusing backward through the grid until it stabilises.
+"""
 
 # %%
 snapshots, V = [], np.zeros(env.nS)
@@ -335,18 +359,20 @@ fig.tight_layout(rect=(0, 0, 1, 0.93))
 plt.show()
 
 # %% [markdown]
-# ## The map — what we open next
-#
-# We just **planned** optimally by *knowing* the model. That's the ceiling; the rest of the tabular
-# track earns the same result **without** the model — from samples alone:
-#
-# | next | drops | the new question |
-# |---|---|---|
-# | `03` | the known `p(s'|s,a)` | estimate `V^π` from **sampled episodes** — MC vs TD(0), bias/variance |
-# | `04` | the model *and* evaluation-only | learn the **optimal** policy from experience (Q-learning, SARSA) |
-#
-# The one-step lookahead `q_from_v` and the backup `V ← max_a Q` are the exact targets those
-# model-free methods approximate: MC/TD estimate the `Σ p[r + γV(s')]` expectation by *averaging real
-# transitions* instead of reading `env.P`.
-#
-# Next: **`03` — Monte Carlo & TD(0): estimating value from samples, no model.**
+"""
+## The map — what we open next
+
+We just **planned** optimally by *knowing* the model. That's the ceiling; the rest of the tabular
+track earns the same result **without** the model — from samples alone:
+
+| next | drops | the new question |
+|---|---|---|
+| `03` | the known `p(s'|s,a)` | estimate `V^π` from **sampled episodes** — MC vs TD(0), bias/variance |
+| `04` | the model *and* evaluation-only | learn the **optimal** policy from experience (Q-learning, SARSA) |
+
+The one-step lookahead `q_from_v` and the backup `V ← max_a Q` are the exact targets those
+model-free methods approximate: MC/TD estimate the `Σ p[r + γV(s')]` expectation by *averaging real
+transitions* instead of reading `env.P`.
+
+Next: **`03` — Monte Carlo & TD(0): estimating value from samples, no model.**
+"""
