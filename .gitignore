@@ -12,5 +12,6 @@ diffusion/data/
 *.npz
 
 # jupytext-paired notebooks: the .py is source of truth, the .ipynb is regenerated
-# with `jupytext --to ipynb --execute` (outputs not committed)
-nb/*/walkthroughs/*.ipynb
+# with `jupytext --to ipynb --execute` (outputs not committed). Covers walkthroughs/
+# and custom/ (from-scratch impls are paired too, for LaTeX/figures in their write-ups).
+nb/**/*.ipynb

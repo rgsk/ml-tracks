@@ -1,16 +1,45 @@
-"""naive_conv2d — 2-D cross-correlation from scratch, to prove `F.conv2d` is no magic.
+# ---
+# jupyter:
+#   jupytext:
+#     formats: ipynb,py:percent
+#     text_representation:
+#       extension: .py
+#       format_name: percent
+#   kernelspec:
+#     display_name: Python 3
+#     language: python
+#     name: python3
+# ---
 
-A conv LAYER maps input (N, Cin, H, W) with weight (Cout, Cin, kH, kW) to output (N, Cout, Hout, Wout).
-Each output channel `o` slides its own (Cin, kH, kW) kernel over the (zero-padded) input; every output
-cell is a windowed multiply-and-sum over all input channels. That's the whole operation — three loops
-(output channel, output row, output col), each cell one dot product. This matches torch's F.conv2d
-(single group, dilation 1) to floating-point noise.
+# %% [markdown]
+# # `naive_conv2d` — 2-D convolution from scratch
+#
+# To prove `F.conv2d` is no magic. This module is **imported** by `02_features` (`from
+# custom.naive_conv2d import naive_conv2d`) and also runs **standalone as its own self-test**:
+#
+# ```bash
+# python nb/cnn/custom/naive_conv2d.py     # checks against torch's F.conv2d
+# ```
+#
+# ## What it computes
+#
+# A conv **layer** maps input `(N, Cin, H, W)` with weight `(Cout, Cin, kH, kW)` to output
+# `(N, Cout, Hout, Wout)`. Each output channel `o` slides its own `(Cin, kH, kW)` kernel over the
+# (zero-padded) input; every output cell is a windowed multiply-and-sum over all input channels:
+#
+# $$\text{out}[o, i, j] = \sum_{\text{over the } C_{in} \times k_H \times k_W \text{ window}} \text{kernel}[o]\cdot\text{input\_window}$$
+#
+# That's the whole operation — **three loops** (output channel, output row, output col), each cell one
+# dot product. Two structural facts fall out and are the whole reason convs beat dense layers (`03`):
+# **weight sharing** (the same `kernel[o]` at every `(i,j)`) and **locality** (each output depends only
+# on a small `kH×kW` window).
+#
+# This matches torch's `F.conv2d` (single group, dilation 1) to floating-point noise.
+#
+# > Like every DL framework, this is cross-**correlation** (kernel *not* flipped) — see `03` for the
+# > flip. It only matters for hand-set kernels; a learned kernel just learns whichever orientation.
 
-Run standalone to check against torch:  python naive_conv2d.py   (from nb/cnn/custom/)
-NOTE: like every DL framework, this is cross-CORRELATION (kernel not flipped) — see 03 for the flip.
-"""
-from __future__ import annotations
-
+# %%
 import torch
 
 
@@ -42,11 +71,15 @@ def naive_conv2d(x, weight, bias=None, stride=1, padding=0):
     return out
 
 
-# ---------------------------------------------------------------------------
-# Self-check: compares against torch's F.conv2d on random data across the configs
-# we actually use (stride, padding, channels, batch, bias, larger kernels).
-# Run standalone:  python naive_conv2d.py   (from nb/cnn/custom/)
-# ---------------------------------------------------------------------------
+# %% [markdown]
+# ## Self-check vs `torch.F.conv2d`
+#
+# Compare against torch across the configs we actually use (stride, padding, channels, batch, bias,
+# larger kernels), including the exact convs inside `SmallCNN.features` — the `28 → 14 → 7` pyramid.
+# The `if __name__ == "__main__"` guard means this runs when the file is executed (as a script *or* as
+# this notebook) but stays quiet when `02` imports the function.
+
+# %%
 if __name__ == "__main__":
     import torch.nn.functional as F
 
