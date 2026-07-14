@@ -369,9 +369,15 @@ network (no training needed — it's about signal propagation through the layers
   each layer's Jacobian on the way down, **shrinks geometrically with depth** — the
   vanishing gradient. Early layers get almost no learning signal.
 
-Below: a plain stack of `Linear→GELU→Linear` sublayers, no residual, no norm. Sweep the
-depth and, for each, measure (a) the RMS of the final activation and (b) the norm of the
-gradient arriving back at the input. Read the trend, not any single row.
+Below: a stack of `Linear→GELU→Linear` sublayers swept across depth, in all four
+corners — **plain** (no residual, no norm), **residual-only**, **prenorm-only**, and
+**both**. For each, measure (a) the RMS of the final activation and (b) the norm of the
+gradient arriving back at the input. Read the trend down each column, not any single
+row; start with **plain** — it's the one that breaks. The two single-fix columns
+isolate what each change buys: watch **residual-only**'s gradient recover (while its
+activation RMS starts to climb), and watch **prenorm-only** do the opposite — pin the
+activations but leave the gradient weak. Only **both** gets both right. The next two
+sections build and explain each fix.
 """
 
 
@@ -394,16 +400,29 @@ def signal_probe(depth, residual, norm, C=64, seed=0):
     return h.detach().std().item(), x.grad.norm().item()
 
 
-print(f"{'depth':>6} | {'plain: act_rms  grad_norm':>28} | "
-      f"{'residual+prenorm: act_rms  grad_norm':>36}")
-print("-" * 78)
+cols = ["plain", "residual-only", "prenorm-only", "both"]
+print(f"{'depth':>5} | " + " | ".join(f"{c:>16}" for c in cols))
+print(f"{'':>5} | " + " | ".join(f"{'act    grad':>16}" for _ in cols))
+print("-" * 81)
 for depth in [1, 2, 4, 8, 16, 32]:
-    p_rms, p_g = signal_probe(depth, residual=False, norm=False)
-    r_rms, r_g = signal_probe(depth, residual=True, norm=True)
-    print(f"{depth:>6} | {p_rms:>12.3f}  {p_g:>12.2e} | {r_rms:>16.3f}  {r_g:>14.2e}")
+    p = signal_probe(depth, residual=False, norm=False)   # plain: no fix
+    r = signal_probe(depth, residual=True, norm=False)    # Fix 1 alone: residual
+    n = signal_probe(depth, residual=False, norm=True)    # Fix 2 alone: pre-norm
+    b = signal_probe(depth, residual=True, norm=True)     # both fixes
+    row = " | ".join(f"{a:>6.3f} {g:>9.2e}" for a, g in (p, r, n, b))
+    print(f"{depth:>5} | {row}")
 
-print("\nplain: gradient to the input collapses toward 0 as depth grows (vanishing);")
-print("residual+prenorm: gradient stays O(1) and activations stay well-scaled.")
+print("\n(each cell: activation RMS on the left, gradient norm reaching the input on "
+      "the right)")
+print("plain: gradient collapses toward 0 with depth (vanishing); activations shrink "
+      "too.")
+print("residual-only: gradient recovers to O(1), but activation RMS now GROWS with "
+      "depth")
+print("  -> Fix 1 cures the backward pass and opens a forward wrinkle Fix 2 closes.")
+print("prenorm-only: activations stay well-scaled and the gradient stays alive, but "
+      "weak and")
+print("  flat -> norm conditions the forward pass; it is NOT the gradient highway.")
+print("both: gradient stays O(1) AND activations stay well-scaled.")
 
 # %% [markdown]
 """
@@ -424,7 +443,10 @@ Jacobians, `J_L · … · J_1`, which shrinks or explodes geometrically. With th
 every factor is `(I + J)`: expand the product and one term is `I · I · … · I = I` — a
 **direct, undamped path** from the loss to every layer. The gradient can always flow
 straight down the identity highway, no matter how many layers sit on top. That's the
-`residual=True` column above: `grad_norm` stopped collapsing.
+**residual-only** column above: `grad_norm` stopped collapsing — the backward pass is
+cured by this one change alone. But look at that column's *other* number: `act_rms`
+started to **grow** with depth. That's the forward-side price of adding to the stream,
+and it's exactly what Fix 2 handles next.
 
 (This is exactly `05`'s `04`-shape lesson echoed structurally: the residual stream is
 the thing every sublayer reads from and writes back into, the same stream `01` carried
@@ -478,6 +500,24 @@ for depth in range(1, 33):
 
 print("\nstream grows with depth (info accumulates); "
       "the normed input stays ~1 (stable).")
+
+# %% [markdown]
+"""
+### Aside — but doesn't LayerNorm *alone* fix the gradient?
+
+Fair question, and the **prenorm-only** column in that first table answers it with a
+twist. Pre-norm is also about scale, so you might expect it to rescue the gradient too —
+and it *partly* does: LayerNorm conditions the forward pass, giving better-behaved
+Jacobians, so the gradient never collapses all the way to zero the way **plain** does
+(`0.0` by depth 32 versus prenorm-only's ~`3e-3`).
+
+But look at the *magnitude* and the *trend*. Prenorm-only sits near `3e-3` and stays
+**flat** with depth; the residual delivers `O(1e-1)` — an order of magnitude stronger —
+because the identity term gives the gradient a path whose strength doesn't decay through
+depth at all. Norm *conditions*; the residual *carries*. Different mechanisms — which is
+exactly why **both** is the only column that's simultaneously well-scaled *and*
+strongly-gradiented, and why the Block uses both, never either alone.
+"""
 
 # %% [markdown]
 """
@@ -579,7 +619,7 @@ The story in one column: each row changed *one* idea, and the loss moved.
 print(f"bigram         (03, CTX=1)         : 2.450   <- the floor")
 print(f"average        (04, uniform mix)   : 2.950   <- worse: no order, no focus")
 print(f"concat/Bengio  (04, rigid window)  : 1.840")
-print(f"attention only (06, 1 layer)       : {attn_only_floor:.3f}   "
+print(f"attention only (05, 1 layer)       : {attn_only_floor:.3f}   "
       "<- mix, linear readout")
 print(f"attention+MLP  (06, 1 layer)       : {attn_mlp_floor:.3f}   "
       "<- + per-token compute")
