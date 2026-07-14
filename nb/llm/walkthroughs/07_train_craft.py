@@ -596,28 +596,56 @@ full-size step in every coordinate regardless of the real gradient, which can kn
 model into a bad region it never climbs out of. Trace it from the buffers at `t=1`, both
 starting at `m=v=0` (the exact lines are in `nb/llm/custom/optimizers.py`, class `AdamW`):
 
-    m      = b1*0 + (1-b1)*g   = (1-b1)*g
-    v      = b2*0 + (1-b2)*g^2 = (1-b2)*g^2
+```-
+m      = b1*0 + (1-b1)*g   = (1-b1)*g
+v      = b2*0 + (1-b2)*g^2 = (1-b2)*g^2
 
-    m_hat  = m/(1-b1^1) = (1-b1)*g  / (1-b1) = g       # bias corr recovers g exactly
-    v_hat  = v/(1-b2^1) = (1-b2)*g^2 / (1-b2) = g^2    # ...and v_hat back to g^2
+m_hat  = m/(1-b1^1) = (1-b1)*g  / (1-b1) = g       # bias corr recovers g exactly
+v_hat  = v/(1-b2^1) = (1-b2)*g^2 / (1-b2) = g^2    # ...and v_hat back to g^2
 
-    m_hat/(sqrt(v_hat)+eps) = g/(sqrt(g^2)+eps) = g/(|g|+eps)  ~=  sign(g)
+m_hat/(sqrt(v_hat)+eps) = g/(sqrt(g^2)+eps) = g/(|g|+eps)  ~=  sign(g)
+```
 
 so `p -= lr · sign(g)`, **per coordinate**. Two things to read off it:
 
-- **Magnitude is exactly `lr`, for every parameter.** However big or small its real gradient,
-  each param moves the same distance `lr` on this first step — the `1/sqrt(v)` division has
-  completely cancelled the gradient's scale. This is the cleanest possible view of Adam's
-  normalization: strip away the running averages (there's only one sample yet) and the raw
-  step is a pure `±lr` nudge. It's also *why* a fresh Adam is dangerous — that full-size step
-  fires when `v` has averaged just one gradient and can't yet be trusted to size it down.
+- **Magnitude is ~`lr`, for every parameter.** However big or small its real gradient, each
+  param moves ~`lr` on this first step — the `1/sqrt(v)` division has completely cancelled the
+  gradient's scale. This is the cleanest possible view of Adam's normalization: strip away the
+  running averages (there's only one sample yet) and the raw step is a pure `±lr` nudge. It's
+  also *why* a fresh Adam is dangerous — that full-size step fires when `v` has averaged just
+  one gradient and can't yet be trusted to size it down.
 - **The sign still points downhill, so it's `±1`, not `1`.** `sign(g)` carries the gradient's
   direction: a coordinate with `g>0` (loss rises as the weight grows) steps *down* by `lr`,
-  one with `g<0` steps *up* by `lr`. The magnitude is uniform; the direction is still the
-  honest descent direction per coordinate. (`eps` is what makes it "essentially" sign rather
-  than exactly `±1`: for a genuinely tiny `g`, `g/(|g|+eps)` shrinks toward 0 instead of
-  snapping to `±1` — the same "don't divide by ~0" floor from Knob 2.)
+  one with `g<0` steps *up* by `lr`. The magnitude is (near-)uniform; the direction is the
+  honest per-coordinate descent direction.
+
+Why "~`lr`" and not exactly `lr`: the `eps` in the denominator shaves the step a little below
+full size. Pull the sign out and the size is just the leftover factor —
+
+```-
+g/(|g|+eps) = sign(g) · |g|/(|g|+eps) = sign(g) · 1/(1 + eps/|g|)
+                                                   └──── size ────┘
+
+|g|            1/(1 + eps/|g|)     step size
+------------   ----------------    ---------
+~1  (normal)   ~0.99999998         ~lr         eps invisible; step is essentially ±lr
+~eps (1e-8)    ~0.5                ~lr/2       eps now half the denominator
+<<eps          ~|g|/eps -> 0        -> 0        floor kicks in: no blow-up near g=0
+```
+
+So `eps` doesn't change the *direction*, only trims the *size* — nothing for normal
+gradients, everything for gradients near zero. It's guarding against two failures at the
+bottom of that table, really the same one seen from two sides:
+
+- **At exactly `g=0`:** `g/|g|` is `0/0` — undefined, a literal divide-by-zero. `+eps` makes
+  it `0/eps = 0`, a clean "no gradient, no step".
+- **At vanishingly small but nonzero `g`:** without `eps`, `g/|g|` *snaps to `±1`* — a param
+  whose gradient is pure noise (essentially no signal) would still take a full `±lr` step.
+  `+eps` gates it down toward `0` instead, so only gradients meaningfully above `eps` earn a
+  full-size step.
+
+Same floor covers both: the "don't divide by ~0" guard from Knob 2, which also keeps tiny
+noise gradients from being amplified into full `±1` steps.
 
 For the full derivation as runnable code plus a check against `torch.optim.AdamW`, see
 `nb/llm/custom/optimizers.py`. **Warmup** defuses exactly this — ramp the
