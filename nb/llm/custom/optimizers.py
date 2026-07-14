@@ -370,11 +370,18 @@ class AdamW:
             self.t[i] += 1
             t = self.t[i]
 
-            # the Adam core, unchanged — driven by the raw gradient g (no decay in it)
+            # the Adam core, unchanged — driven by the raw gradient g (no decay in it).
+            # EMAs: 1st moment (mean of g), 2nd moment (mean of g^2)
             self.m[i] = self.b1 * self.m[i] + (1 - self.b1) * g
             self.v[i] = self.b2 * self.v[i] + (1 - self.b2) * g * g
+
+            # bias correction: buffers started at 0, so divide out the (1 - b^t) bias.
+            # strong at the cold start, fades to 1 as t grows (b^t -> 0).
             m_hat = self.m[i] / (1 - self.b1 ** t)
             v_hat = self.v[i] / (1 - self.b2 ** t)
+
+            # adaptive step: normalize the momentum by the grad RMS. addcdiv_(a, b,
+            # value=v) does p += v*(a/b), so this is p -= lr * m_hat/(sqrt(v_hat)+eps).
             p.addcdiv_(m_hat, v_hat.sqrt() + self.eps, value=-self.lr)
 
     def zero_grad(self):

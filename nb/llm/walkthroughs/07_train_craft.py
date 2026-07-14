@@ -587,12 +587,48 @@ print(f"  -> {n_nd / (n_d + n_nd) * 100:.1f}% of params (the 1-D ones) are never
 """
 ## Knob 3 — LR warmup + cosine decay
 
-Adam's moment estimates `m, v` both start at **0** and are pure noise for the first handful
-of steps — taking a full-size step then, on a fresh model, can knock it into a bad region
-it never recovers from. **Warmup** eases in: ramp the LR linearly from ~0 up to the peak
-over the first `warmup` steps. Then **cosine decay** glides from the peak down to a small
-floor along half a cosine — smoother than a step drop, and the slow finish lets the model
-settle into the minimum instead of bouncing around it.
+**Warmup exists because of AdamW's cold start.** Recall Knob 2: the step is
+`lr · m̂ / (sqrt(v̂) + eps)`, and both moments start at **0**. So for the first handful of
+steps `v` is an average over just one or two gradients — a noisy, unreliable estimate of the
+gradient's true magnitude — which makes the *adaptive step size itself* high-variance right
+when the model is a fresh random init. At `t=1` the update is essentially `lr · sign(g)`: a
+full-size step in every coordinate regardless of the real gradient, which can knock the
+model into a bad region it never climbs out of. Trace it from the buffers at `t=1`, both
+starting at `m=v=0` (the exact lines are in `nb/llm/custom/optimizers.py`, class `AdamW`):
+
+    m      = b1*0 + (1-b1)*g   = (1-b1)*g
+    v      = b2*0 + (1-b2)*g^2 = (1-b2)*g^2
+
+    m_hat  = m/(1-b1^1) = (1-b1)*g  / (1-b1) = g       # bias corr recovers g exactly
+    v_hat  = v/(1-b2^1) = (1-b2)*g^2 / (1-b2) = g^2    # ...and v_hat back to g^2
+
+    m_hat/(sqrt(v_hat)+eps) = g/(sqrt(g^2)+eps) = g/(|g|+eps)  ~=  sign(g)
+
+so `p -= lr · sign(g)`, **per coordinate**. Two things to read off it:
+
+- **Magnitude is exactly `lr`, for every parameter.** However big or small its real gradient,
+  each param moves the same distance `lr` on this first step — the `1/sqrt(v)` division has
+  completely cancelled the gradient's scale. This is the cleanest possible view of Adam's
+  normalization: strip away the running averages (there's only one sample yet) and the raw
+  step is a pure `±lr` nudge. It's also *why* a fresh Adam is dangerous — that full-size step
+  fires when `v` has averaged just one gradient and can't yet be trusted to size it down.
+- **The sign still points downhill, so it's `±1`, not `1`.** `sign(g)` carries the gradient's
+  direction: a coordinate with `g>0` (loss rises as the weight grows) steps *down* by `lr`,
+  one with `g<0` steps *up* by `lr`. The magnitude is uniform; the direction is still the
+  honest descent direction per coordinate. (`eps` is what makes it "essentially" sign rather
+  than exactly `±1`: for a genuinely tiny `g`, `g/(|g|+eps)` shrinks toward 0 instead of
+  snapping to `±1` — the same "don't divide by ~0" floor from Knob 2.)
+
+For the full derivation as runnable code plus a check against `torch.optim.AdamW`, see
+`nb/llm/custom/optimizers.py`. **Warmup** defuses exactly this — ramp the
+LR linearly from ~0 up to the peak over the first `warmup` steps, buying time for `v` to
+average enough samples to be trustworthy before the steps reach full size. (It's also what
+lets us safely run the higher `3e-3` peak that beat the flat `1e-3`: the danger is
+concentrated at the start, so ease past the start.)
+
+Then **cosine decay** glides from the peak down to a small floor along half a cosine —
+smoother than a step drop, and the slow finish lets the model settle into the minimum
+instead of bouncing around it.
 """
 
 
@@ -642,6 +678,17 @@ which is the whole reason we clip by norm. `torch.nn.utils.clip_grad_norm_` does
 this and *returns the pre-clip norm*, which is what we log to watch for spikes. We'll see
 below that the un-clipped norm is largest in the first few steps (the fresh-model danger
 zone warmup also targets) and settles after.
+
+**Clip vs warmup — same danger zone, different cause.** It's tempting to lump these two
+together as "one early-training fix," but they treat different problems and neither can do
+the other's job. Warmup (Knob 3) is about **Adam's cold moments**: `v` is a noisy estimate
+for the first few steps, so the *adaptive step size* is unreliable — a purely optimizer-side
+issue. Clipping is about the **raw gradient** being huge from a bad batch — it caps `g`
+*before* the optimizer, never touches `m`/`v`, and you'd want it with plain SGD too. The
+tell that they're distinct: clip can't rescue a cold-`v` step (a normal-size gradient still
+gets an erratic adaptive rate), and warmup can't cap a spike (a giant gradient is still
+giant, just multiplied by a smaller LR). They *co-occur* only because a fresh model is
+volatile on both axes at once — so both earn their keep in the same first ~100 steps.
 """
 
 # %% [markdown]
