@@ -409,6 +409,11 @@ the gradient*, so it flows through the `1/sqrt(v)` division and a param with a b
 history gets *less* decay — the decay strength becomes an accident of each param's gradient
 scale. AdamW applies `w -= lr·wd·w` **directly, outside** the adaptive update, so every
 weight decays by the same fraction. That decoupling is literally what the "W" is.
+
+> We drive with `torch.optim` here, but the update rules themselves are only a few lines
+> each. `custom/optimizers.py` builds **SGD → Adam → AdamW** from scratch — each the
+> previous plus one idea, each validated against its `torch.optim` twin to ~0 — and isolates
+> the single line that moves between Adam and AdamW that *is* this paragraph.
 """
 
 
