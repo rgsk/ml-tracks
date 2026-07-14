@@ -35,11 +35,12 @@ toy. We measure all four honestly, and say plainly which is which:
 
 1. **Weight init** *(diagnostic + scale)* — before a single gradient step, a freshly-built
    model should sit at loss `≈ ln(vocab)` (it knows nothing, so it should predict
-   ~uniform). We measure that the PyTorch defaults miss it and GPT-2's `std=0.02` init —
-   plus a `1/sqrt(2·n_layer)` scale on the residual projections — lands it, keeping `06`'s
-   residual stream from blowing up. That sanity check is the transferable win; on *this*
-   toy it doesn't lower the final loss (a 4-layer model recovers from a bad start), and
-   we'll measure that honestly too — its loss payoff is at depth/scale.
+   ~uniform). The PyTorch defaults miss it — and, because `ln_f` normalizes the stream
+   before the head, the fix is *entirely* the **output head's** init scale (GPT-2's
+   `std=0.02`); the separate `1/sqrt(2·n_layer)` residual-projection scaling is a *depth*
+   stabilizer this 4-layer toy can't even show move. That `ln(vocab)` sanity check is the
+   transferable win; on *this* toy the init doesn't lower the final loss at all (measured)
+   — its payoff is at depth/scale.
 2. **AdamW & decoupled weight decay** *(sets the number)* — *why* Adam over SGD, measured:
    AdamW reaches a loss SGD can't touch even at 30× the LR. Plus the nanoGPT two-group
    trick — decay the 2-D weight matrices, never the 1-D biases and LayerNorm gains — where
@@ -279,29 +280,65 @@ print(f"PyTorch-default init loss : {init_loss(default_model):.4f}   "
 
 # %% [markdown]
 """
-### Why the default overshoots, and the GPT-2 fix
+### Why the default overshoots — it's the output head, and *only* the head
 
-Two defaults push the untrained logits away from uniform:
+The whole path from network to loss is one line: `logits = lm_head(ln_f(x))`. And `ln_f`
+is a LayerNorm — it renormalizes `x` to unit scale *per token* right before the head. So
+**however large or small the residual stream got, `lm_head` always sees a unit-scale
+input** (we measure `std(ln_f(x)) ≈ 1.000` below, for any init). The head is blind to the
+stream's magnitude.
 
-- **`nn.Embedding` initializes to `N(0, 1)`** — unit *standard deviation*. Both the token
-  and position tables start at that scale, so the residual stream enters the blocks already
-  large, and everything downstream is amplified from there.
-- **the residual stream grows with depth** — exactly `06`'s measured lesson. Each Block
-  *adds* `attn(...)` and `ffwd(...)` to the stream, so variance accumulates over the `2·N`
-  additions. By the head, the vector fed to `lm_head` is bigger than unit-scale, and the
-  logits spread out.
+That single fact pins down the cause. With the head's input fixed at unit scale, the spread
+of the logits is set *entirely* by `lm_head`'s own weight scale. PyTorch's default `Linear`
+init draws weights with std `≈ 1/sqrt(n_embd) ≈ 0.051`, which makes the untrained logits
+spread with std `≈ 0.58` — wide enough that softmax is visibly non-uniform, so cross-entropy
+against random targets sits *above* `ln(vocab)`. Shrink just that one matrix to std `0.02`
+and the logits collapse toward uniform and the loss onto `ln(vocab)`.
 
-GPT-2's init is two rules that fix both:
+Nothing upstream matters for this number: not the `N(0,1)` embeddings, not `06`'s
+residual-stream growth — `ln_f` erases all of it before the head. (The textbook-dramatic
+version of this bug is **weight tying**: if `lm_head` *shares* the embedding's `N(0,1)`
+weights, the logits truly explode. Here the two are separate, so it's only the milder
+`0.051` default.) Let's isolate it — fix `lm_head` alone, leave everything else at PyTorch
+defaults, and watch the init loss land anyway:
+"""
 
-    every Linear / Embedding weight ~ N(0, 0.02)          # small, tight — logits stay flat
-    residual-projection weights    ~ N(0, 0.02 / sqrt(2·n_layer))   # cancel the depth growth
 
-The `0.02` keeps the head's logits small (so softmax ≈ uniform → loss ≈ ln V). The
-`1/sqrt(2·n_layer)` factor is the interesting one: there are `2·n_layer` additions into the
-residual stream (attn + ffwd per Block), and shrinking each *contributing* projection by
-`1/sqrt(2·n_layer)` keeps the summed variance ~flat instead of growing linearly with depth
-— it directly answers the "residual stream RMS climbs with depth" plot from `06`. That is
-why only the `RESIDUAL_PROJ`-tagged Linears get the extra factor.
+# %%
+@torch.no_grad()
+def head_stats(model):
+    """std of the head's INPUT (after ln_f) and of the resulting logits, on one batch."""
+    xb, _ = get_batch("val")
+    x = model.tok_emb(xb) + model.pos_emb(torch.arange(xb.size(1), device=DEV))
+    for b in model.blocks:
+        x = b(x)
+    head_in = model.ln_f(x)
+    return head_in.std().item(), model.lm_head(head_in).std().item()
+
+
+torch.manual_seed(0)
+dm = GPT(vocab_size).to(DEV)
+h_std, lg_std = head_stats(dm)
+print(f"default: std(ln_f output) = {h_std:.3f}  <- ~1 whatever the stream did (ln_f norms)")
+print(f"default: lm_head.weight std {dm.lm_head.weight.std():.4f} -> logit std {lg_std:.3f}")
+
+torch.manual_seed(0)
+hm = GPT(vocab_size).to(DEV)                        # everything at PyTorch defaults...
+nn.init.normal_(hm.lm_head.weight, std=0.02)        # ...except lm_head, shrunk to 0.02
+nn.init.zeros_(hm.lm_head.bias)
+_, lg2 = head_stats(hm)
+print(f"lm_head@0.02 ONLY: logit std {lg2:.3f} -> init loss {init_loss(hm):.4f}  "
+      f"(≈ ln vocab {ln_vocab:.4f}; nothing else touched)")
+
+# %% [markdown]
+"""
+### The GPT-2 init function
+
+The real recipe applies `std=0.02` to *every* Linear and Embedding — the extra ones are
+harmless for the init loss (`ln_f` and the pre-norms normalize their scale away) but are
+the scheme that trains at scale — plus a `1/sqrt(2·n_layer)` factor on the residual
+projections we'll examine next. Building the full thing confirms it also lands on
+`ln(vocab)`:
 """
 
 
@@ -331,13 +368,23 @@ print(f"GPT-2 init loss           : {init_loss(init_model):.4f}   "
 
 # %% [markdown]
 """
-### See the depth fix directly: residual-stream RMS at the output
+### What the `1/sqrt(2·n_layer)` residual scaling is actually for
 
-The `1/sqrt(2·n_layer)` claim, made falsifiable. Push one batch through a fresh model and
-read the RMS of the residual stream *right before the final norm* — with the residual-proj
-scaling on, and with it off (plain `0.02` on those two projections too). With the scaling
-the stream stays near the input scale; without it, the `2·N` additions pile up and it
-climbs — the same growth `06`'s pre-norm plot showed, now measured at init.
+So if the head can't see the stream, why scale the residual projections at all? Because it
+targets a *different* problem, one `ln_f` doesn't hide: the size of the residual stream
+*inside* the stack. Each Block adds `attn(...)` and `ffwd(...)`, so over `2·n_layer`
+additions the stream's variance accumulates (`06`'s lesson). GPT-2 shrinks each residual
+projection by `1/sqrt(2·n_layer)` to keep that growth flat — a *depth* stabilizer, not a
+logit fix, which is why only the two `RESIDUAL_PROJ`-tagged Linears get the factor.
+
+The demonstration is a **depth sweep**: build this exact model at growing depths, init it
+with and without the `1/sqrt(2·n_layer)` scaling, and read the residual RMS entering `ln_f`.
+With the scaling the stream is **pinned flat at every depth** (what the factor is calibrated
+to do); without it the `2·n_layer` additions pile up and the RMS **climbs like `sqrt(depth)`
+— a ~9× spread by depth 48**. That growth is exactly what the scaling cancels, and exactly
+why it's a *depth* concern our 4-layer toy barely feels. Yet through the whole sweep **both
+columns' init loss stays on `ln(vocab)`**: `ln_f` normalizes the stream away before the
+head, so none of this reaches the logits. The two jobs, cleanly separated:
 """
 
 
@@ -352,40 +399,117 @@ def resid_rms(model):
     return x.std().item()
 
 
-torch.manual_seed(0)
-scaled = apply_gpt2_init(GPT(vocab_size).to(DEV))               # residual proj scaled
+def build_init(n_layer, scale_resid):
+    """Fresh GPT at a given depth, 0.02 init, with/without the 1/sqrt(2N) residual scale."""
+    torch.manual_seed(0)
+    m = GPT(vocab_size, n_layer=n_layer).to(DEV)
+    for mod in m.modules():
+        if isinstance(mod, nn.Linear):
+            std = 0.02
+            if scale_resid and getattr(mod, "RESIDUAL_PROJ", False):
+                std *= (2 * n_layer) ** -0.5
+            nn.init.normal_(mod.weight, std=std)
+            if mod.bias is not None:
+                nn.init.zeros_(mod.bias)
+        elif isinstance(mod, nn.Embedding):
+            nn.init.normal_(mod.weight, std=0.02)
+    return m
 
-torch.manual_seed(0)
-unscaled = GPT(vocab_size).to(DEV)                              # same, but 0.02 everywhere
-for m in unscaled.modules():
-    if isinstance(m, nn.Linear):
-        nn.init.normal_(m.weight, std=0.02)                    # NO residual-proj scaling
-        if m.bias is not None:
-            nn.init.zeros_(m.bias)
-    elif isinstance(m, nn.Embedding):
-        nn.init.normal_(m.weight, std=0.02)
 
-print(f"residual-stream RMS, scaled proj (1/sqrt(2N)) : {resid_rms(scaled):.3f}")
-print(f"residual-stream RMS, plain 0.02 (no scaling)  : {resid_rms(unscaled):.3f}")
-print("  -> scaling holds the stream flat through depth; without it the 2N adds pile up.")
+print("             scaled 1/sqrt(2N)  |  plain 0.02 (no scale)")
+print(f"{'depth':>5} | {'resid RMS':>9} {'loss':>6} | {'resid RMS':>9} {'loss':>6}")
+print("-" * 45)
+for nl in [2, 4, 8, 16, 32, 48]:
+    ms, mu = build_init(nl, True), build_init(nl, False)
+    marker = "  <- our model" if nl == 4 else ""
+    print(f"{nl:>5} | {resid_rms(ms):>9.3f} {init_loss(ms):>6.3f} | "
+          f"{resid_rms(mu):>9.3f} {init_loss(mu):>6.3f}{marker}")
+print(f"\n(ln vocab = {ln_vocab:.3f}) scaled: RMS pinned ~0.05 at EVERY depth. unscaled: it")
+print("climbs ~sqrt(depth), a ~9x spread by depth 48 — the accumulation the scaling cancels.")
+print("Both columns' init loss stays on ln(vocab): ln_f hides the stream from the head.")
 
 # %% [markdown]
 """
-### Honest caveat: on *this* toy, good init doesn't lower the final loss
+### Why `sqrt(depth)`? The residual stream is a random walk
 
-Worth stating plainly, because the ablation at the end will show it. The two wins above —
-init loss on `ln(vocab)`, residual stream held flat — are real and *diagnostic*: they tell
-you the model is built correctly. But they do **not** translate into a lower loss on this
-4-layer, 3000-step run. If anything the `std=0.02` init is *deliberately tiny and safe*, so
-this small model, which has plenty of room to just grow its weights, trains a hair faster
-from PyTorch's larger default init and lands at the same place either way.
+Here's the piece that makes the sweep click. We measured two facts: each block *adds* its
+sublayer output to the stream (`x = x + delta`), and each delta is the **same size at every
+depth** — because the sublayer's input is `ln(x)` (unit scale, always) and its weights are
+init'd identically per block, so same-scale-in gives same-scale-out. So why doesn't the
+stream grow *linearly*, `2N` blocks × a constant step `δ`? Why `sqrt`?
 
-That is the correct lesson, not a disappointment: GPT-2 init is **stability insurance that
-pays off at depth and scale** — where PyTorch's defaults, with the residual stream growing
-unchecked over dozens of layers, genuinely fail to train — plus a *sanity check you run
-before every training job*. "Is my fresh model at `ln(vocab)`?" catches more real bugs
-(a mis-tied head, a forgotten scale) than any single number. It's in the recipe for the
-regime GPTs live in, and for the bug it catches — not to rescue this toy's third decimal.
+Because the deltas point in **random, mostly-different directions**, so they don't stack up
+— they partly cancel. The one-line reason is that **variances add, standard deviations
+don't**: for independent zero-mean vectors,
+
+    Var(a + b) = Var(a) + Var(b)        ->   RMS(a + b) = sqrt(RMS(a)^2 + RMS(b)^2)
+
+not `RMS(a) + RMS(b)`. Apply that to the stream, a sum of `2N` roughly-independent,
+equal-size steps:
+
+    Var(stream) ≈ Var(emb) + 2N · δ^2       ->   RMS(stream) ≈ sqrt(2N) · δ
+
+That's a **random walk** (the "drunkard's walk"): take `2N` steps of size `δ` in random
+directions and you drift `sqrt(2N)·δ` from the origin, not `2N·δ`. The steps never get
+bigger with depth — there are just *more* of them, and a longer random walk drifts as
+`sqrt(steps)`. That is the `sqrt(depth)` in the unscaled column.
+
+And it's exactly why `1/sqrt(2·n_layer)` is the cancelling fix: shrink every step by
+`1/sqrt(2N)` and the drift becomes `sqrt(2N) · δ/sqrt(2N) = δ` — the *same* distance no
+matter how many steps. Let's watch the steps stay flat while the walk accumulates, and
+confirm the `sqrt`-sum predicts the stream exactly:
+"""
+
+
+# %%
+@torch.no_grad()
+def block_deltas(model):
+    """Per-block sublayer output RMS (the random-walk 'step') and the running stream RMS.
+    Also accumulate Var(emb) + sum(step^2) — the predicted stream variance if the steps
+    were independent."""
+    xb, _ = get_batch("val")
+    x = model.tok_emb(xb) + model.pos_emb(torch.arange(xb.size(1), device=DEV))
+    rows, var_pred = [], x.var().item()               # start from the embedding variance
+    for blk in model.blocks:
+        da_out = blk.attn(blk.ln1(x)); da = da_out.std().item(); x = x + da_out
+        df_out = blk.ffwd(blk.ln2(x)); df = df_out.std().item(); x = x + df_out
+        var_pred += da ** 2 + df ** 2                  # variances add (independent steps)
+        rows.append((da, df, x.std().item()))
+    return rows, var_pred ** 0.5
+
+
+torch.manual_seed(0)
+rows, rms_pred = block_deltas(build_init(8, scale_resid=False))   # unscaled, 8 blocks
+print("unscaled, 8 blocks — each block adds a ~constant-size step:")
+print(f"{'blk':>3} | {'step_attn':>9} {'step_ff':>8} | {'stream RMS':>10}")
+for i, (da, df, s) in enumerate(rows):
+    print(f"{i:>3} | {da:>9.4f} {df:>8.4f} | {s:>10.3f}")
+print(f"\nsteps stay flat with depth; stream = sqrt(emb^2 + sum of steps^2) = {rms_pred:.3f}")
+print(f"  -> matches the measured {rows[-1][2]:.3f}: constant steps, sqrt(N) random-walk drift.")
+
+# %% [markdown]
+"""
+### So do we even need `apply_gpt2_init` here? Honestly, no.
+
+Worth stating plainly. On this 4-layer, 3000-step toy, neither half of the scheme earns its
+keep in the loss:
+
+- the `1/sqrt(2·n_layer)` residual scaling does nothing measurable — we just watched it
+  leave the init loss untouched, and the ablation at the end shows it costs ~0 in final
+  loss too;
+- even the `lm_head` fix, which *does* land the init loss on `ln(vocab)`, doesn't lower the
+  *final* loss — a small model recovers from PyTorch's larger default init inside a few
+  hundred steps. In fact pure PyTorch defaults train to the *same* place (the end ablation's
+  "init off" row confirms it, a hair lower if anything).
+
+So why is it in the recipe — and in this notebook? Two reasons a toy can't reward but that
+decide real runs. (1) The **`ln(vocab)` sanity check** is the cheapest bug-catcher you have:
+a fresh model that *doesn't* read `≈ ln(vocab)` has something wrong (a mis-tied head, a
+forgotten scale, an exploded embedding) — you want that signal on every job, and it's the
+`lm_head` scale that gives it. (2) The residual scaling is **stability insurance at depth**,
+where the accumulation we measured as "mild" turns destabilizing over dozens of layers.
+GPT-2 init is the init that *keeps working* as you scale up — not the one that wins a
+4-layer toy's third decimal.
 """
 
 # %% [markdown]
