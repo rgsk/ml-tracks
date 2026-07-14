@@ -196,19 +196,24 @@ class FeedForward(nn.Module):
 """
 ### See it: the MLP is position-wise, attention is not
 
-The claim that separates the two sublayers, made falsifiable. Take a batch, perturb
-**only the last position**, and re-run each module. If a module is position-wise, every
-*earlier* output is byte-for-byte unchanged — information cannot have crossed positions.
+The claim that separates the two sublayers, made falsifiable — with the *same* probe on
+both. Pick an interior position `i`, perturb **only** that row of the input, re-run each
+module, and ask *exactly which output rows moved*. Row `t` of a position-wise module
+depends on row `t` alone; a causal mixing module lets row `t` see every row `<= t`. So
+the precise set of moved rows is a fingerprint — and we check the whole set, not just
+that "something changed":
 
-- The **FeedForward** must pass: it never looks across the time axis, so touching row
-  `T-1` can't move rows `0..T-2`.
-- **Attention** must *fail* this exact test in the forward direction — mixing across
-  positions is its entire job. (It stays causal the *other* way: the last token can read
-  earlier ones, just not vice-versa. Here we perturb the last token and look at earlier
-  outputs, which attention leaves alone; so we perturb an *earlier* token instead to
-  show attention genuinely moves information forward.)
+- The **FeedForward** moves **only row `i`** — every other position, before *and* after,
+  is byte-for-byte identical. It never looks across the time axis.
+- **Attention** leaves rows `0..i-1` unchanged (the future can't leak backward — the
+  causal mask) but moves **every** row from `i` onward (they all attend to `i`). Both
+  halves of that pattern have to hold.
 
-Two modules, the same probe, opposite answers — that contrast *is* the division of
+That's why we perturb an *interior* `i`, not position 0 or the last token: only a middle
+index exposes all three facts at once — attention's untouched past, attention's fully
+moved future, and the MLP's single moved row.
+
+Two modules, the same probe, opposite fingerprints — that contrast *is* the division of
 labor.
 """
 
@@ -220,18 +225,31 @@ x = torch.randn(B, T, C)
 ff = FeedForward(C).eval()
 attn = CausalSelfAttention(C, n_head=4).eval()
 
-# perturb ONLY the last position
-x_last = x.clone()
-x_last[:, -1, :] = torch.randn(B, C)
-ff_pw = torch.allclose(ff(x)[:, :-1], ff(x_last)[:, :-1], atol=1e-6)
-print(f"FeedForward: perturbing pos T-1 leaves earlier outputs unchanged? {ff_pw}")
+# the SAME probe for both: perturb ONE interior row i, then ask which rows moved.
+i = T // 2
+x0 = x.clone()
+x0[:, i, :] = torch.randn(B, C)
+
+
+def moved_rows(module, x, x0, atol=1e-6):
+    """Per-position bool (T,): did output row t change when we perturbed the input?"""
+    a, b = module(x), module(x0)
+    return ~torch.isclose(a, b, atol=atol).all(dim=0).all(dim=-1)   # over B, then C
+
+others = torch.arange(T) != i
+
+# FeedForward: ONLY row i moves; every other row (before and after) is identical.
+ff_moved = moved_rows(ff, x, x0)
+ff_pw = ff_moved[i].item() and not ff_moved[others].any().item()
+print(f"FeedForward: only perturbed row {i} moved, all others identical? {ff_pw}")
 print("  -> position-wise: each token is transformed on its own.")
 
-# perturb an EARLY position; a later output must move (attention read it)
-x_early = x.clone()
-x_early[:, 0, :] = torch.randn(B, C)
-attn_moves = not torch.allclose(attn(x)[:, -1], attn(x_early)[:, -1], atol=1e-6)
-print(f"\nAttention: perturbing pos 0 changes the LAST output?          {attn_moves}")
+# Attention: rows < i stay put (causal past), rows >= i ALL move (they attend to i).
+attn_moved = moved_rows(attn, x, x0)
+past_frozen = not attn_moved[:i].any().item()
+future_moved = attn_moved[i:].all().item()
+print(f"\nAttention:   rows <{i} unchanged (causal)? {past_frozen}   "
+      f"rows >={i} all changed? {future_moved}")
 print("  -> cross-position: it mixes info forward. That's the half the MLP can't do.")
 
 # %% [markdown]
