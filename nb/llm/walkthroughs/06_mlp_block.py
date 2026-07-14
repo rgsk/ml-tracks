@@ -17,11 +17,11 @@
 # LLM · 06 — the MLP and the Block
 
 `05` ended on a deliberately honest scoreboard. A single attention head, and even four
-heads, cleared the bigram floor but **did not beat `04`'s concat** (1.84). The reason was
-stated, not yet fixed: **attention only mixes.** It moves information *between* tokens —
-a learned, causal, weighted average of the past — and then hands each position a single
-*linear* readout to the vocabulary. There is no place in that model for a token to
-**think on its own** once it has gathered its context.
+heads, cleared the bigram floor but **did not beat `04`'s concat** (1.84). The reason
+was stated, not yet fixed: **attention only mixes.** It moves information *between*
+tokens — a learned, causal, weighted average of the past — and then hands each position
+a single *linear* readout to the vocabulary. There is no place in that model for a token
+to **think on its own** once it has gathered its context.
 
 This notebook adds that missing half and then the wrapper that lets you stack it:
 
@@ -33,9 +33,10 @@ This notebook adds that missing half and then the wrapper that lets you stack it
 2. The **depth problem**, measured: naively stacking `attn → MLP` layers doesn't train —
    the forward signal and the backward gradient both fall apart with depth. We *see* it
    happen on real tensors.
-3. The two fixes that solve it, each measured: the **residual** (`x + sublayer(x)`) gives
-   the gradient a straight path through depth, and **pre-norm** (`LayerNorm` on each
-   sublayer's *input*) keeps every sublayer well-scaled no matter how tall the stack.
+3. The two fixes that solve it, each measured: the **residual** (`x + sublayer(x)`)
+   gives the gradient a straight path through depth, and **pre-norm** (`LayerNorm` on
+   each sublayer's *input*) keeps every sublayer well-scaled no matter how tall the
+   stack.
 4. Assemble the **Block** — `x = x + attn(ln1(x)); x = x + ffwd(ln2(x))` — stack four of
    them, and **recover `01`'s 1.594**. That's the whole core architecture, built.
 
@@ -108,11 +109,11 @@ print(f"corpus {len(text):,} chars, vocab {vocab_size}, block {BLOCK}")
 """
 ## The box `05` handed us: fused causal self-attention
 
-We build *on top of* attention, so here it is unchanged — the fused `CausalSelfAttention`
-`05` ended on (all heads in a couple of batched matmuls, validated against
-`F.scaled_dot_product_attention` to ~0). Nothing new; we just need it as a component.
-Read it as a black box that does one thing: **mix each token with a learned, causal
-weighted average of the tokens before it**, in and out at width `n_embd`.
+We build *on top of* attention, so here it is unchanged — the fused
+`CausalSelfAttention` `05` ended on (all heads in a couple of batched matmuls, validated
+against `F.scaled_dot_product_attention` to ~0). Nothing new; we just need it as a
+component. Read it as a black box that does one thing: **mix each token with a learned,
+causal weighted average of the tokens before it**, in and out at width `n_embd`.
 """
 
 
@@ -164,10 +165,10 @@ Three design choices, each with a reason:
   — actually lives. (In a real GPT the FeedForward holds ~2/3 of the parameters.)
 - **GELU**, not ReLU. A smooth gate — `x · Φ(x)` — that GPT-2 and most transformers use;
   the smoothness gives cleaner gradients than ReLU's hard corner.
-- **Position-wise.** No token index appears anywhere in it. Row `t` of the output depends
-  *only* on row `t` of the input — the exact opposite of attention, which is *all* about
-  cross-position interaction. Attention is the only place tokens talk; the MLP is where
-  each one thinks in private. We prove that next.
+- **Position-wise.** No token index appears anywhere in it. Row `t` of the output
+  depends *only* on row `t` of the input — the exact opposite of attention, which is
+  *all* about cross-position interaction. Attention is the only place tokens talk; the
+  MLP is where each one thinks in private. We prove that next.
 
 (A `Dropout` sits at the end for regularization; we set `dropout=0` here so the measured
 numbers are deterministic.)
@@ -204,8 +205,8 @@ The claim that separates the two sublayers, made falsifiable. Take a batch, pert
 - **Attention** must *fail* this exact test in the forward direction — mixing across
   positions is its entire job. (It stays causal the *other* way: the last token can read
   earlier ones, just not vice-versa. Here we perturb the last token and look at earlier
-  outputs, which attention leaves alone; so we perturb an *earlier* token instead to show
-  attention genuinely moves information forward.)
+  outputs, which attention leaves alone; so we perturb an *earlier* token instead to
+  show attention genuinely moves information forward.)
 
 Two modules, the same probe, opposite answers — that contrast *is* the division of
 labor.
@@ -237,22 +238,23 @@ print("  -> cross-position: it mixes info forward. That's the half the MLP can't
 """
 ## Does the MLP actually help? One attn+MLP layer vs `05`'s attention-only
 
-The direct test. Take `05`'s multi-head attention LM and insert one FeedForward after the
-attention — a *single* layer, `attn → MLP`, no residual or norm yet (one layer trains
-fine without them; we add those for *depth*, next). Train both — with and without the MLP
-— on the same loop and compare to `04`'s concat.
+The direct test. Take `05`'s multi-head attention LM and insert one FeedForward after
+the attention — a *single* layer, `attn → MLP`, no residual or norm yet (one layer
+trains fine without them; we add those for *depth*, next). Train both — with and without
+the MLP — on the same loop and compare to `04`'s concat.
 
 The prediction from the theory: attention alone gives a *linear* readout over a mixed
-vector; adding a nonlinear per-token transform should measurably lower the loss. But note
-the honest ceiling — *one* attn+MLP layer improves on attention-alone yet **still trails
-concat's 1.84**. A single mixing layer isn't enough compute; crossing concat is what
-**depth** buys, and that's the payoff waiting at the end of this notebook.
+vector; adding a nonlinear per-token transform should measurably lower the loss. But
+note the honest ceiling — *one* attn+MLP layer improves on attention-alone yet **still
+trails concat's 1.84**. A single mixing layer isn't enough compute; crossing concat is
+what **depth** buys, and that's the payoff waiting at the end of this notebook.
 """
 
 
 # %%
 class OneLayerLM(nn.Module):
-    """token+pos embed -> attention -> per-token MLP -> vocab. One layer, no residual."""
+    """token+pos embed -> attention -> per-token MLP -> vocab.
+    One layer, no residual."""
 
     def __init__(self, vocab_size, n_embd=64, n_head=4, mlp=True, block_size=BLOCK):
         super().__init__()
@@ -335,8 +337,8 @@ print(f"attention + MLP (1 layer)   : {attn_mlp_floor:.3f}   <- the MLP's contri
 """
 ## Now stack it — and watch depth break
 
-One `attn → MLP` layer is good; `01` used **four**. The naive way to go deeper is to just
-keep applying the pair: `x = mlp(attn(x))`, over and over. It doesn't work, and the
+One `attn → MLP` layer is good; `01` used **four**. The naive way to go deeper is to
+just keep applying the pair: `x = mlp(attn(x))`, over and over. It doesn't work, and the
 failure is worth *seeing* rather than being told, because the fix (residual + norm) only
 makes sense once you've watched the thing it fixes.
 
@@ -406,9 +408,9 @@ every factor is `(I + J)`: expand the product and one term is `I · I · … · 
 straight down the identity highway, no matter how many layers sit on top. That's the
 `residual=True` column above: `grad_norm` stopped collapsing.
 
-(This is exactly `05`'s `04`-shape lesson echoed structurally: the residual stream is the
-thing every sublayer reads from and writes back into, the same stream `01` carried from
-embedding to final norm.)
+(This is exactly `05`'s `04`-shape lesson echoed structurally: the residual stream is
+the thing every sublayer reads from and writes back into, the same stream `01` carried
+from embedding to final norm.)
 """
 
 # %% [markdown]
@@ -430,8 +432,8 @@ residual stream itself:
 always sees a unit-scale input regardless of how tall the stack is — while the raw
 residual stream `x` is left free to grow and carry information straight through
 (un-normalized) to the top. Crucially it's `x + sublayer(ln(x))`, **not** `ln(x +
-sublayer(x))`: the identity highway from Fix 1 must stay un-normalized, or we'd break the
-clean gradient path we just built. (Post-norm — LayerNorm *after* the add — is the
+sublayer(x))`: the identity highway from Fix 1 must stay un-normalized, or we'd break
+the clean gradient path we just built. (Post-norm — LayerNorm *after* the add — is the
 original 2017 Transformer; pre-norm is what GPT-2 onward use because it trains far more
 stably at depth.)
 
@@ -446,7 +448,8 @@ ln = nn.LayerNorm(C)
 x = torch.randn(1, 16, C)
 sub = lambda: nn.Sequential(nn.Linear(C, C), nn.GELU(), nn.Linear(C, C))
 
-print(f"{'depth':>6} | {'residual-stream RMS':>20} | {'RMS of ln(x) into sublayer':>28}")
+print(f"{'depth':>6} | {'residual-stream RMS':>20} | "
+      f"{'RMS of ln(x) into sublayer':>28}")
 print("-" * 62)
 h = x
 for depth in range(1, 33):
@@ -455,15 +458,16 @@ for depth in range(1, 33):
     if depth in (1, 2, 4, 8, 16, 32):
         print(f"{depth:>6} | {h.std().item():>20.3f} | {into.std().item():>28.3f}")
 
-print("\nstream grows with depth (info accumulates); the normed input stays ~1 (stable).")
+print("\nstream grows with depth (info accumulates); "
+      "the normed input stays ~1 (stable).")
 
 # %% [markdown]
 """
 ## Assemble the Block
 
 Both fixes, wrapped around the two sublayers, is the transformer **Block** — the unit
-`01` stacked four of. Attention (mix) and FeedForward (per-token compute), each in its own
-pre-norm residual:
+`01` stacked four of. Attention (mix) and FeedForward (per-token compute), each in its
+own pre-norm residual:
 
     x = x + attn(ln1(x))     # gather context, add the delta
     x = x + ffwd(ln2(x))     # think per-token, add the delta
@@ -475,7 +479,8 @@ tunes *how* it's trained or swaps one piece inside this exact shape.
 
 # %%
 class Block(nn.Module):
-    """One transformer layer: pre-norm residual attention, then pre-norm residual MLP."""
+    """One transformer layer: pre-norm residual attention, then pre-norm residual
+    MLP."""
 
     def __init__(self, n_embd, n_head, block_size=BLOCK, dropout=0.0):
         super().__init__()
@@ -495,10 +500,10 @@ class Block(nn.Module):
 ## Stack four Blocks → recover `01`'s 1.594
 
 Now the payoff. Token + position embedding → **four Blocks** → a final `LayerNorm` → the
-vocab head. This is `01`'s architecture exactly, at `01`'s size (`n_embd=128`, 4 heads, 4
-layers) — assembled from the pieces we built and understand. The `ln_f` before the head
-is the same idea one more time: normalize the residual stream once at the top before
-reading out logits.
+vocab head. This is `01`'s architecture exactly, at `01`'s size (`n_embd=128`, 4 heads,
+4 layers) — assembled from the pieces we built and understand. The `ln_f` before the
+head is the same idea one more time: normalize the residual stream once at the top
+before reading out logits.
 
 Trained on the same loop, it should land right around `01`'s **1.594** — the number that
 has sat at the bottom of the scoreboard since `05`, now reproduced from scratch. (It
@@ -556,20 +561,23 @@ The story in one column: each row changed *one* idea, and the loss moved.
 print(f"bigram         (03, CTX=1)         : 2.450   <- the floor")
 print(f"average        (04, uniform mix)   : 2.950   <- worse: no order, no focus")
 print(f"concat/Bengio  (04, rigid window)  : 1.840")
-print(f"attention only (06, 1 layer)       : {attn_only_floor:.3f}   <- mix, linear readout")
-print(f"attention+MLP  (06, 1 layer)       : {attn_mlp_floor:.3f}   <- + per-token compute")
-print(f"4-Block GPT    (06, this notebook) : {gpt_floor:.3f}   <- + depth (residual+prenorm)")
+print(f"attention only (06, 1 layer)       : {attn_only_floor:.3f}   "
+      "<- mix, linear readout")
+print(f"attention+MLP  (06, 1 layer)       : {attn_mlp_floor:.3f}   "
+      "<- + per-token compute")
+print(f"4-Block GPT    (06, this notebook) : {gpt_floor:.3f}   "
+      "<- + depth (residual+prenorm)")
 print(f"transformer    (01, reference)     : 1.594")
 
 # %% [markdown]
 """
 ## Read the babble
 
-Generate from the trained GPT. Compared to `05`'s single-layer output, real **words** and
-short phrases start to hold together — depth plus per-token MLPs is what lets the model
-assemble structure, not just echo character statistics. It's still a tiny char model on a
-few minutes of training, so don't expect sense; expect Shakespeare-shaped text with words
-that mostly exist.
+Generate from the trained GPT. Compared to `05`'s single-layer output, real **words**
+and short phrases start to hold together — depth plus per-token MLPs is what lets the
+model assemble structure, not just echo character statistics. It's still a tiny char
+model on a few minutes of training, so don't expect sense; expect Shakespeare-shaped
+text with words that mostly exist.
 """
 
 # %%
@@ -582,8 +590,8 @@ print(decode(gpt.generate(start, max_new_tokens=400)[0].tolist()))
 
 The core transformer is complete and reproduced from scratch:
 
-- the **FeedForward** is the per-token nonlinear compute attention lacks — position-wise,
-  4× wide, where most of the model's knowledge sits;
+- the **FeedForward** is the per-token nonlinear compute attention lacks —
+  position-wise, 4× wide, where most of the model's knowledge sits;
 - the **residual** (`x + sublayer(x)`) gives the gradient an identity highway through
   depth — we watched the vanishing gradient it cures;
 - **pre-norm** keeps every sublayer's input unit-scaled while the residual stream grows
@@ -592,9 +600,9 @@ The core transformer is complete and reproduced from scratch:
   Blocks reproduce `01`'s 1.594.
 
 There's nothing architectural left in the core model — `01`'s box is fully open. What's
-left is *how well you drive it*. `07` opens the `train()` call we've been reusing on faith
-since `03`: **AdamW** and decoupled weight decay, principled **weight init** (and the
-`≈ ln(vocab)` init-loss sanity check), **LR warmup + cosine decay**, and **gradient
-clipping** — each a knob you can turn off and watch the loss curve get worse. Same model,
-a better-driven training run, and a lower number.
+left is *how well you drive it*. `07` opens the `train()` call we've been reusing on
+faith since `03`: **AdamW** and decoupled weight decay, principled **weight init** (and
+the `≈ ln(vocab)` init-loss sanity check), **LR warmup + cosine decay**, and **gradient
+clipping** — each a knob you can turn off and watch the loss curve get worse. Same
+model, a better-driven training run, and a lower number.
 """
