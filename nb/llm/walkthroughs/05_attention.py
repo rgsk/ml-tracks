@@ -214,6 +214,125 @@ move that position signal *inside* attention; here it rides in on the embedding,
 unchanged from `03`.)
 """
 
+# %% [markdown]
+"""
+### See it: attention alone is position-blind
+
+Proof of that claim before we build on it. Strip attention to its **value-mixing** — the
+per-token `q/k/v` projections and `softmax(q·kᵀ) @ v`, with **no causal mask and no
+position** — and feed it a sequence `x` and a shuffled copy `x[perm]`. Permutation-
+equivariance means the two orders of operation agree exactly:
+
+    attend(x)[perm]  ==  attend(x[perm])
+
+Reorder the tokens and the outputs just reorder with them — each token's result is
+*unchanged*. The mechanism literally cannot tell where a token sits. (We drop the causal
+mask here on purpose: the mask is *itself* a position signal, so it — like `pos_emb` —
+injects order too. Dropping it isolates the pure content-based routing.)
+"""
+
+# %%
+torch.manual_seed(0)
+T, C = 5, 16
+proj_q = nn.Linear(C, C, bias=False)
+proj_k = nn.Linear(C, C, bias=False)
+proj_v = nn.Linear(C, C, bias=False)
+
+
+def attend_no_pos(x):
+    """Unmasked self-attention, no position added: the pure value-mixing operation."""
+    q, k, v = proj_q(x), proj_k(x), proj_v(x)
+    w = F.softmax(q @ k.transpose(-2, -1) * C ** -0.5, dim=-1)
+    return w @ v
+
+
+x = torch.randn(T, C)                        # T token vectors (embeddings, no pos)
+perm = torch.randperm(T)                     # a reordering of the T positions
+
+attend_then_perm = attend_no_pos(x)[perm]    # attend, THEN shuffle the outputs
+perm_then_attend = attend_no_pos(x[perm])    # shuffle the inputs, THEN attend
+
+print(f"permutation of positions : {perm.tolist()}")
+print(f"attend(x)[perm] == attend(x[perm]) ? "
+      f"{torch.allclose(attend_then_perm, perm_then_attend, atol=1e-6)}")
+print("-> reordering tokens only reorders the outputs; the values are unchanged.")
+print("   attention has no built-in sense of position — pos_emb (at the input) and")
+print("   the causal mask are what put order back in.")
+
+# %% [markdown]
+"""
+#### Why the matmul forces this
+
+Write "reorder the rows" as a permutation matrix `P` (`x[perm]` = `P @ x`). `P` is
+orthogonal, so `Pᵀ @ P = I` — remember that, it's the whole trick. Push `P @ x` through
+each step and track where the `P`s go:
+
+    1. per-row projections    q' = (Px)Wqᵀ = P(xWqᵀ) = P q     (same for k, v)
+    2. scores  S = q kᵀ       S' = (Pq)(Pk)ᵀ = P S Pᵀ
+    3. W = softmax(S)         W' = softmax(P S Pᵀ) = P W Pᵀ
+    4. out = W v              out' = (P W Pᵀ)(P v) = P W (PᵀP) v = P W v = P out
+
+- Projections pick up a **left** `P` because they act on the *feature* axis (right
+  index), which commutes with `P` on the *position* axis (left): `(Px)W = P(xW)`.
+- A score couples *two* positions, so `P` lands on **both** sides: `S'[i,j] = S[πi,πj]`.
+- Softmax is per-row and permutation-equivariant within a row, so it carries `P … Pᵀ`
+  straight through.
+- Keys and values share the same positions, so the weights' right `Pᵀ` meets `v`'s left
+  `P` and they **annihilate** (`PᵀP = I`). Only the query-side `P` survives → it
+  reorders the outputs, and nothing else moves.
+
+Strip the matrices and one row is `out[i] = Σ_j softmax_j(q_i·k_j) · v_j` — a **sum over
+the key/value axis `j`**, and a sum ignores term order. Each `v_j` is addressed by its
+content-derived weight, never by *which slot* it sits in; the only position that matters
+is `i`, which query you're computing. That set-aggregation over an unordered bag of
+(key, value) pairs is exactly why attention is order-blind until `pos_emb` is added.
+"""
+
+# %% [markdown]
+"""
+#### The same four lines, in code
+
+If the `P` algebra didn't land, watch it happen on real tensors. We reuse `x`, `perm`,
+and the `proj_*` from the demo, build the actual permutation matrix `P`, and check each
+numbered line prints `True`. `P @ z` reorders the rows of `z` exactly like `z[perm]` —
+that's all `P` is — and `Pᵀ @ P = I` is the identity that collapses step 4.
+"""
+
+# %%
+T, C = x.shape                               # reuse x, perm, proj_* from the demo above
+eq = lambda a, b: torch.allclose(a, b, atol=1e-6)
+
+# P is the perm as a matrix: row i has a single 1 in column perm[i]
+P = torch.zeros(T, T)
+P[torch.arange(T), perm] = 1.0
+print("P (permutation matrix):")
+print(P.int())
+print(f"x[perm] == P @ x ?  {eq(x[perm], P @ x)}   (P reorders rows)")
+print(f"Pᵀ @ P == I ?       {eq(P.T @ P, torch.eye(T))}   (the step-4 trick)")
+
+
+def parts(inp):
+    """Run attention, returning every intermediate so we can compare them."""
+    q, k, v = proj_q(inp), proj_k(inp), proj_v(inp)
+    S = q @ k.transpose(-2, -1) * C ** -0.5
+    W = F.softmax(S, dim=-1)
+    return q, S, W, W @ v
+
+
+q, S, W, out = parts(x)                       # on the original order
+qp, Sp, Wp, outp = parts(x[perm])             # on the shuffled order (x[perm] == P @ x)
+
+print(f"\n1. q'   == P q      {eq(qp, P @ q)}   (per-row proj -> left P)")
+print(f"2. S'   == P S Pᵀ   {eq(Sp, P @ S @ P.T)}   (two positions -> both sides)")
+print(f"3. W'   == P W Pᵀ   {eq(Wp, P @ W @ P.T)}   (softmax carries it)")
+print(f"4. out' == P out    {eq(outp, P @ out)}   (the payoff)")
+
+# step 4 spelled out: out' = W'v' = (P W Pᵀ)(P v) = P W (PᵀP) v = P W v
+step4 = (P @ W @ P.T) @ (P @ proj_v(x))       # = W' v', the real computation on x[perm]
+cancel = P @ W @ (P.T @ P) @ proj_v(x)        # insert PᵀP -> it is the identity
+print(f"\nout' = (PWPᵀ)(Pv) = PW(PᵀP)v = P(Wv):  {eq(step4, cancel)}")
+print("-> the inner PᵀP vanishes; only the query-side P remains -> outputs reorder.")
+
 
 # %%
 class AttnLM(nn.Module):
@@ -438,27 +557,34 @@ with `head_size`** — big `head_size` → large-magnitude scores. Push large va
 softmax and it **saturates**: nearly all mass collapses onto one position, the
 distribution goes one-hot, and its gradient (`p_i(δ - p_j)`) vanishes — the head can
 barely learn *where* to look. Dividing by `sqrt(head_size)` rescales the variance back
-to ~1. Let's just watch the numbers with the scale off vs on.
+to ~1. Let's watch it in the *actual* `Head.forward` layout: a query block `(T, hs)` and
+a key block `(T, hs)`, whose product `q @ k.T` is the full `(T, T)` score matrix. Every
+entry is a length-`hs` dot product, so the scores carry variance ~`hs` until we scale.
+Read one query's row (its scores over all `T` keys) through softmax, scale off vs on.
 """
 
 # %%
 torch.manual_seed(0)
-hs = 64
-q = torch.randn(2000, hs)
-k = torch.randn(2000, hs)
-raw = (q * k).sum(-1)                       # unscaled q·k, one per row
-scaled = raw * hs ** -0.5                   # the fix
+T, hs = 8, 64
+q = torch.randn(T, hs)                       # a query block, exactly as inside Head
+k = torch.randn(T, hs)                       # a key block
 
-# how peaky is the softmax over a row of scores, unscaled vs scaled? build one score
-# row against hs keys, then compare softmax with the scale off vs on.
-row = k[:hs] @ q[0]                          # hs raw scores q[0]·k[j], variance ~ hs
-peak_unscaled = F.softmax(row, dim=-1).max().item()
-peak_scaled = F.softmax(row * hs ** -0.5, dim=-1).max().item()
+scores = q @ k.transpose(-2, -1)             # (T, T): scores[i, j] = q[i] · k[j]
+scores_scaled = scores * hs ** -0.5          # the 1/sqrt(hs) fix
 
-print(f"var(q·k)  unscaled = {raw.var().item():6.2f}  (~ head_size = {hs})")
-print(f"var(q·k)  scaled   = {scaled.var().item():6.2f}  (~ 1)")
-print(f"\nsoftmax peak  unscaled ≈ {peak_unscaled:.3f}  (near one-hot -> tiny grad)")
-print(f"softmax peak  scaled   ≈ {peak_scaled:.3f}  (spread out -> learns freely)")
+print(f"scores shape {tuple(scores.shape)}  (T x T, one length-hs dot product each)")
+print(f"var(scores)  unscaled = {scores.var().item():6.2f}  (~ head_size = {hs})")
+print(f"var(scores)  scaled   = {scores_scaled.var().item():6.2f}  (~ 1)")
+
+# one query's row = its score distribution over all T keys; softmax it both ways
+i = 0
+w_unscaled = F.softmax(scores[i], dim=-1)
+w_scaled = F.softmax(scores_scaled[i], dim=-1)
+fmt = lambda w: "[" + " ".join(f"{v:.2f}" for v in w.tolist()) + "]"
+print(f"\nrow {i} softmax unscaled : {fmt(w_unscaled)}")
+print(f"  -> peak {w_unscaled.max().item():.3f}  (one key dominates -> near one-hot)")
+print(f"row {i} softmax scaled   : {fmt(w_scaled)}")
+print(f"  -> peak {w_scaled.max().item():.3f}  (spread over keys -> learns freely)")
 
 # %% [markdown]
 """
