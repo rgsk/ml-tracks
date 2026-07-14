@@ -592,15 +592,7 @@ of steps — taking a full-size step then, on a fresh model, can knock it into a
 it never recovers from. **Warmup** eases in: ramp the LR linearly from ~0 up to the peak
 over the first `warmup` steps. Then **cosine decay** glides from the peak down to a small
 floor along half a cosine — smoother than a step drop, and the slow finish lets the model
-settle into the minimum instead of bouncing around it. The shape every GPT uses:
-
-    lr
-  max ┤        .-''''-.
-      │      /          `-.
-      │    /                `-.
-  min ┤  /                      `--------
-      └──┬──────────┬──────────────────── step
-         0        warmup                max_steps
+settle into the minimum instead of bouncing around it.
 """
 
 
