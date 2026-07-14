@@ -21,6 +21,25 @@
       "group": { "kind": "build", "isDefault": true }
     },
     {
+      // Update the existing .ipynb from the sibling .py WITHOUT executing: writes the new
+      // inputs (code + markdown) while keeping the outputs already stored in the notebook.
+      // Use this for pure markdown/prose edits — instant, and last run's plots/prints stay.
+      // Requires the .ipynb to already exist (do a rebuild once if it doesn't).
+      "label": "jupytext: update current notebook (no execute)",
+      "type": "shell",
+      "command": "uv run jupytext --to ipynb --update \"${fileDirname}/${fileBasenameNoExtension}.py\"",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "silent",
+        "focus": false,
+        "panel": "shared",
+        "showReuseMessage": false,
+        "clear": true,
+        "close": true
+      }
+    },
+    {
       // Sync the .py <-> .ipynb pair for the file you're looking at (no execution).
       // Uses the sibling .py as source, so it works whether the .py OR the .ipynb is focused.
       "label": "jupytext: sync current notebook",
