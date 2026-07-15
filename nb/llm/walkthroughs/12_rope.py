@@ -16,7 +16,48 @@
 """
 # LLM · 12 — RoPE: position as rotation
 
-TODO intro — written last, once the numbers are in.
+Every model in this track has started its forward pass by **adding a learned vector for
+"you are at slot `t`"**. `12` deletes that line. **RoPE** (Su et al. 2021 — Llama,
+Mistral, Qwen, GPT-NeoX) instead **rotates** `q` and `k` inside attention by an angle
+proportional to their position, and the rotation is arranged so that the absolute
+positions **cancel** in the dot product: a score depends only on the *distance* between
+two tokens. Zero parameters, no table, no length cap.
+
+It's sold as **the change that unlocks long context**. That claim is what I set out to
+measure, and it did not survive contact.
+
+- **the famous benefit is the one that didn't show up.** No table means no length cap,
+  and that's true: our 64-token model *runs* at 256. It scores **3.46** there — against
+  **1.59** for the stupidest alternative available, sliding a 64-token window and
+  throwing the rest away. At position 192 its loss is **4.30**, and `ln(65) = 4.17`, so
+  it is doing *worse than an untrained model* — worse than `07`'s init-loss check.
+  "Runs at any length" and "works at any length" are unrelated claims, and the
+  distance between them is an entire research literature.
+- **the unadvertised benefit is the one that pays.** Give the absolute model the same
+  text 32 slots to the right and it gets **0.11 worse** and flips **17%** of its top-1
+  predictions — nothing changed but *where the text claims to sit*. That's **8x the
+  entire RoPE-vs-absolute loss gap**, thrown away on an irrelevance. RoPE's answer is
+  *identical to float rounding*: KL of 0.0000, not one prediction moved. Not because it
+  learned to be robust — because there's no expression in which absolute position
+  survives.
+- **which is the convolution trick, wearing a different hat.** An absolute table is to
+  RoPE what a fully-connected layer is to a **conv**: the conv shares weights across
+  translations, so a pattern learned in one place is known everywhere. RoPE shares
+  attention weights across translations for the same reason and the same payoff — fewer
+  parameters, a symmetry built in rather than learned. It wins the A/B by **0.0135**
+  with **1% fewer params**, every seed of it below every seed of the table.
+- **and the extension fixes are one vector, with a mechanism.** PI, NTK-aware and YaRN
+  look like three ideas and are three *shapes of the same per-plane divisor*. Measured
+  with no fine-tuning, **every one of them loses to the sliding window**, and **PI is
+  worse than doing nothing at all** — which sounds like noise until you notice the
+  ranking is exactly *how well each method protects the fast, short-wavelength planes*.
+  This model reads ~16 characters of context. Its whole signal is local. PI blurs the
+  local planes to rescue long-range ones it never uses.
+
+The honest summary: RoPE is a clear upgrade, and **not for the reason on the tin**. You
+adopt it for the symmetry and the deleted table. Long context is a *separate* problem
+that RoPE makes *addressable* rather than solved — `13`'s KV-cache and this notebook's
+last section are what you'd actually need.
 """
 
 # %%
@@ -107,7 +148,7 @@ badly", *cannot run*. This is the cheap complaint, and it's the one usually quot
 **It's absolute, and attention wants relative.** This is the real one. What matters for
 "this verb agrees with that subject" is that they are 3 apart — not that they sit at
 slots 40 and 43. An absolute table forces the model to learn every relative pattern
-*separately at every absolute location*, because slot 40 and slot 900 are unrelated rows.
+*separately at every absolute location*: slot 40 and slot 900 are unrelated rows.
 
 Let's price both.
 """
@@ -133,7 +174,7 @@ and just before the scores are computed it **rotates** the query and key vectors
 angle proportional to their position.
 
 Take one head vector of size `d` (= `head_size`, even). Pair its coordinates into `d/2`
-two-dimensional planes — coordinate `k` with coordinate `k + d/2`, the half-split pairing
+2D planes — coordinate `k` with coordinate `k + d/2`, the half-split pairing
 Llama and HF ship — and rotate plane `k` of the token at position `m` by the angle
 `m · theta_k`:
 
@@ -154,7 +195,7 @@ This is the one derivation to keep, and it's three lines. A rotation matrix `R(a
 R(a)^T = R(-a)                and         R(a) R(b) = R(a+b)
 ```
 
-So take the query at position `m` and the key at position `n`, and do what attention does
+Take the query at position `m` and the key at position `n`, and do what attention does
 — dot them:
 
 ```-
@@ -244,12 +285,12 @@ rotation moves a vector's **direction**, never its **magnitude**:
 # %%
 x_one = torch.randn(HS)
 print(f"||x|| = {x_one.norm():.4f}")
-print(f"\n{'position m':>11} | {'||rope(x, m)||':>15} | {'plane 0 = (out[0], out[16])'}")
+print(f"\n{'position m':>11} | {'||rope(x, m)||':>15} | plane 0 = (out[0], out[16])")
 print("-" * 62)
 for m in (0, 1, 2, 5, 50, 1000):
     r = rope_explicit(x_one.view(1, HS), torch.tensor([float(m)])).view(HS)
     print(f"{m:>11} | {r.norm():>15.4f} | ({r[0]:+.3f}, {r[HS // 2]:+.3f})")
-print("\nIdentical at every position, including 1000 — far outside anything we train on.")
+print("\nIdentical at every position, including 1000 — far beyond what we train on.")
 print("An ADDITIVE position embedding has no such guarantee: it moves the token vector")
 print("by whatever the table learned, and a position can in principle shout down the")
 print("token itself. RoPE cannot: position sets the angle, the token keeps its length.")
@@ -347,19 +388,19 @@ across the whole context: it can't resolve neighbours, but it does encode *rough
 you are* over long spans. Stack them and you get distance resolved at **every scale at
 once** — a positional ruler with both fine tick marks and long ones.
 
-Note the shape of it: it's a spectrum, and the two ends have opposite failure modes. That
+Note the shape: it's a spectrum, and the two ends have opposite failure modes. That
 tension is dormant until the extrapolation section, where it becomes the whole story.
 """
 
 # %%
 theta_full = rope_frequencies(HS)
 print(f"head_size d = {HS} -> {HS // 2} planes, base = 10000\n")
-print(f"{'plane k':>8} | {'theta_k':>12} | {'wavelength':>12} | {'turns in a 64-block':>20}")
+print(f"{'plane k':>8} | {'theta_k':>12} | {'wavelength':>12} | {'turns in 64':>13}")
 print("-" * 62)
 for k in [0, 1, 2, 4, 8, 12, HS // 2 - 1]:
     th = theta_full[k].item()
     wl = 2 * math.pi / th
-    print(f"{k:>8} | {th:>12.6f} | {wl:>12.1f} | {BLOCK / wl:>20.3f}")
+    print(f"{k:>8} | {th:>12.6f} | {wl:>12.1f} | {BLOCK / wl:>13.3f}")
 n_safe = int((theta_full * BLOCK / (2 * math.pi) >= 1).sum())
 print(f"\n{n_safe} of {HS // 2} planes complete at least one full turn inside our "
       f"{BLOCK}-token block.")
@@ -400,7 +441,7 @@ exactly three lines: build `cos`/`sin`, rotate `q`, rotate `k`.
 
 Two details that are easy to get wrong:
 
-- **`v` is not rotated.** Position should decide *who attends to whom* — that's the `q·k`
+- **`v` is not rotated.** Position decides *who attends to whom* — that's the `q·k`
   score. It shouldn't corrupt the *payload* being moved. Rotating `v` would mean the
   information a token contributes changes depending on where it stands.
 - **the mask is built on the fly.** `01`–`11` registered a `(block_size, block_size)`
@@ -430,6 +471,7 @@ class CausalSelfAttention(nn.Module):
         self.rope_base = rope_base
         self.freq_div = None      # set by the context-extension section, at eval time
         self.rope_temp = 1.0      # YaRN's attention temperature; 1.0 = off
+        self.rope_tables = None   # optional prebuilt (cos, sin); see "What it costs"
         # NOTE: no tril buffer -> no block_size baked into this module.
 
     def forward(self, x, pos_offset=0):
@@ -441,9 +483,12 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, nh, hs).transpose(1, 2)
 
         if self.rope:
-            cos, sin = build_rope_cache(T, hs, self.rope_base, offset=pos_offset,
-                                        freq_div=self.freq_div, device=x.device,
-                                        dtype=x.dtype)
+            if self.rope_tables is not None and pos_offset == 0:
+                cos, sin = self.rope_tables[0][:T], self.rope_tables[1][:T]
+            else:
+                cos, sin = build_rope_cache(T, hs, self.rope_base, offset=pos_offset,
+                                            freq_div=self.freq_div, device=x.device,
+                                            dtype=x.dtype)
             q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)   # v untouched
 
         scores = q @ k.transpose(-2, -1) * (hs ** -0.5 / self.rope_temp)
@@ -585,11 +630,13 @@ def full_val_loss(m, T=BLOCK, bs=128, pos_offset=0, max_windows=None):
 
 
 @torch.no_grad()
-def loss_by_position(m, T, bs=64, max_windows=384):
+def loss_by_position(m, T, bs=64, max_windows=4096):
     """Mean CE at EACH position 0..T-1, over non-overlapping val windows -> (T,).
 
     full_val_loss averages this curve; here we keep the shape, because past the
-    trained length the shape is the entire finding."""
+    trained length the shape is the entire finding. Every position is a mean over
+    `nwin` samples, so it stays visibly noisy — use the whole val split, and read
+    the trend, not the wiggle."""
     m.eval()
     nwin = min((len(val_data) - 1) // T, max_windows)
     x = val_data[:nwin * T].view(nwin, T)
@@ -610,7 +657,7 @@ SEEDS = (1337, 7, 42)
 
 
 def run_seeds(rope, seeds=SEEDS, keep=None):
-    """Train one model per seed; return final val losses. `keep` caches seed 0's model."""
+    """Train one model per seed; return val losses. `keep` caches seed 0's model."""
     out = []
     for s in seeds:
         torch.manual_seed(s)
@@ -626,7 +673,7 @@ def run_seeds(rope, seeds=SEEDS, keep=None):
 ## The A/B: 3 seeds each
 
 Same everything — `06`'s model, `07`'s recipe — one delta: learned absolute `pos_emb` vs
-rotated `q`/`k`. RoPE deletes the whole position table and adds no parameters of its own,
+rotated `q`/`k`. RoPE deletes the position table and adds no parameters of its own,
 so this is the rare upgrade that is also strictly smaller.
 """
 
@@ -660,14 +707,28 @@ print(f"params: {p_abs - p_rope:,} fewer ({(p_abs - p_rope) / p_abs:.1%}), and t
 """
 ### Reading the A/B
 
-TODO after the run.
+**RoPE wins, and the win is real but small.** ~0.013 of loss — under 1%. What makes it
+worth reporting rather than rounding away is that the seed ranges **don't overlap**:
+every RoPE seed beat every absolute seed, and the gap is a hair above the worst
+within-model seed spread. Call it a small real effect, not a dramatic one. `11`'s SwiGLU
+bought about 1.5x more.
+
+**And it's a rare direction for an upgrade — strictly less model.** RoPE deletes 8,192
+parameters (the whole table), adds none of its own, and scores better. Every other Phase
+B delta either held parameters fixed by construction (`11`'s `8C/3`) or shaved a few
+hundred (`09`'s `beta`). This one deletes 1% of the model and gains.
+
+So *why* does deleting a learned input feature help? The table isn't just costing
+parameters — it's costing the model the ability to **reuse what it learns**. That's a
+claim about a symmetry, not about capacity, and the loss column can't see it. The next
+section can.
 """
 
 # %% [markdown]
 """
 ## Shift-invariance: the property, on a trained model
 
-The loss numbers can't see the thing RoPE actually changed, so let's measure it directly.
+The loss numbers can't see what RoPE actually changed, so let's measure it directly.
 
 `pos_offset` translates the *entire* context: feed the same tokens, tell the model they
 live at positions `k..k+T-1` instead of `0..T-1`. Nothing about the text changed — only
@@ -695,7 +756,7 @@ def shifted_logits(m, offset):
     return m(xs_shift, pos_offset=offset)[0]
 
 
-print(f"the same 64 windows of {W_SHIFT} tokens, moved to a different absolute offset\n")
+print(f"the same 64 windows of {W_SHIFT} tokens, at a different absolute offset\n")
 print(f"{'model':<6} | {'offset':>6} | {'max |Δ logit|':>13} | "
       f"{'mean KL(p0 || p_off)':>20} | {'top-1 flipped':>13}")
 print("-" * 70)
@@ -720,7 +781,39 @@ for name, m in [("abs", abs_m), ("RoPE", rope_m)]:
 
 # %% [markdown]
 """
-TODO reading, after the run.
+### Reading it: this is the whole notebook in one table
+
+**RoPE's row is zeros.** KL of 0.0000 to four decimals, and **not one** of 2,048 top-1
+predictions moves, at any offset. The `max |Δ logit|` of ~2e-2 is float rounding and
+nothing more: TF32 matmuls don't return bit-identical results when you hand them
+differently-rotated inputs, so the last bits wobble. The *mathematics* is exact — the KL
+and the flip rate are what prove the wobble is noise rather than signal. Move the text a
+thousand tokens and it would still be zeros; there is no code path by which the model
+could find out.
+
+**The absolute model's row is a disaster, and I underrated it.** Same text, moved 32
+slots: **17% of its top-1 predictions change**, and it pays **0.11 of loss** — for
+nothing. Not a distortion of the text, not less context. The text is *identical*. It
+claims to start at index 32.
+
+Sit with the size of that. The entire RoPE-vs-table gap from the A/B was **0.0135**. The
+table model throws away **8x that much** on the mere question of *where the sentence
+starts*. Its knowledge of English is smeared across 64 slots and only partly shared
+between them; ask it about text at slots 32–63 and you get a *different, worse* model
+than the one that handles slots 0–31.
+
+**This is why the conv analogy is the right one.** A convolution and a fully-connected
+layer can both learn an edge detector. The conv learns it **once** and it works
+everywhere, because translation is built into the weight sharing; the FC layer must
+rediscover it independently at every location, from whatever fraction of the data
+happened to land there. That is *exactly* the relationship between RoPE and a position
+table, and it's why "delete 8,192 parameters, get a better model" isn't paradoxical.
+The parameters weren't buying capacity. They were buying **redundancy** — 64 slightly
+different copies of a job that has one right answer.
+
+The A/B says that redundancy costs ~0.013 of val loss at our size. This table says what
+it costs *structurally*, and the structural number is the one that scales: at 64 slots
+you can afford to relearn everything 64 times. At 128k you cannot.
 """
 
 # %% [markdown]
@@ -743,7 +836,8 @@ it. The curve is the model's context appetite.
 
 # %%
 lbp64 = {"abs": loss_by_position(abs_m, BLOCK), "RoPE": loss_by_position(rope_m, BLOCK)}
-print("mean val loss at each position inside the trained 64-token window\n")
+print("mean val loss at each position inside the trained 64-token window")
+print(f"(each row is a mean over {(len(val_data) - 1) // BLOCK:,} val windows)\n")
 print(f"{'position':>9} | {'abs':>7} | {'RoPE':>7}")
 print("-" * 29)
 for t in (0, 1, 2, 4, 8, 16, 31, 47, 63):
@@ -771,7 +865,35 @@ plt.show()
 
 # %% [markdown]
 """
-TODO reading, after the run.
+### The control changes what every later number means
+
+**The curve is flat by about position 9.** Loss falls off a cliff for the first few
+characters — 2.5 with nothing to go on, 1.87 by position 2, 1.69 by position 4 — and
+then it's **done**: by position 9 it's within 0.02 of the level it holds for the rest of
+the window. The sharpest way to say it is that **position 16 is already as good as
+position 63** — a hair better, in fact — with a quarter of the context. (Each point is
+one token per val window, so there's a few hundredths of scatter across positions. Read
+the plateau, not the wiggle.)
+
+This model reads **about 8–16 characters**. That's it — a 4-layer char model trained
+on 1MB of Shakespeare — it has learned spelling, common words, and the shape of a verse
+line, and none of that needs 64 characters of history.
+
+So the 64-token block was **already ~4x more than the model can use**, and 256 is
+16–32x. That reframes the entire second half before we run it:
+
+- **there is no upside available.** Extending to 256 cannot improve the prediction at
+  position 200: the information that would help is in the last ~16 characters and
+  the model already has those in a 64-window. Any long-context test on this model
+  measures **damage only**.
+- **so the sliding window is not a strawman — it's the ceiling.** Throwing away all but
+  the last 64 tokens discards nothing this model was ever going to use.
+
+Both remain true for real LLMs in the part of the ratio that matters: a model trained at
+8k reads *some* signal at 8k, so extending to 128k has real upside. But the shape of the
+question is the same, and so is the discipline. **Measure what your model uses before
+you pay to give it more.** A long-context benchmark that never checks whether the model
+uses the context is measuring its own optimism.
 """
 
 # %% [markdown]
@@ -817,7 +939,7 @@ print(f"mean loss BEYOND the trained length (64-255): {lbp256[BLOCK:].mean():.4f
 ### The honest baseline: just slide the window
 
 "RoPE at 256 is worse than at 64" isn't yet an indictment — we need the alternative. And
-the alternative is embarrassingly simple: at every position, **feed the model the last 64
+the alternative is embarrassingly simple: at every position, **feed it the last 64
 tokens** and throw the rest away. Any model can do this, including the absolute one.
 
 Note that the sliding curve needs no extra compute to know: for every position past 63,
@@ -856,7 +978,45 @@ plt.show()
 
 # %% [markdown]
 """
-TODO reading, after the run.
+### The pitch, audited
+
+**It doesn't degrade. It detonates.** Past the trained length the loss goes to ~3.5 on
+average and **4.30 at position 192** — and the number to hold that against is
+`ln(65) = 4.17`, the loss of a model that has never seen text and emits a uniform
+distribution over the vocabulary. `07` used exactly that constant as its init sanity
+check. **At position 192, our trained model is worse than its own initialization.** It
+isn't extrapolating badly; it has stopped being a language model.
+
+**And the shape of the collapse says it's the positions, not the length.** It's fine
+at 64, fine at 70, wobbling by 96, gone by 128. The text is the same Shakespeare
+throughout, and the model's job at position 192 — predict the next character from the
+previous ~16 — is *identical* to the job it does perfectly at position 32. Nothing about
+the task got harder. The only thing that changed is the *angles* the positions produce,
+and it was enough to destroy the model completely.
+
+**So the honest scoreboard on the famous benefit:**
+
+```-
+RoPE, full 256-token context     3.46     <- the feature
+RoPE, 64-token sliding window    1.59     <- ignoring the feature
+abs pos_emb, 64-token sliding    1.61     <- not having the feature
+```
+
+Using the thing RoPE is famous for is **~1.9 worse** than not using it, and the model
+that *cannot do it at all* lands within a hair of the best row. The table's hard
+cap — the headline complaint, the thing that raises `IndexError` — costs it **nothing
+here**, because the sliding window was always available and this model has nothing to
+gain from a longer context anyway.
+
+I want to be careful about what this does and doesn't show, because it would be easy to
+over-read. It is **not** "RoPE doesn't help long context" — real long-context models
+are RoPE models, and RoPE is what makes their length extension *possible*. What it shows
+is that **"no length cap" is a claim about the code, not about the model.** The table
+imposes its limit with an exception; RoPE imposes its limit by silently producing
+garbage. The limit did not go away. It stopped being enforced.
+
+That's the more dangerous failure of the two, and it's worth knowing which one you're
+shipping.
 """
 
 # %% [markdown]
@@ -882,14 +1042,15 @@ So the damage is entirely the **low-frequency** end. Here's the census for our h
 # %%
 twopi = 2 * math.pi
 wl = twopi / theta_full
-print(f"trained at L = {BLOCK}, evaluating at {T_LONG} (a {T_LONG // BLOCK}x extension)\n")
+print(f"trained at L={BLOCK}, evaluating at {T_LONG} ({T_LONG // BLOCK}x extension)\n")
 print(f"{'plane':>6} | {'wavelength':>11} | {'max angle @L':>13} | "
-      f"{'max angle @256':>15} | {'seen in training?'}")
+      f"{'max angle @256':>14} | {'seen in training?'}")
 print("-" * 74)
 for k in [0, 2, 4, 5, 6, 8, 12, 15]:
     th = theta_full[k].item()
     ok = "yes — full turn" if wl[k] <= BLOCK else "NO — unseen arc"
-    print(f"{k:>6} | {wl[k]:>11.1f} | {BLOCK * th:>13.3f} | {T_LONG * th:>15.3f} | {ok}")
+    print(f"{k:>6} | {wl[k]:>11.1f} | {BLOCK * th:>13.3f} | {T_LONG * th:>14.3f} | "
+          f"{ok}")
 print(f"\n{n_safe}/{HS // 2} planes are safe. {HS // 2 - n_safe}/{HS // 2} spend the "
       f"whole extension in angles the model never trained on.")
 print("That is the cliff. And it says the fix must be per-plane: leave the fast ones")
@@ -899,7 +1060,7 @@ print("alone, and do something about the slow ones.")
 """
 ## Every fix is the same knob
 
-Here's the tidy thing about the context-extension literature: PI, NTK-aware and YaRN look
+Here's the tidy thing about the context-extension literature: PI, NTK-aware and YaRN
 like three different ideas, and they are all **one line** — a per-plane divisor on the
 frequencies. That's the `freq_div` argument `build_rope_cache` has been carrying.
 
@@ -919,7 +1080,7 @@ Since the angle is `m·theta_k`, that's identical to dividing every frequency by
 div_k = s                       (flat — every plane, same squeeze)
 ```
 
-Max angle at the new length `L'` becomes `L'·theta_k/s = L·theta_k` — exactly the trained
+Max angle at the new length `L'` becomes `L'·theta_k/s = L·theta_k` — exactly the
 maximum, for every plane. Simple and it works, but the squeeze is **uniform**: the fast
 planes, which were fine, also get blurred by `s`. Adjacent tokens now differ by a `s`x
 smaller angle everywhere.
@@ -937,7 +1098,7 @@ which runs from `div_0 = 1` (plane 0 untouched — full local resolution kept) t
 spread through the community before it reached any paper.
 
 **YaRN** (Peng et al., Llama-3.1 / Qwen2). Stop ramping smoothly and make the
-safe/unsafe split from the census above **explicit**. Let `r_k = L / wavelength_k` be the
+safe/unsafe split from the census **explicit**. Let `r_k = L / wavelength_k` be the
 turns a plane completes in the training window:
 
 ```-
@@ -971,7 +1132,7 @@ def freq_divisor(method, s, head_size=HS, train_len=BLOCK, alpha=1.0, beta=8.0):
         return torch.tensor(float(s)) ** (idx / (head_size - 2))
     if method == "yarn":
         turns = train_len * rope_frequencies(head_size) / twopi      # r_k
-        gamma = ((turns - alpha) / (beta - alpha)).clamp(0, 1)       # 1=extrap, 0=interp
+        gamma = ((turns - alpha) / (beta - alpha)).clamp(0, 1)      # 1=extrap, 0=interp
         return s - gamma * (s - 1)
     raise ValueError(method)
 
@@ -1063,7 +1224,68 @@ plt.show()
 
 # %% [markdown]
 """
-TODO reading, after the run.
+### Reading it: everything loses, and the order is the lesson
+
+**Nothing clears the bar.** The best method here is YaRN at 2.33; sliding a 64-token
+window is 1.59. Every fix is **+0.74 or worse** against the do-nothing baseline. If you
+stopped reading at the scoreboard you'd conclude the whole literature is snake oil.
+
+Look at the order instead:
+
+```-
+PI              3.71     <- WORSE than doing nothing
+vanilla RoPE    3.46
+NTK-aware       2.59
+YaRN            2.33     <- best, still loses to the sliding window
+```
+
+**PI is worse than the broken thing it fixes.** That's the result I'd have called a bug
+before drawing the divisor plot. PI *does* what it promises — every plane's angles land
+back inside the trained arc, including the 11 slow planes that vanilla RoPE sends into
+unseen territory. It fixes the diagnosed problem and it makes the model *worse*.
+
+The divisor plot explains it, and the context control from earlier is the other half.
+**PI is the flat line**: it divides every plane by 4, including the 5 fast planes that
+were never broken. And those 5 fast planes are where this model's whole signal lives —
+it reads 16 characters, and 16-character distances are resolved by short-wavelength
+planes. So PI trades away the model's only working sense (fine local distance, now 4x
+blurrier) to rescue long-range planes it has no use for. Bad trade, measured.
+
+Now the ranking reads as one sentence: **it's how well each method protects the fast
+planes.**
+
+```-
+PI            blurs all 16 planes by 4x            worst
+vanilla       keeps all 5 fast planes perfect      breaks the 11 slow ones
+NTK           geometric ramp: plane 0 untouched    partial protection, partial fix
+YaRN          all 5 safe planes untouched, exactly rest interpolated -> best
+```
+
+YaRN wins because it's the only one that reads the census we printed and acts on it —
+extrapolate the planes that saw every angle, interpolate the ones that didn't, and don't
+compromise in the middle. That's the actual idea in the paper, and our tiny head
+reproduces its ordering exactly.
+
+**The temperature costs us 0.05.** YaRN's `t = 0.1·ln(s)+1` corrects the softmax
+sharpening you get from packing positions into a smaller arc — a real effect in a model
+attending over thousands of tokens with real long-range mass. Our model puts almost
+all its attention mass within 16 tokens, so there's little entropy shift to correct and
+the temperature is just a slightly wrong scale on the scores. It's tuned for a regime
+we're not in. (One model, no seeds — a deterministic difference for *this* model, not a
+verdict.)
+
+**The caveat that keeps this honest.** All three methods are meant to be used **with a
+short fine-tune**, on models that genuinely use their context. We applied them to a
+frozen model that reads 16 characters and asked them to work for free. That they lose
+to a sliding window here is a fact about **our model**, not about YaRN. What transfers
+the *mechanism* — the fast/slow split, why the methods differ only in `div_k`, and why
+protecting the planes carrying your signal beats fixing the planes that aren't.
+
+And there's a general lesson in PI's result that outlives the details: a fix that
+addresses the diagnosed problem can still lose, because **the diagnosis names what's
+broken, not what's load-bearing.** The slow planes were broken. The fast planes were
+carrying the model. Only one of those came from the census; the other came from the
+context control — a measurement I nearly didn't run.
 """
 
 # %% [markdown]
@@ -1071,9 +1293,17 @@ TODO reading, after the run.
 ## What it costs
 
 `09` and `11` both ended by measuring a cost the arithmetic said wouldn't be there, so
-let's keep the habit. RoPE adds two elementwise multiplies, a `cat` and an add per
-attention — plus `cos`/`sin` tables it rebuilds on every forward, in every block, because
-that's the simplest thing to write.
+let's keep the habit. RoPE adds no parameters and barely any FLOPs — two elementwise
+multiplies, a `cat` and an add per attention. It should be free.
+
+It is not free, and the reason is the one `09` taught: at this size nothing is bound by
+arithmetic. Those "barely any FLOPs" arrive as ~20 extra **kernel launches** per block,
+each a few microseconds of GPU idle, on a model whose entire step is ~3ms. Plus we
+rebuild the `cos`/`sin` tables on **every forward, in every block** — which is pure
+waste, since they depend only on `(T, head_size, base)`.
+
+So let's measure the naive version, then hoist the tables out (build once, slice to `T`,
+exactly what production does) and see how much of the bill was table-rebuilding.
 """
 
 # %%
@@ -1098,16 +1328,46 @@ def bench(m, T=BLOCK, iters=30):
 
 
 t_abs, t_rope = bench(abs_m), bench(rope_m)
+
+for b in rope_m.blocks:                  # hoist: build the tables once, then slice
+    b.attn.rope_tables = build_rope_cache(BLOCK, HS, b.attn.rope_base, device=DEV)
+t_cached = bench(rope_m)
+for b in rope_m.blocks:
+    b.attn.rope_tables = None           # put back; the rest of the notebook rebuilds
+
 print(f"batch {BATCH} x {BLOCK} tokens, fwd+bwd, median of 30\n")
-print(f"{'model':<22} | {'params':>9} | {'time':>8}")
-print("-" * 46)
-print(f"{'abs pos_emb':<22} | {p_abs:>9,} | {t_abs:>6.2f}ms")
-print(f"{'RoPE':<22} | {p_rope:>9,} | {t_rope:>6.2f}ms")
-print(f"\nRoPE is {t_rope / t_abs - 1:+.0%} wall-clock for {p_abs - p_rope:,} fewer "
-      f"params.")
-print("Rebuilding cos/sin per block per forward is most of that, and it's pure waste:")
-print("the tables depend on (T, head_size, base) only. Real implementations build them")
-print("once at init and slice. We'll want that anyway in `13`.")
+print(f"{'model':<26} | {'params':>9} | {'time':>8} | {'vs abs':>7}")
+print("-" * 60)
+print(f"{'abs pos_emb':<26} | {p_abs:>9,} | {t_abs:>6.2f}ms | {'—':>7}")
+print(f"{'RoPE, tables rebuilt':<26} | {p_rope:>9,} | {t_rope:>6.2f}ms | "
+      f"{t_rope / t_abs - 1:>+6.0%}")
+print(f"{'RoPE, tables prebuilt':<26} | {p_rope:>9,} | {t_cached:>6.2f}ms | "
+      f"{t_cached / t_abs - 1:>+6.0%}")
+print(f"\nhoisting cos/sin out of the forward: {t_rope - t_cached:.2f}ms of the "
+      f"{t_rope - t_abs:.2f}ms RoPE tax "
+      f"({(t_rope - t_cached) / (t_rope - t_abs):.0%} of it)")
+
+# %% [markdown]
+"""
+**I guessed wrong about where the time went.** I'd assumed the redundant table rebuild
+was *most* of the RoPE tax — it's rebuilt 4x per forward for no reason, it's obviously
+the silly part, so it must be the expensive part. Hoisting it out recovers **under
+half** of the tax. The rest is `apply_rope` itself: a multiply, a slice, a negate, a
+`cat` and an add, twice per block — none of which we can delete. They *are* the
+algorithm.
+
+So a model that is **1% smaller**, with **~0.1% more arithmetic**, costs roughly **a
+third more wall clock** — and ~20% even after the free win. `09`'s lesson lands a third
+time: at this size the GPU sits idle most of the step, so what you pay for is **the
+number of kernels you launch**, not the work inside them. Every op in `rotate_half` is a
+rounding error of FLOPs wrapped in a full launch of overhead.
+
+The fix isn't algorithmic, it's **fusion** — production RoPE is one kernel that reads
+`q`, applies the rotation, and writes it back, and at that point the cost genuinely does
+approach zero. Which is the same shape as `09`'s ending: our unfused RMSNorm looked 1.4x
+faster than LayerNorm, and torch's fused kernels were identical. Never conclude anything
+about cost from an unfused toy — including this one.
+"""
 
 # %% [markdown]
 """
@@ -1150,5 +1410,55 @@ print(decode(generate(rope_m, start, 500)[0].tolist()))
 """
 ## What you built, and where `13` goes next
 
-TODO — written last.
+The `pos_emb` line is gone from the model, and the reason it's gone is not the reason
+it's usually deleted:
+
+- **RoPE rotates `q`/`k` by `m·theta_k` per plane**, and orthogonality does the rest:
+  `<R(mθ)q, R(nθ)k> = q^T R((n−m)θ) k`. The absolute positions **cancel**, so a score
+  depends only on distance. Zero parameters, no table, and `v` is never rotated —
+  position decides *who attends to whom*, not *what gets moved*.
+- **`x·cos + rotate_half(x)·sin` is the whole implementation**, matching the explicit
+  per-plane 2x2 rotation to 2e-7, and it broadcasts over `(B, nh, T, hs)` for free.
+- **it wins the A/B by 0.0135 with 1% fewer parameters** — small, but every seed of it
+  below every seed of the table. A rare upgrade that is *strictly less model*.
+- **and the symmetry is why.** Translate the text 32 slots: the absolute model flips
+  **17%** of its top-1 predictions and pays **0.11** of loss; RoPE's output is identical
+  to float rounding (KL 0.0000, zero flips). That 0.11 is **8x the whole A/B gap** —
+  spent on an irrelevance. The table was buying 64 partly-shared copies of one job. It's
+  the **conv-vs-fully-connected trade**: share weights across translations and a pattern
+  learned once is known everywhere.
+- **"no length cap" is a claim about the code, not the model.** Ours runs at 256 and
+  scores **3.46** vs **1.59** for a 64-token sliding window; at position 192 it hits
+  **4.30**, worse than `ln(65) = 4.17` — worse than its own initialization. The absolute
+  table enforces its limit with an `IndexError`; RoPE enforces its limit by silently
+  emitting garbage. Only one of those tells you.
+- **the fast planes carry everything, and that decides the fixes.** `theta_k =
+  base^(-2k/d)` gives 5 of our 16 planes a full turn inside 64 tokens; the other 11
+  extrapolate into angles never trained on. PI/NTK/YaRN are **one per-plane divisor**
+  in three shapes, and measured with no fine-tune the ranking is exactly *how much each
+  protects the 5 fast planes*: **PI (blurs all of them) is worse than doing nothing**,
+  YaRN (protects them exactly) is best, and all of them lose to a sliding window on a
+  model that reads 16 characters.
+- **and it isn't free.** Roughly **a third more wall-clock** for a model that got
+  *smaller*, and hoisting the redundant `cos`/`sin` rebuild out of the forward recovers
+  under half of that — the rest is the rotation's own kernel launches. `09`'s lesson
+  again: at this size nothing is bound by arithmetic, it's bound by **launches**.
+
+The idea I'd keep is the control, not the mechanism. The context-usage curve took four
+lines and it silently decided the meaning of every number after it: with the model
+reading ~16 characters, "extend to 256" could only ever measure damage, the sliding
+window was the ceiling rather than a strawman, and PI's inexplicable last place became
+obvious. **Measure what your model uses before you pay to give it more** — the census
+told us which planes were *broken*, but only the control told us which were
+*load-bearing*, and the fixes were ranked by the second one.
+
+`13` picks up the thread this notebook left dangling twice. Generation still crops to
+`block_size` and re-runs the whole prefix through the model for **every single token** —
+recomputing keys and values for tokens that haven't changed since the last step. The
+**KV-cache** stores them instead, and it's the difference between quadratic and linear
+decoding. RoPE is what makes the cache honest: because each token's rotation is a
+function of its **absolute** position, a cached key keeps the rotation it was born with
+and never needs touching — which is exactly what the `offset` argument in
+`build_rope_cache` has been waiting for. That, and hoisting the `cos`/`sin` tables for
+good rather than rebuilding them every step.
 """

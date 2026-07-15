@@ -47,7 +47,7 @@ nb/llm/
     09_rmsnorm.py      ⇄ .ipynb   drop LayerNorm's centering — scale by RMS (simpler, same quality)
     10_activations.py  ⇄ .ipynb   why the FFN needs a nonlinearity at all; the zoo is one knob
     11_swiglu.py       ⇄ .ipynb   gate the feed-forward: the product, not the activation
-    12_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
+    12_rope.py         ⇄ .ipynb   rotary Q/K → scores depend on relative distance, not on the slot
     13_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
     14_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
     15_sft.py          ⇄ .ipynb   base → instruction-follower: continue training with loss masking
@@ -136,9 +136,17 @@ why Shazeer couldn't rank the GLU variants: the variant isn't what's working. Me
 product is **degree-2 homogeneous**, so unlike Swish it can never linearize, and `10`'s
 depth collapse disappears. Plus where the famous `8C/3` actually comes from.
 
-**`12` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
-score depends only on the *relative* distance between tokens — no length cap baked in. The change that
-unlocks longer context and cache-friendly generation.
+**`12` — RoPE.** Replace the learned absolute position table with **rotary** Q/K: rotate each vector
+by an angle set by its position, and the absolute positions **cancel** in `q·k`, so a score depends
+only on the *distance* between tokens. Zero params, no table, no length cap. The lesson is that the
+famous benefit is not the real one. **"No length cap" is a claim about the code, not the model** —
+ours *runs* at 4x its trained length and collapses past its own init loss there, losing to the
+dumbest baseline available (slide a window, throw the rest away). What actually pays is the
+unadvertised half: **exact shift-invariance**, which is the **conv's weight-sharing trick** applied to
+position — the table was buying 64 partly-shared copies of one job, and moving the text 32 slots costs
+it 8x the entire RoPE-vs-table gap. Ends on context extension (PI / NTK-aware / YaRN) as **three
+shapes of one per-plane divisor**, where PI lands *worse than doing nothing* and the ranking is
+exactly how well each protects the fast planes carrying the model's signal.
 
 **`13` — KV-cache.** During generation, don't recompute past keys/values every step — cache and reuse
 them. The core inference speedup; and why RoPE (`12`) makes a real sliding-window cache possible.
@@ -162,7 +170,8 @@ the trainable params, hot-swappable per task. The last *supervised* rung.
 ### Threads that recur (called out as they appear, not separate items)
 - **Attention cost**: the T×T score matrix is O(T²) — motivates the KV-cache, GQA, and FlashAttention.
 - **Normalization & residuals**: pre-norm + residual is what makes depth trainable; LayerNorm→RMSNorm.
-- **Position**: learned absolute → RoPE relative — the change that unlocks length extrapolation.
+- **Position**: learned absolute → RoPE relative — a *symmetry* (shift-invariance), not a free length
+  upgrade; extrapolation is a separate problem RoPE makes addressable rather than solves.
 - **Cross-tokenizer metric**: per-token loss isn't comparable across vocabs; normalize to **bits/byte**.
 - **What fine-tuning can and can't do**: SFT/LoRA reshape *behavior*; knowledge comes from pretraining.
 ```
