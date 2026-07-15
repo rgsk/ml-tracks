@@ -820,6 +820,149 @@ from, in the predicted direction. That's the claim the experiment supports, and 
 
 # %% [markdown]
 """
+## `beta` and the input scale are the same knob
+
+There's a loose end in everything above, and pulling it tightens the whole argument.
+We keep saying a gate is "sharp" or "soft" — but sharp *compared to what*? A gate that
+switches over a width of `1/beta` is a hard step for inputs spread over `±10` and a
+straight line for inputs spread over `±0.1`. So `beta` alone can't be the quantity that
+matters. And indeed it isn't — there's an exact identity hiding in `x·sigmoid(beta*x)`:
+
+```-
+swish_beta(s*x)  =  s*x · sigmoid(beta*s*x)
+                 =  s · [ x · sigmoid((beta*s)*x) ]
+                 =  s · swish_(beta*s)(x)
+```
+
+**Scaling the input by `s` IS multiplying `beta` by `s`** — the two are the same
+operation. (The leftover factor `s` on the outside is a scalar, and `09` proved the next
+`Linear` absorbs one of those for free.) So neither `beta` nor the pre-activation scale
+is separately meaningful. The only real quantity is the **product `beta*s`** — call it
+the *effective sharpness*.
+"""
+
+# %%
+xi = torch.randn(50_000) * 1.64                     # pre-activations at our scale
+print("identity check:  swish_beta(s*x) == s * swish_(beta*s)(x)")
+for s in (0.5, 2.0, 3.3):
+    for b in (1.0, 1.702):
+        lhs = Swish(b)(s * xi)
+        rhs = s * Swish(b * s)(xi)
+        print(f"  s={s:<4} beta={b:<6} -> max diff {(lhs - rhs).abs().max():.2e}")
+
+# %% [markdown]
+"""
+### The sweep was an effective-sharpness sweep all along
+
+That identity re-reads every number in this notebook. Our pre-activations sit at
+`s ≈ 1.64`, so the `beta` sweep was never measuring `beta` — it was measuring `beta*s`:
+"""
+
+# %%
+S_HERE = 1.64
+print(f"{'beta':>6} | {'beta*s (effective)':>18} | {'val loss':>9}")
+print("-" * 42)
+for b in BETAS:
+    v = sum(beta_res[b]) / len(beta_res[b])
+    tag = {1.0: "  <- SiLU", 1.702: "  <- ~GELU"}.get(b, "")
+    print(f"{b:>6} | {b * S_HERE:>18.2f} | {v:>9.4f}{tag}")
+best = min(BETAS, key=lambda b: sum(beta_res[b]) / len(beta_res[b]))
+print(f"\nbest effective sharpness here: beta*s = {best * S_HERE:.2f}")
+print(f"SiLU (beta=1) would hit that if the pre-activations sat at "
+      f"s = {best * S_HERE:.2f} instead of {S_HERE}.")
+
+# %% [markdown]
+"""
+So the honest statement of this notebook's surprise is **not** "SiLU is worse than
+GELU". It's:
+
+> `beta*s = 1.0 x 1.64 = 1.64` is too soft for this model. The loss wants
+> `beta*s ≈ 3-5`.
+
+Nothing about SiLU is defective — it's *mismatched to the scale our init and our
+LayerNorm happen to produce*. Give this model pre-activations at `s ≈ 3.3` and SiLU
+would sit exactly on the optimum, and GELU would be the one overshooting. That's the
+real content of the "Llama runs SiLU and is fine" caveat: at their scale, `beta=1` lands
+somewhere else on this curve.
+
+And note what the identity buys us: we get that conclusion **for free, without training
+anything**. "Re-run the sweep with the pre-activations doubled" sounds like a good
+experiment, but by the identity it is the *bit-identical computation* to the `beta`
+sweep we already ran — same graph, same numbers. It's a corollary, not an experiment.
+"""
+
+# %% [markdown]
+"""
+### A hypothesis, and its death
+
+Here's a tempting idea. If `beta*s` is what matters, and each block gets its own
+learnable `beta`, then maybe every block tunes itself to the *same* effective sharpness
+— the model's preferred operating point — and the varying `beta`s are just each block
+compensating for its own `s`.
+
+It's testable in one line: measure `s` and `beta` **in the same model** and multiply.
+(The same-model part is the whole test. Taking `s` from one run and `beta` from another
+would be comparing two different networks and calling it a pattern.)
+"""
+
+
+# %%
+@torch.no_grad()
+def preact_std_avg(m, batches=8):
+    """Per-block pre-activation std, averaged over several val batches. Hooks fire in
+    block order, so stats[i::n_blocks] are the readings for block i."""
+    stats, handles = [], []
+    for b in m.blocks:
+        handles.append(b.ffwd.fc.register_forward_hook(
+            lambda mod, i, o: stats.append(o.std().item())))
+    for _ in range(batches):
+        m(get_batch("val")[0])
+    for h in handles:
+        h.remove()
+    nb = len(m.blocks)
+    return [sum(stats[i::nb]) / len(stats[i::nb]) for i in range(nb)]
+
+
+learned.eval()
+s_learned = preact_std_avg(learned)              # same model the betas came from
+prods = [b * s for b, s in zip(betas, s_learned)]
+print(f"{'block':<6} | {'s (preact std)':>14} | {'learned beta':>12} | {'beta*s':>7}")
+print("-" * 50)
+for i, (s, b, p) in enumerate(zip(s_learned, betas, prods)):
+    print(f"{i:<6} | {s:>14.3f} | {b:>12.3f} | {p:>7.3f}")
+spread = lambda v: max(v) - min(v)
+print(f"\nbeta alone : spread {spread(betas):.3f}  (nearly constant across blocks)")
+print(f"beta*s     : spread {spread(prods):.3f}  (varies several-fold)")
+
+# %% [markdown]
+"""
+**The hypothesis is dead.** It's the opposite of what happens: `beta*s` is *not*
+constant — it falls steeply with depth — while **`beta` alone is nearly constant**. The
+blocks are not each tuning to a shared operating point. If anything, `beta` barely moves
+and `s` does all the varying.
+
+Two things worth taking from the wreckage.
+
+**First, the earlier "pattern" was an artifact, and this is why the same-model rule
+matters.** Multiply the per-block `beta`s by the *GELU probe's* `s` values (which grow
+with depth) and you get a suspiciously flat-looking product — a pattern assembled from
+two different networks. Measured inside one model, where `s` actually *falls* with
+depth, it evaporates. Same arithmetic, two sources, opposite conclusions.
+
+**Second, the deepest block runs its FFN nearly linear** — `beta*s ≈ 1`, down at the
+soft end of the sweep where we measured the loss to be *worst*. And the model chose that
+freely: `s` is set by `fc`'s learned weights, so any block could have scaled itself into
+the sharp regime. The last one declined. We measured what the optimum is *when every
+block shares one `beta`*; it does not follow that every block wants it, and this says
+they don't.
+
+Which is a good note to leave the notebook on. `beta*s` is the right quantity — that
+part is an identity and it's solid. "Every block wants the same `beta*s`" was a story,
+and the measurement refused it.
+"""
+
+# %% [markdown]
+"""
 ## What you built, and where `11` goes next
 
 The line `06` waved at is the line the FeedForward is built around:
@@ -842,6 +985,18 @@ The line `06` waved at is the line the FeedForward is built around:
   toward `~2` — into the region the sweep found better, which the model never saw. It
   beats the fixed SiLU it started from; it doesn't catch fixed GELU, because `beta`
   spent most of training still climbing.
+- **`beta` alone was never the real quantity.** `swish_beta(s*x) = s*swish_(beta*s)(x)`
+  is an exact identity, so scaling the input *is* scaling `beta` — only the product
+  `beta*s` means anything. The sweep was an effective-sharpness sweep in disguise, and
+  the honest form of the surprise is "`beta*s = 1.64` is too soft **here**", not "SiLU
+  is worse": at `s ≈ 3.3` SiLU would *be* the optimum. That follows from the identity
+  with no extra training — which is also why "re-run the sweep at double scale" isn't an
+  experiment, it's the same computation.
+- **and one story died on contact.** "Each block tunes `beta` to hit a shared `beta*s`"
+  is a lovely hypothesis; measured inside a single model it's false — `beta` is nearly
+  constant across blocks while `beta*s` falls several-fold with depth, and the deepest
+  block chooses to run its FFN nearly *linear*. The version that looked true came from
+  multiplying one model's `beta` by another model's `s`.
 - **two failures, two mechanisms.** Saturating activations (sigmoid, tanh) lose on
   *gradient flow* — sigmoid's derivative can't exceed `0.25`, so it divides the gradient
   by `4x` at every layer before saturation is even mentioned. SiLU loses to GELU on
