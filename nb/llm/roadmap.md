@@ -45,12 +45,13 @@ nb/llm/
     07_train_craft.py  ⇄ .ipynb   the training loop: AdamW, weight init, LR warmup+cosine, grad clip
     08_sampling.py     ⇄ .ipynb   turning logits into text: temperature, top-k, top-p, greedy
     09_rmsnorm.py      ⇄ .ipynb   drop LayerNorm's centering — scale by RMS (simpler, same quality)
-    10_swiglu.py       ⇄ .ipynb   a gated feed-forward that learns more per parameter
-    11_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
-    12_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
-    13_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
-    14_sft.py          ⇄ .ipynb   base → instruction-follower: continue training with loss masking
-    15_lora.py         ⇄ .ipynb   freeze the base, train tiny low-rank adapters (~1% of the params)
+    10_activations.py  ⇄ .ipynb   why the FFN needs a nonlinearity at all; the zoo is one knob
+    11_swiglu.py       ⇄ .ipynb   a gated feed-forward that learns more per parameter
+    12_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
+    13_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
+    14_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
+    15_sft.py          ⇄ .ipynb   base → instruction-follower: continue training with loss masking
+    16_lora.py         ⇄ .ipynb   freeze the base, train tiny low-rank adapters (~1% of the params)
   custom/                    <- from-scratch impls (softmax, cross_entropy, layer/rms-norm, attention);
                                 each runs standalone as a self-test, matched against torch to ~0
   model.py                   <- the cleaned-up GPT, assembled once we understand each piece
@@ -120,26 +121,32 @@ small measured upgrade on the model you built.
 **`09` — RMSNorm.** Drop LayerNorm's centering; just scale by root-mean-square. Simpler, one fewer
 param vector, same quality — and *why* the re-centering turned out not to matter.
 
-**`10` — SwiGLU.** Replace the Linear→GELU→Linear feed-forward with a **gated** variant (a second
+**`10` — activation functions.** The prior question `06` skipped: *why is there a nonlinearity in
+the FeedForward at all?* Two stacked Linears are one Linear, so without it the whole 4x hidden layer
+collapses to a single matrix — proved by fusion, then priced on the scoreboard. Then *which* one: the
+zoo (ReLU/GELU/SiLU/tanh/sigmoid) turns out to be **one knob**, `Swish(x) = x*sigmoid(beta*x)`, where
+beta dials from a straight line through SiLU and GELU to ReLU. Sets up `11`, which changes this line.
+
+**`11` — SwiGLU.** Replace the Linear→GELU→Linear feed-forward with a **gated** variant (a second
 branch multiplied element-wise) that learns more per parameter. Used by Llama/PaLM.
 
-**`11` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
+**`12` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
 score depends only on the *relative* distance between tokens — no length cap baked in. The change that
 unlocks longer context and cache-friendly generation.
 
-**`12` — KV-cache.** During generation, don't recompute past keys/values every step — cache and reuse
-them. The core inference speedup; and why RoPE (`11`) makes a real sliding-window cache possible.
+**`13` — KV-cache.** During generation, don't recompute past keys/values every step — cache and reuse
+them. The core inference speedup; and why RoPE (`12`) makes a real sliding-window cache possible.
 
-**`13` — GQA / MQA.** The KV-cache stores K/V for every head. Share them across **groups** of heads to
+**`14` — GQA / MQA.** The KV-cache stores K/V for every head. Share them across **groups** of heads to
 shrink the cache a lot with minimal quality loss — how long contexts get served cheaply.
 
 ## Phase C — base model → assistant (supervised)
 
-**`14` — SFT.** A base model only predicts next tokens; it doesn't *follow instructions*. Continue
+**`15` — SFT.** A base model only predicts next tokens; it doesn't *follow instructions*. Continue
 training on (instruction, good answer) pairs with **loss masking** — only the answer positions count.
 The first step from raw LM to assistant.
 
-**`15` — LoRA.** Freeze the base, train tiny low-rank **adapters** instead — same task quality, ~1% of
+**`16` — LoRA.** Freeze the base, train tiny low-rank **adapters** instead — same task quality, ~1% of
 the trainable params, hot-swappable per task. The last *supervised* rung.
 > Preference/RL alignment — reward modeling, PPO-RLHF, DPO, GRPO — is the **`nb/rl/` Phase 3** track,
 > which imports this model directly. That's the bridge; follow it there.

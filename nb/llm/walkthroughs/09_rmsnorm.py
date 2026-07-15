@@ -885,11 +885,16 @@ predicts nothing**. Measure, or you'll repeat a speedup that stopped being true 
 ago.
 
 That's also the Phase B pattern in miniature: a modern LLM is a GPT-2 with the fat
-trimmed off the parts that turned out not to be load-bearing. `10` does the same trick
-in the other direction — instead of deleting something, **SwiGLU** *adds* a branch. The
-FeedForward's `Linear → GELU → Linear` becomes a **gated** unit: a second parallel
-projection that multiplies the first element-wise, letting the layer choose what to let
-through per feature. Llama and PaLM both run it, it learns more per parameter — and the
-interesting part is why a *multiplication* buys something two matmuls and a nonlinearity
-can't.
+trimmed off the parts that turned out not to be load-bearing.
+
+The next delta goes the other way — instead of deleting a piece of the FeedForward,
+**SwiGLU** *adds* a branch to it. But we owe a debt before we can read that change. `06`
+built the FFN as `Linear → GELU → Linear` and justified the `4x` expansion and the
+position-wise property, while saying almost nothing about the GELU sitting in the middle;
+SwiGLU replaces exactly that. So `10` asks the prior question — **why is there a
+nonlinearity there at all?** — and the answer is not a detail: two stacked `Linear`s are
+one `Linear`, so without it the entire `4x` hidden layer collapses into a single matrix.
+Then *which* one, where the zoo (ReLU, GELU, SiLU, tanh, sigmoid) collapses into **one
+knob** and a surprise: SiLU, the activation Llama runs and the one inside SwiGLU, loses to
+plain GELU here. `11` then builds SwiGLU on top of that.
 """
