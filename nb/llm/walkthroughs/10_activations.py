@@ -33,7 +33,7 @@ activation and the FeedForward doesn't get *slightly worse* — it **stops exist
 stacked `Linear`s are one `Linear`:
 
     W2·(W1·x + b1) + b2 = (W2·W1)·x + (W2·b1 + b2)
-                           └─ one matrix ─┘  └─ one vector ─┘
+                          └─ W ─┘       └─ b ─┘
 
 so `C → 4C → C` without a nonlinearity collapses into a single `C → C` map. All 131,712
 parameters of the FFN express what 16,512 could. The `4x` expansion `06` was so careful
@@ -133,7 +133,7 @@ Start with the algebra, because everything else follows from it. A `Linear` comp
 linear2(linear1(x)) = W2·(W1·x + b1) + b2
                     = W2·W1·x + W2·b1 + b2
                     = (W2·W1)·x + (W2·b1 + b2)
-                      └── call it W ──┘ └─── call it b ───┘
+                      └─ W ─┘      └─── b ───┘
                     = W·x + b            <- a single Linear
 ```
 
@@ -520,20 +520,25 @@ fig.tight_layout(rect=[0, 0, 1, 0.95])
 plt.show()
 
 # %%
-# How much gradient actually survives? Two readings: the best case (max f'), and the
-# average case under the pre-activation distribution this model really produces —
-# roughly N(0, 1.64^2); we measure that std further down.
+# Backprop multiplies by f'(x) at every activation it crosses, so f' IS the gradient's
+# transmission factor. Two readings of it: the CEILING (the biggest f' ever gets), and
+# the TYPICAL value at the input scale this model really runs at — the pre-activation
+# std we measure further down, ~1.64.
+#
+# The .sum() is the standard elementwise-derivative trick: autograd needs a scalar, and
+# since output i depends only on input i, d(sum)/dx_i = f'(x_i) — one backward pass
+# returns f' at all 20,001 grid points at once.
 torch.manual_seed(0)
-real_scale = torch.randn(200_000) * 1.64
-print(f"{'activation':<18} | {'max f(x)':>8} | {'mean |f(x)| at our scale':>24}")
-print("-" * 58)
+real_scale = torch.randn(200_000) * 1.64          # the pre-activations this model sees
+ceiling, typical = "max f'(x)", "mean |f'(x)| at our scale"
+print(f"{'activation':<18} | {ceiling:>10} | {typical:>25}")
+print("-" * 60)
 for name, fn, _c in ACTS:
     xg = torch.linspace(-8, 8, 20001, requires_grad=True)
-    g, = torch.autograd.grad(fn(xg).sum(), xg)
+    g, = torch.autograd.grad(fn(xg).sum(), xg)             # f' on a dense grid
     xs = real_scale.clone().requires_grad_(True)
-    gs, = torch.autograd.grad(fn(xs).sum(), xs)
-    print(f"{name:<18} | {g.max():>8.3f} | {gs.abs().mean():>24.3f}")
-print("\n(columns are the derivative f', not f)")
+    gs, = torch.autograd.grad(fn(xs).sum(), xs)     # f' where the data actually is
+    print(f"{name:<18} | {g.max():>10.3f} | {gs.abs().mean():>25.3f}")
 
 # %% [markdown]
 """
