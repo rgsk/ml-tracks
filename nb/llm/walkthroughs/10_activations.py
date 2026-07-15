@@ -885,10 +885,142 @@ would sit exactly on the optimum, and GELU would be the one overshooting. That's
 real content of the "Llama runs SiLU and is fine" caveat: at their scale, `beta=1` lands
 somewhere else on this curve.
 
-And note what the identity buys us: we get that conclusion **for free, without training
-anything**. "Re-run the sweep with the pre-activations doubled" sounds like a good
-experiment, but by the identity it is the *bit-identical computation* to the `beta`
-sweep we already ran — same graph, same numbers. It's a corollary, not an experiment.
+And note what the identity buys us: that conclusion is **free**. "Re-run the sweep with
+the pre-activations scaled up" sounds like an experiment, but the identity says it's the
+*same computation* as the `beta` sweep we already ran — so its result is a corollary,
+not a discovery.
+
+Which leaves two things the algebra genuinely does **not** settle, and both are worth a
+training run:
+
+1. **Does the identity survive 3000 steps of AdamW?** It's an identity about a
+   *function*. Training is a different beast: the two forms have different float
+   rounding, and any drift compounds over 3000 steps. So "SiLU with big inputs" and
+   "`beta=3.3`" should land in the same place — but that's a claim about optimization,
+   not algebra, and it can be checked.
+2. **What if we scale the pre-activations for real — and *don't* compensate?** The
+   identity's tidy `s`-in/`s`-out cancellation is what makes it a tautology. Take away
+   the divide and it's a real intervention: the FFN's output gets bigger, the residual
+   stream changes, and the model is free to fight back by shrinking `fc`'s weights. Does
+   the scale stick, or does the network wash it out? Nothing above answers that.
+"""
+
+
+# %%
+class ScaledAct(nn.Module):
+    """Show the activation inputs at scale `s`, then undo the `s` on the way out. By the
+    identity this is EXACTLY 'the same gate at a different pre-activation scale', with
+    the FFN's output magnitude left alone."""
+
+    def __init__(self, act, scale):
+        super().__init__()
+        self.act, self.scale = act, scale
+
+    def forward(self, x):
+        return self.act(self.scale * x) / self.scale
+
+
+TWO = (1337, 7)                       # 2 seeds — these are checks, not the headline A/B
+plain_silu = run_seeds(lambda: Swish(1.0), seeds=TWO)
+beta_33 = run_seeds(lambda: Swish(3.3), seeds=TWO)
+silu_scaled = run_seeds(lambda: ScaledAct(Swish(1.0), 3.3), seeds=TWO)
+
+for label, v in [("SiLU, pre-acts as-is", plain_silu),
+                 ("beta=3.3 directly", beta_33),
+                 ("SiLU, pre-acts x3.3", silu_scaled)]:
+    print(f"  {label:<24}: " + "  ".join(f"{x:.4f}" for x in v)
+          + f"   mean {sum(v) / len(v):.4f}")
+gap = abs(sum(silu_scaled) / 2 - sum(beta_33) / 2)
+print(f"\nSiLU given the scale it wants lands on beta=3.3 (gap {gap:.4f})"
+      f" — the identity survives training.")
+print(f"And it stops losing: {sum(plain_silu) / 2:.4f} -> {sum(silu_scaled) / 2:.4f}, "
+      f"now level with GELU's {gelu_mean:.4f}.")
+
+# %% [markdown]
+"""
+**Question 1, answered: the identity holds through training**, to well inside seed noise
+— and there's the payoff in a single row. SiLU, handed pre-activations at `s ≈ 3.3`,
+goes from the worst of the three modern activations to level with GELU. Nothing about
+the function changed. We only changed the scale of the numbers we fed it.
+
+(The two runs aren't bit-identical, and shouldn't be: `swish_1(3.3x)/3.3` and
+`swish_3.3(x)` are the same mathematics in a different order of float operations, and
+3000 steps of AdamW amplify that into the third decimal. Same place, not the same bits.)
+"""
+
+
+# %%
+class GainedAct(nn.Module):
+    """Scale the activation's input by `gain` and DON'T undo it. Unlike ScaledAct this
+    is a real change to the network: the FFN's output magnitude moves too, and the model
+    must live with it — or fight it by shrinking fc."""
+
+    def __init__(self, act, gain):
+        super().__init__()
+        self.act, self.gain = act, gain
+
+    def forward(self, x):
+        return self.act(self.gain * x)
+
+
+@torch.no_grad()
+def preact_std_avg(m, batches=8):
+    """Per-block std of fc's output, averaged over several val batches. Hooks fire in
+    block order, so stats[i::n_blocks] are the readings for block i."""
+    stats, handles = [], []
+    for b in m.blocks:
+        handles.append(b.ffwd.fc.register_forward_hook(
+            lambda mod, i, o: stats.append(o.std().item())))
+    for _ in range(batches):
+        m(get_batch("val")[0])
+    for h in handles:
+        h.remove()
+    nb = len(m.blocks)
+    return [sum(stats[i::nb]) / len(stats[i::nb]) for i in range(nb)]
+
+
+print(f"{'fc gain':>8} | {'val loss':>9} | {'fc-out std per block':<26} | "
+      f"{'effective gain*std':<26}")
+print("-" * 80)
+for g in (1.0, 2.0, 3.3):
+    losses = run_seeds(lambda g=g: GainedAct(Swish(1.0), g), seeds=TWO)
+    torch.manual_seed(TWO[0])
+    m = train(GPT(vocab_size, lambda: GainedAct(Swish(1.0), g)).to(DEV))
+    m.eval()
+    stds = preact_std_avg(m)                     # fc's OWN output, before the gain
+    eff = [g * s for s in stds]
+    fmt = lambda v: "[" + " ".join(f"{x:.2f}" for x in v) + "]"
+    mean_l = sum(losses) / len(losses)
+    print(f"{g:>8} | {mean_l:>9.4f} | {fmt(stds):<26} | {fmt(eff):<26}")
+
+# %% [markdown]
+"""
+**Question 2, answered — and this one is a real result.** Three things happen at once,
+and they only make sense together:
+
+**The model fights back.** Look at `fc`'s own output std as the gain goes up: it
+*falls*. The network sees its pre-activations being inflated and responds by shrinking
+`fc`'s weights — exactly the compensation it's free to make, since `fc` is 65k learnable
+parameters and nothing pins its scale.
+
+**It loses the fight.** The shrinking is partial: the *effective* scale (`gain × std`)
+still climbs, from the ~2-and-collapsing profile at gain 1 up into the **3–5 band** —
+the band the sweep independently found was optimal. So the intervention sticks. And the
+loss follows it down, from SiLU's ~1.62 to ~1.57, without touching `beta`.
+
+**And look at the gain-1 row — that's the real diagnosis of SiLU.** Its effective scale
+per block reads roughly `[2.1, 2.1, 1.0, 0.3]`: the first two blocks are near the good
+band, and then it *collapses with depth*. By the last block the FFN is running at an
+effective sharpness of ~0.3, which is the far-left, near-linear end of the sweep — the
+regime we opened this notebook by proving is worthless. **SiLU doesn't lose because its
+curve is wrong; it loses because its deep blocks slide into the linear regime and it has
+no way to climb out.** Force them out with a gain and the deficit disappears.
+
+That also quietly answers "why doesn't the model just fix this itself?" It *can* —
+`fc`'s weights set `s`, and scaling `fc` up while scaling `proj` down would buy a
+sharper gate for free. It doesn't. Weight decay pulls against large `fc` weights, and
+the fix needs a coordinated move in two matrices at once, which gradient descent has no
+particular reason to find. The knob exists; the optimizer just doesn't turn it.
 """
 
 # %% [markdown]
@@ -907,22 +1039,6 @@ would be comparing two different networks and calling it a pattern.)
 
 
 # %%
-@torch.no_grad()
-def preact_std_avg(m, batches=8):
-    """Per-block pre-activation std, averaged over several val batches. Hooks fire in
-    block order, so stats[i::n_blocks] are the readings for block i."""
-    stats, handles = [], []
-    for b in m.blocks:
-        handles.append(b.ffwd.fc.register_forward_hook(
-            lambda mod, i, o: stats.append(o.std().item())))
-    for _ in range(batches):
-        m(get_batch("val")[0])
-    for h in handles:
-        h.remove()
-    nb = len(m.blocks)
-    return [sum(stats[i::nb]) / len(stats[i::nb]) for i in range(nb)]
-
-
 learned.eval()
 s_learned = preact_std_avg(learned)              # same model the betas came from
 prods = [b * s for b, s in zip(betas, s_learned)]
@@ -950,11 +1066,19 @@ two different networks. Measured inside one model, where `s` actually *falls* wi
 depth, it evaporates. Same arithmetic, two sources, opposite conclusions.
 
 **Second, the deepest block runs its FFN nearly linear** — `beta*s ≈ 1`, down at the
-soft end of the sweep where we measured the loss to be *worst*. And the model chose that
+soft end of the sweep where we measured the loss to be *worst*. And it chose that
 freely: `s` is set by `fc`'s learned weights, so any block could have scaled itself into
 the sharp regime. The last one declined. We measured what the optimum is *when every
 block shares one `beta`*; it does not follow that every block wants it, and this says
 they don't.
+
+That last point is the one to trust, because it showed up **twice, by different
+routes**. The gain experiment saw it without any learnable `beta` at all: plain SiLU's
+effective scale ran `[2.1, 2.1, 1.0, 0.3]`, collapsing with depth into the linear
+regime. Here a learnable `beta` finds the same shape. Two different models, two
+different mechanisms, same finding — **deep blocks drift toward a linear FFN unless
+something stops them**, which is a good deal more interesting than the tidy constant we
+went looking for.
 
 Which is a good note to leave the notebook on. `beta*s` is the right quantity — that
 part is an identity and it's solid. "Every block wants the same `beta*s`" was a story,
@@ -989,9 +1113,16 @@ The line `06` waved at is the line the FeedForward is built around:
   is an exact identity, so scaling the input *is* scaling `beta` — only the product
   `beta*s` means anything. The sweep was an effective-sharpness sweep in disguise, and
   the honest form of the surprise is "`beta*s = 1.64` is too soft **here**", not "SiLU
-  is worse": at `s ≈ 3.3` SiLU would *be* the optimum. That follows from the identity
-  with no extra training — which is also why "re-run the sweep at double scale" isn't an
-  experiment, it's the same computation.
+  is worse". Confirmed by training: hand SiLU pre-activations at `s ≈ 3.3` and it lands
+  on `beta=3.3` and draws level with GELU — same function, different input scale.
+- **and SiLU's real problem is depth, not shape.** Scaling `fc`'s output *without*
+  compensating is a genuine intervention, and it showed the diagnosis: plain SiLU's
+  effective scale runs `[2.1, 2.1, 1.0, 0.3]` — fine at first, then **collapsing into
+  the near-linear regime with depth**. The model fights the gain (it shrinks `fc`) but
+  loses, the effective scale climbs into the optimal 3–5 band, and the loss falls ~1.62
+  → ~1.57 without `beta` moving at all. It could have done this itself — `fc` sets `s` —
+  but weight decay and a two-matrix coordination problem mean the optimizer never turns
+  that knob.
 - **and one story died on contact.** "Each block tunes `beta` to hit a shared `beta*s`"
   is a lovely hypothesis; measured inside a single model it's false — `beta` is nearly
   constant across blocks while `beta*s` falls several-fold with depth, and the deepest
