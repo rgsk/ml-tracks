@@ -46,7 +46,7 @@ nb/llm/
     08_sampling.py     ⇄ .ipynb   turning logits into text: temperature, top-k, top-p, greedy
     09_rmsnorm.py      ⇄ .ipynb   drop LayerNorm's centering — scale by RMS (simpler, same quality)
     10_activations.py  ⇄ .ipynb   why the FFN needs a nonlinearity at all; the zoo is one knob
-    11_swiglu.py       ⇄ .ipynb   a gated feed-forward that learns more per parameter
+    11_swiglu.py       ⇄ .ipynb   gate the feed-forward: the product, not the activation
     12_rope.py         ⇄ .ipynb   rotary Q/K → attention depends on relative distance (longer context)
     13_kv_cache.py     ⇄ .ipynb   don't recompute past K/V each step — the core inference speedup
     14_gqa.py          ⇄ .ipynb   share K/V across head groups to shrink the KV-cache
@@ -127,8 +127,14 @@ collapses to a single matrix — proved by fusion, then priced on the scoreboard
 zoo (ReLU/GELU/SiLU/tanh/sigmoid) turns out to be **one knob**, `Swish(x) = x*sigmoid(beta*x)`, where
 beta dials from a straight line through SiLU and GELU to ReLU. Sets up `11`, which changes this line.
 
-**`11` — SwiGLU.** Replace the Linear→GELU→Linear feed-forward with a **gated** variant (a second
-branch multiplied element-wise) that learns more per parameter. Used by Llama/PaLM.
+**`11` — SwiGLU.** Give the gate its **own matrix**: `proj(up(x) ⊗ act(gate(x)))` — the
+feed-forward Llama/PaLM/Mistral run. The lesson isn't the name, it's that the **product** is
+now the nonlinearity, not the activation: delete the activation from a GLU and it *doesn't*
+collapse the way `10`'s FFN did, because `(Wx)(Vx)` is quadratic. So the experiment is a
+**2x2** (gate x activation) — either alone ties, both together wins — and that grid explains
+why Shazeer couldn't rank the GLU variants: the variant isn't what's working. Mechanism: a
+product is **degree-2 homogeneous**, so unlike Swish it can never linearize, and `10`'s
+depth collapse disappears. Plus where the famous `8C/3` actually comes from.
 
 **`12` — RoPE.** Replace the learned absolute position table with **rotary** Q/K so the attention
 score depends only on the *relative* distance between tokens — no length cap baked in. The change that
