@@ -219,8 +219,11 @@ def apply_gpt2_init(model):
     """07's Knob 1: N(0, 0.02), residual projections scaled by 1/sqrt(2*n_layer)."""
     for mod in model.modules():
         if isinstance(mod, nn.Linear):
-            std = 0.02 * ((2 * model.n_layer) ** -0.5
-                          if getattr(mod, "RESIDUAL_PROJ", False) else 1.0)
+            std = 0.02 * (
+                (2 * model.n_layer) ** -0.5
+                if getattr(mod, "RESIDUAL_PROJ", False)
+                else 1.0
+            )
             nn.init.normal_(mod.weight, std=std)
             if mod.bias is not None:
                 nn.init.zeros_(mod.bias)
