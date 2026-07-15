@@ -659,20 +659,35 @@ print(f"beta=100   vs ReLU        : max diff {g_relu:.4f}  <- a hard step = ReLU
 print(f"beta=0.001 vs the line x/2: max diff {g_lin:.4f}  <- no activation")
 
 # %%
-plt.figure(figsize=(6.8, 3.4))
-for b, style in [(0.01, ":"), (0.5, "-"), (1.0, "-"), (1.702, "-"), (5.0, "-"),
-                 (50.0, "--")]:
-    lbl = {0.01: "b→0: a line", 1.0: "b=1: SiLU", 1.702: "b=1.702: ≈GELU",
-           50.0: "b→∞: ReLU"}.get(b, f"b={b}")
-    plt.plot(xr, Swish(b)(xr), style, lw=1.6, label=lbl)
-plt.axhline(0, c="gray", lw=0.5)
-plt.axvline(0, c="gray", lw=0.5)
-plt.ylim(-1.5, 5)
-plt.xlabel("x")
-plt.ylabel("x * sigmoid(beta*x)")
-plt.title("one knob: from a straight line, through SiLU and GELU, to ReLU")
-plt.legend(fontsize=8)
-plt.tight_layout()
+# beta is an ORDERED magnitude, not five unrelated categories — so it gets one hue
+# stepped light→dark, and you read the knob turning as the curve darkens.
+FAMILY = [
+    (0.01, "#86b6ef", "beta→0: x/2, a straight line"),
+    (0.5, "#5598e7", "beta=0.5"),
+    (1.0, "#2a78d6", "beta=1: SiLU"),
+    (1.702, "#1c5cab", "beta=1.702: ≈GELU"),
+    (50.0, "#104281", "beta→∞: ReLU"),
+]
+xf = torch.linspace(-4, 3, 1401)          # zoomed to where the family actually differs
+fig, ax = plt.subplots(figsize=(8.4, 3.6))
+for b, color, label in FAMILY:
+    ax.plot(xf, Swish(b)(xf), color=color, lw=2, label=label, zorder=3)
+ax.axhline(0, color="#999", lw=0.5, zorder=0)
+ax.axvline(0, color="#999", lw=0.5, zorder=0)
+ax.grid(alpha=0.18, lw=0.5)
+ax.set_axisbelow(True)
+for side in ("top", "right"):
+    ax.spines[side].set_visible(False)
+ax.set_xlabel("x")
+ax.set_ylabel("x * sigmoid(beta*x)")
+ax.set_title("One knob: beta dials the gate from a straight line to ReLU",
+             fontsize=11, color="#222")
+# legend OUTSIDE the axes (it used to sit on the data), reversed so its order matches
+# the order the curves stack in at the right-hand edge
+handles, labels = ax.get_legend_handles_labels()
+ax.legend(handles[::-1], labels[::-1], fontsize=8.5, frameon=False,
+          loc="center left", bbox_to_anchor=(1.02, 0.5))
+fig.tight_layout()
 plt.show()
 
 # %% [markdown]
