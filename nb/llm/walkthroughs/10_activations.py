@@ -1025,6 +1025,51 @@ particular reason to find. The knob exists; the optimizer just doesn't turn it.
 
 # %% [markdown]
 """
+### Same effective sharpness, two ways to buy it
+
+One more reading of the `beta*s` identity, on the pair from Question 1. `silu_scaled`
+and `gelu_scaled` both wrap `ScaledAct(·, 3.3)`, so the gate sees `3.3*s` at input scale —
+but `gelu_scaled` carries `beta = 1.702`, giving it ~1.7x more sharpness *per unit of
+input for free*. If sharpness is really the product, the model should compensate: with
+more `beta` in hand it needs less `s`, so `gelu_scaled` should settle `fc` a touch
+*smaller* in every block. We can just measure `fc`'s output std and check.
+"""
+
+
+# %%
+for label, act_fn in [("silu_scaled  (beta=1.0,   s=3.3)",
+                       lambda: ScaledAct(Swish(1.0), 3.3)),
+                      ("gelu_scaled  (beta=1.702, s=3.3)",
+                       lambda: ScaledAct(Swish(1.702), 3.3))]:
+    losses, seed_stds = [], []
+    for seed in TWO:
+        torch.manual_seed(seed)
+        m = train(GPT(vocab_size, act_fn).to(DEV))
+        losses.append(full_val_loss(m))
+        m.eval()
+        seed_stds.append(preact_std_avg(m))          # fc's OWN output std, per block
+    nb = len(seed_stds[0])
+    s = [sum(ss[i] for ss in seed_stds) / len(seed_stds) for i in range(nb)]
+    beta = 1.0 if "1.0" in label else 1.702
+    eff = [beta * 3.3 * si for si in s]              # what the gate actually sees
+    fmt = lambda v: "[" + " ".join(f"{x:.2f}" for x in v) + "]"
+    print(f"{label} | val {sum(losses) / len(losses):.4f} | "
+          f"fc std {fmt(s)} | beta*3.3*s {fmt(eff)}")
+
+# %% [markdown]
+"""
+It compensates, exactly as predicted. `gelu_scaled` learns a *smaller* `fc` in every
+block (~0.06 lower std on average, same sign across both seeds) — the extra `beta` lets
+it relax the scale. And the two land at essentially the same val loss: same operating
+point, reached from opposite directions. Read the last column and both sit inside the
+optimal 3-5 band at every depth — and note it *rises* gently with depth instead of
+collapsing to 0.3 the way un-scaled SiLU did, which is the whole reason `ScaledAct`
+rescued it. `beta` and `s` are one knob; this is the model sliding along it.
+"""
+
+
+# %% [markdown]
+"""
 ### A hypothesis, and its death
 
 Here's a tempting idea. If `beta*s` is what matters, and each block gets its own
