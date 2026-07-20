@@ -147,6 +147,20 @@ x_t = √ᾱ_t·x_0  +  √(1-ᾱ_t)·ε        ε ~ N(0, I)      ← the one li
 
 One draw of noise, one level `t`, no loop. Let's confirm it's not just algebra — that the one-jump
 formula and the actual `t`-step chain produce the **same distribution**.
+
+To have something exact to check against, we start every run from the same pixel `x0 = 0.6` and read
+the mean/std straight off the closed form `x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε` (with `ε ~ N(0,1)`):
+
+```-
+mean(x_t) = √ᾱ_t·x0 + √(1-ᾱ_t)·mean(ε) = √ᾱ_t·x0     
+→ pred_mean = alpha_bar[t].sqrt() * 0.6
+std(x_t) = √(1-ᾱ_t)·std(ε)  = √(1-ᾱ_t)      
+→ pred_std  = (1 - alpha_bar[t]).sqrt()
+```
+
+The noise averages to 0 so it drops out of the mean; the constant `x0` adds no spread so it's absent
+from the std. Those `pred_*` are the analytic ground truth the iterative and closed-form runs below
+should match.
 """
 
 
@@ -168,10 +182,11 @@ def forward_closed_form(x0, t, alpha_bar):
 torch.manual_seed(0)
 N = 40000
 for t in (50, 200, 500):
-    x0 = torch.full((N,), 0.6)                       # same starting pixel, N independent noise runs
+    _x0 = 0.6
+    x0 = torch.full((N,), _x0)                       # same starting pixel, N independent noise runs
     xi = forward_iterative(x0, t, alphas, betas)     # step-by-step
     xc = forward_closed_form(x0, t, alpha_bar)        # one jump
-    pred_mean = alpha_bar[t].sqrt() * 0.6
+    pred_mean = alpha_bar[t].sqrt() * _x0
     pred_std = (1 - alpha_bar[t]).sqrt()
     print(f"  t={t:>3}  | iterative mean={xi.mean():+.3f} std={xi.std():.3f}"
           f"  | closed-form mean={xc.mean():+.3f} std={xc.std():.3f}"
