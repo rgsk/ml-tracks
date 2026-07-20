@@ -238,6 +238,50 @@ plt.tight_layout(); plt.show()
 
 # %% [markdown]
 """
+## The signal-to-noise ratio
+
+Those same two variances, taken as a **ratio** instead of a sum, are the **signal-to-noise ratio** —
+how much signal there is per unit of noise at level `t`. Same terms as the `Var(x_t)` line above,
+divided rather than added:
+
+```-
+SNR(t) = signal variance / noise variance
+       = (√ᾱ_t)²·Var(x0) / [(√(1-ᾱ_t))²·Var(ε)]
+       = ᾱ_t·1 / [(1-ᾱ_t)·1]
+       = ᾱ_t / (1-ᾱ_t)
+```
+
+Huge at `t=0` (almost all signal), `→ 0` as `t→T` (almost all noise) — the same story `√ᾱ` told,
+compressed into one number. We reuse it in `03`, where it turns out to be exactly the per-`t` weight
+relating the two training targets (predict the noise vs predict the image). Let's measure it and check
+it matches the closed form.
+"""
+
+# %%
+torch.manual_seed(0)
+x0 = torch.randn(50000)                               # unit-variance signal
+ts = torch.arange(0, T, 20)
+snr_measured, snr_formula = [], []
+for t in ts:
+    ab = alpha_bar[t]
+    signal = ab.sqrt() * x0                           # the √ᾱ·x0 part of x_t
+    noise = (1 - ab).sqrt() * torch.randn_like(x0)    # the √(1-ᾱ)·ε part of x_t
+    snr_measured.append((signal.var() / noise.var()).item())
+    snr_formula.append((ab / (1 - ab)).item())
+
+for t in (0, 100, 250, 500, 750, 999):
+    ab = alpha_bar[t]
+    print(f"  t={t:>4}: SNR = ᾱ/(1-ᾱ) = {(ab / (1 - ab)):9.3f}")
+
+plt.figure(figsize=(6.5, 3.4))
+plt.semilogy(ts.numpy(), snr_formula, label="ᾱ_t / (1-ᾱ_t)  (closed form)")
+plt.semilogy(ts.numpy(), snr_measured, "o", ms=3, label="measured  Var(signal)/Var(noise)")
+plt.xlabel("t"); plt.ylabel("SNR (log)"); plt.legend(); plt.title("signal-to-noise ratio across t")
+plt.tight_layout(); plt.show()
+print("  all signal at t=0, ~0 by t=T — reused in 03 as the weight that relates the two targets.")
+
+# %% [markdown]
+"""
 ## The endpoint — and why sampling starts from noise
 
 As `t → T`, `ᾱ_t → 0`, so the closed form becomes
