@@ -54,7 +54,16 @@ The chain matters, because "loss ≈ 1" and "outputs ≈ 0" are **not** the same
 constant prediction `c` against `ε ~ N(0,1)`:
 
 ```
-  loss(c) = E[(c − ε)²] = (c − E[ε])² + Var(ε) = c² + 1
+  loss(c) = E[(c − ε)²] = E[c² − 2cε + ε²]
+                        = c² − 2c·E[ε] + E[ε²]              (linearity; c is constant)
+
+  now use  E[ε²] = Var(ε) + (E[ε])²  :
+
+                        = c² − 2c·E[ε] + (E[ε])² + Var(ε)
+                        = (c − E[ε])²  +  Var(ε)            (first three terms = a perfect square)
+                          └── bias² ──┘   └ irreducible ┘
+
+  with ε ~ N(0,1):  E[ε] = 0,  Var(ε) = 1   →   loss(c) = c² + 1
 ```
 
 so `c = 0` scores exactly `1` (the floor), `c = 1` (all ones) scores `2`, etc. **Only predicting the

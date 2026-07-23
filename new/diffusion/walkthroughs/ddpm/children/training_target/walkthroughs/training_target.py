@@ -260,7 +260,7 @@ def exp_2_why_one(seed=0, n=8192):
     i_min = int(torch.argmin(losses))
     print("  predict a CONSTANT c for every pixel, measure MSE(c, ε):")
     print("      c      MSE(c,ε)   (c-μ)²+σ²")
-    for c, m, p in list(zip(cs, losses, parabola))[::8]:           # every 8th row
+    for c, m, p in list(zip(cs, losses, parabola))[::5]:           # every 5th row (hits c=0, the min)
         mark = "  <- min" if abs(c.item() - cs[i_min].item()) < 1e-6 else ""
         print(f"    {c.item():+.2f}    {m.item():.4f}     {p.item():.4f}{mark}")
     print(f"    best constant c* = {cs[i_min].item():+.2f}  (= mean ε)   loss there = {losses[i_min].item():.4f}  (= var ε = the floor)\n")
@@ -583,10 +583,10 @@ def exp_5_per_t_difficulty(seed=0, T=1000, epochs=6, batch_size=256, lr=2e-4, ea
 
 def run_experiments():
     # exp_1_whole_game()
-    # exp_2_why_one()
+    exp_2_why_one()
     # exp_3_eps_or_x0()
     # exp_4_why_eps()
-    exp_5_per_t_difficulty()
+    # exp_5_per_t_difficulty()
 
 
 if __name__ == "__main__":

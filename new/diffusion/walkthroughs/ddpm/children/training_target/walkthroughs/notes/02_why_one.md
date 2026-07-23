@@ -36,8 +36,9 @@ Sweep the constant `c` and measure `MSE(c, ε)` on a big pile of `ε`; it lands 
 ```
     c      MSE(c,ε)   (c-μ)²+σ²
   -1.00    1.9998     1.9998
-  -0.20    1.0396     1.0396
-  +0.20    1.0395     1.0395
+  -0.50    1.2497     1.2497
+  -0.00    0.9996     0.9996  <- min
+  +0.50    1.2495     1.2495
   +1.00    1.9994     1.9994
   best constant c* = -0.00 (= mean ε)   loss = 0.9996 (= var ε = the floor)
 ```
