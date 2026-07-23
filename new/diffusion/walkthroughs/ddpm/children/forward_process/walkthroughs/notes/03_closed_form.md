@@ -128,6 +128,15 @@ directly instead and the variance would be `ᾱ²+(1-ᾱ)²` — still 1 at the 
   999 | 0.0000 |    1.01      |    1.01
 ```
 
+The same two columns over the whole schedule — the √ choice flat at 1, the naive choice caving in:
+
+![√ coefficients keep Var(x_t)=1; using ᾱ,(1-ᾱ) as amplitudes sags to 0.5 mid-schedule](../figures/experiments/03_closed_form.png)
+
+The blue line is dead flat at `1`. The orange one bottoms out at exactly `0.5` around `t≈250` —
+precisely where `ᾱ ≈ 0.5`, so `ᾱ²+(1-ᾱ)² = 0.25+0.25`. It only recovers to `1` at the ends because
+one term dominates there. So `x_t` under the naive coefficients would *shrink* mid-schedule and the
+network would see inconsistent input scales across `t`; the √ is what removes that wobble.
+
 With the √, the squares are exactly `ᾱ` and `1-ᾱ`, which sum to 1 at **every** `t` — no wobble;
 `x_t` just **trades signal for noise** as `t` climbs. (This is called a *variance-preserving*
 process; it's also why `x_T` sits at a clean unit-variance `N(0,I)` — the next box.)

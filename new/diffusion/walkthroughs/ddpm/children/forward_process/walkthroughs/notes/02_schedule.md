@@ -70,6 +70,21 @@ lives in `x_t` — the exact numbers behind the fade in [01_dissolve.md](01_diss
 
 ---
 
+## See the compounding
+
+The table's takeaway in one picture — the whole `t=0…T` schedule at once:
+
+![linear schedule: per-step quantities barely move, yet the cumulative ᾱ collapses](../figures/experiments/02_schedule.png)
+
+**Left (per-step):** `β_t` hugs `0` and `α_t = 1-β_t` hugs `1` for the *entire* schedule — one step
+never does much. **Right (cumulative):** `ᾱ_t`, the *product* of those thousand near-1 factors, still
+plunges from `1` to `~0`, crossing `0.5` around `t≈250` and basically flatlining by `t≈600`. The
+dashed `√ᾱ_t` is the signal amplitude that actually scales the digit in `x_t` — it decays more gently
+(a square root of the blue curve), which is why the digit stays faintly legible a bit past where `ᾱ`
+itself has crashed. Nothing dramatic happens per step; the collapse is *entirely* the compounding.
+
+---
+
 ## What's next
 
 | next | opens | the question |

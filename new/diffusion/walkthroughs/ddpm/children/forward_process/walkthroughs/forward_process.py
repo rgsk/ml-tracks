@@ -178,6 +178,28 @@ def exp_2_schedule():
     print("  has already collapsed to ~0.08 — the tiny per-step losses COMPOUND over 500")
     print("  multiplications. So 'signal √ᾱ' shrinks 1 -> 0 and 'noise √(1-ᾱ)' grows 0 -> 1 as t")
     print("  rises — exactly the fade you saw in exp_1's grid. ᾱ_t is the single dial for that mix.")
+
+    # SEE the compounding: per-step quantities barely leave 1.0, yet their cumulative PRODUCT ᾱ
+    # decays to ~0. Left panel = per-step (β_t, α_t); right panel = cumulative (ᾱ_t and the signal
+    # amplitude √ᾱ_t that actually scales the digit in x_t).
+    import matplotlib
+    matplotlib.use("Agg")                                          # headless: save, don't show
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(1, 2, figsize=(11, 3.4))
+    ax[0].plot(betas.numpy(), label="β_t (noise added per step)")
+    ax[0].plot(alphas.numpy(), label="α_t = 1-β_t (signal kept per step)")
+    ax[0].set_title("per-step (barely leaves 1.0)"); ax[0].set_xlabel("t"); ax[0].legend()
+    ax[1].plot(alpha_bars.numpy(), label="ᾱ_t (signal kept after t steps)")
+    ax[1].plot(alpha_bars.sqrt().numpy(), "--", label="√ᾱ_t (signal amplitude in x_t)")
+    ax[1].set_title("cumulative — the compounding decay to ~0"); ax[1].set_xlabel("t"); ax[1].legend()
+    fig.suptitle("linear schedule: tiny per-step nibbles (left) COMPOUND into ᾱ's collapse (right)",
+                 fontsize=11)
+    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "02_schedule.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"\n  wrote {out} — left: β_t/α_t hug their limits; right: ᾱ_t (the product) still crashes to 0.")
     print("  Next (exp_3): prove that dialing with ᾱ == adding noise step-by-step, and why the √.")
 
 
@@ -288,6 +310,27 @@ def exp_3_closed_form(seed=0, T=1000):
     print("\n      Var pinned at ~1: THAT is why it's √ and not, say, ᾱ and (1-ᾱ) directly — the")
     print("      squares are what must sum to 1, so the amplitudes are their square roots. No")
     print("      blow-up, no fade — x_t just trades signal for noise as t grows.")
+
+    # SEE (B): the √ coefficients keep Var(x_t) flat at 1 for every t; using ᾱ and (1-ᾱ) as the
+    # amplitudes DIRECTLY makes Var = ᾱ²+(1-ᾱ)², which sags to 0.5 mid-schedule (x_t would fade).
+    ts = torch.arange(T)
+    ab_all = alpha_bars
+    var_sqrt = (ab_all + (1 - ab_all)).numpy()          # (√ᾱ)² + (√(1-ᾱ))² = 1  for every t
+    var_nosqrt = (ab_all**2 + (1 - ab_all)**2).numpy()  # ᾱ² + (1-ᾱ)²  → dips to 0.5 at ᾱ=0.5
+    import matplotlib
+    matplotlib.use("Agg")                               # headless: save, don't show
+    import matplotlib.pyplot as plt
+    plt.figure(figsize=(6.5, 3.4))
+    plt.plot(ts.numpy(), var_sqrt, label="√ᾱ, √(1-ᾱ)  → Var ≈ 1 (variance-preserving)")
+    plt.plot(ts.numpy(), var_nosqrt, label="ᾱ, (1-ᾱ)  → Var dips to 0.5")
+    plt.axhline(1.0, color="gray", ls=":", lw=1)
+    plt.xlabel("t"); plt.ylabel("Var(x_t)"); plt.legend(); plt.title("why the √ coefficients")
+    plt.tight_layout()
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "03_closed_form.png")
+    plt.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close()
+    print(f"\n  wrote {out} — √ coefficients hold Var flat at 1; the non-√ choice sags to 0.5 mid-way.")
     print("  Next (exp_4): where the process ENDS — x_T ~ N(0,I), the digit fully erased.")
 
 
@@ -538,12 +581,12 @@ def exp_7_snr(T=1000):
 
 def run_experiments():
     # exp_1_dissolve()
-    # exp_2_schedule()
+    exp_2_schedule()
     # exp_3_closed_form()
     # exp_4_endpoint()
     # exp_5_cosine_schedule()
     # exp_6_linear_vs_cosine()
-    exp_7_snr()
+    # exp_7_snr()
 
 
 if __name__ == "__main__":
