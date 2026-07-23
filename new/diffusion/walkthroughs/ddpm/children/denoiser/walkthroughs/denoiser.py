@@ -1,0 +1,312 @@
+"""
+CHILD WALKTHROUGH (digs into ddpm exp_4): the DENOISER, top-down.
+
+The parent ddpm.py trained a U-Net and sampled digits from noise; the training_target box then
+showed WHAT it learns (predict ε, loss = MSE(ε̂, ε)). This box opens the net itself — the thing
+that computes ε̂ = net(x_t, t). Two questions hide in that call:
+
+    WHY a U-Net (down/up with skip connections), and WHY must the timestep t be an input?
+
+The one sentence everything here rests on:
+
+    the denoiser is a plain IMAGE-TO-IMAGE map: (x_t, t) -> ε̂, same spatial size in and out.
+    the only two non-obvious ingredients are SKIP CONNECTIONS and TIME CONDITIONING.
+
+Top-down: before any "why", SEE the denoiser work — feed it a noised digit and a level, and watch
+it output a noise map that, subtracted off, RECOVERS the clean digit. Run it with
+`python denoiser.py` (`exp_1_whole_game`).
+
+Layers (each an `exp_*`; run it, read the output, then say "next"):
+  1. the WHOLE GAME    — the real TinyUNet as an image->image map: trace its shape flow
+                         (28->14->7->14->28), count its params, then train it briefly and SEE it
+                         denoise (x_t -> ε̂ -> recovered x̂0). Rough narration only.            (here)
+  then open the boxes — each a "why" about that picture:
+  2. WHY SKIPS          — ablate the skip connections: down/up alone throws away spatial detail, so
+                         the recovered digit goes blurry; the skips carry the fine structure across.
+  3. WHY DOWN/UP        — receptive field: pooling lets a small conv net SEE the whole 28x28 digit
+                         (global shape) cheaply; a flat full-res stack can't reach that far.
+  4. WHY t IS AN INPUT  — the SAME x_t means different things at different noise levels; drop the
+                         time conditioning and the net must predict a blur-average -> loss worsens.
+  5. HOW t ENTERS       — sinusoidal embedding -> small MLP -> ADDED into every block (FiLM-lite);
+                         why sinusoidal, why inject everywhere instead of once at the input.
+  6. THE BLOCK          — the residual GroupNorm->SiLU->conv unit: why these are the modern default
+                         (stable training, crisp samples) over BatchNorm / ReLU / plain conv stacks.
+
+Content re-sequences the old bottom-up diffusion/ denoiser pieces top-down as a child dig-in. The
+model here is the REAL parent TinyUNet (this box's whole job is to open it). No torchvision; shared
+MNIST at new/diffusion/data/mnist.npz.
+"""
+from __future__ import annotations
+
+import math
+import os
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+_HERE = os.path.dirname(os.path.abspath(__file__))                 # .../denoiser/walkthroughs
+# walk up to the shared new/diffusion/ root (holds data/):
+#   walkthroughs -> denoiser -> children -> ddpm -> walkthroughs -> diffusion
+_DIFF = os.path.abspath(os.path.join(_HERE, *([".."] * 5)))        # new/diffusion
+_FIGS = os.path.join(_HERE, "figures", "experiments")
+
+
+def _banner(*lines):
+    print("=" * 70)
+    for line in lines:
+        print(line)
+    print("=" * 70)
+
+
+def _device():
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _to_img(x):
+    """(1,28,28)-ish tensor in [-1,1] -> HxW numpy in [0,1] for imshow."""
+    return ((x.squeeze().clamp(-1, 1) + 1) / 2).cpu().numpy()
+
+
+def _mnist(train=True):
+    """MNIST images (N,1,28,28) in [-1,1], from the cached npz. No torchvision."""
+    import numpy as np
+    path = os.path.join(_DIFF, "data", "mnist.npz")
+    if not os.path.exists(path):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        import urllib.request
+        url = "https://storage.googleapis.com/tensorflow/tf-keras-datasets/mnist.npz"
+        print(f"  downloading MNIST npz (~11MB) -> {path} ...")
+        urllib.request.urlretrieve(url, path)
+    d = np.load(path)
+    x = d["x_train"] if train else d["x_test"]                     # (N,28,28) uint8 [0,255]
+    return (torch.from_numpy(x).float() / 127.5 - 1.0).unsqueeze(1)  # (N,1,28,28) in [-1,1]
+
+
+def make_linear_schedule(T=1000, beta_start=1e-4, beta_end=0.02):
+    """The SAME linear DDPM schedule the parent trained on. Returns (betas, alphas, alpha_bars),
+    each shape (T,). ᾱ_t = ∏_{s≤t} α_s = how much original signal survives to step t."""
+    betas = torch.linspace(beta_start, beta_end, T)
+    alphas = 1.0 - betas
+    alpha_bars = torch.cumprod(alphas, dim=0)
+    return betas, alphas, alpha_bars
+
+
+def make_training_pair(x0, alpha_bars, T):
+    """Assemble ONE training batch exactly as the parent train loop does (see the training_target box).
+        x_t = √ᾱ_t·x0 + √(1-ᾱ_t)·ε,   t random per example,   ε~N(0,I) is the label. Returns (x_t,t,ε)."""
+    B = x0.shape[0]
+    t = torch.randint(0, T, (B,), device=x0.device)
+    eps = torch.randn_like(x0)
+    ab = alpha_bars[t].view(B, 1, 1, 1)                            # (B,1,1,1) broadcast over pixels
+    x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+    return x_t, t, eps
+
+
+# ===========================================================================
+# THE REAL MODEL — this is the box we are opening. It is the parent ddpm.py's TinyUNet, verbatim.
+# exp_1 only USES it (shape flow + it denoises); every named piece below gets its own "why" later:
+#   sinusoidal timestep_embedding + time_mlp .......... how t enters   (exp_5)
+#   _Block = GroupNorm->SiLU->conv ×2, +temb, residual . the block     (exp_6), how t enters (exp_5)
+#   down1/2/3 + avg_pool, up2/up1 + interpolate ........ why down/up    (exp_3)
+#   torch.cat([..., h2/h1], 1) skip concats ............ why skips      (exp_2)
+# ===========================================================================
+def timestep_embedding(t, dim):
+    """Sinusoidal embedding of the integer timestep t (B,) -> (B, dim). (WHY sinusoidal: exp_5.)"""
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half, device=t.device) / half)
+    args = t[:, None].float() * freqs[None]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+class _Block(nn.Module):
+    """Residual block: (GroupNorm -> SiLU -> conv) twice, with the timestep ADDED in the middle.
+    GroupNorm + residual are the standard diffusion-U-Net minimum; the `why` is exp_6."""
+
+    def __init__(self, cin, cout, temb_dim):
+        super().__init__()
+        self.norm1 = nn.GroupNorm(8, cin)
+        self.conv1 = nn.Conv2d(cin, cout, 3, padding=1)
+        self.temb = nn.Linear(temb_dim, cout)                            # inject the timestep
+        self.norm2 = nn.GroupNorm(8, cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, padding=1)
+        self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x, temb):
+        h = self.conv1(F.silu(self.norm1(x)))
+        h = h + self.temb(temb)[:, :, None, None]
+        h = self.conv2(F.silu(self.norm2(h)))
+        return h + self.skip(x)
+
+
+class TinyUNet(nn.Module):
+    """Predicts the noise ε from (x_t, t). Down 28->14->7 (channels grow), up 7->14->28 with skip
+    connections; the timestep t is injected into every block. Output is BARE (no activation) — ε is
+    unbounded ~N(0,1)."""
+
+    def __init__(self, base=32, temb_dim=128):
+        super().__init__()
+        self.temb_dim = temb_dim
+        self.time_mlp = nn.Sequential(nn.Linear(temb_dim, temb_dim), nn.SiLU(), nn.Linear(temb_dim, temb_dim))
+        self.stem = nn.Conv2d(1, base, 3, padding=1)                     # 1 -> base, 28x28
+        self.down1 = _Block(base, base, temb_dim)                        # 28
+        self.down2 = _Block(base, base * 2, temb_dim)                    # 14 (after pool)
+        self.down3 = _Block(base * 2, base * 4, temb_dim)                # 7  (after pool)
+        self.mid = _Block(base * 4, base * 4, temb_dim)                  # 7
+        self.up2 = _Block(base * 4 + base * 2, base * 2, temb_dim)       # 14 (concat down2 skip)
+        self.up1 = _Block(base * 2 + base, base, temb_dim)               # 28 (concat down1 skip)
+        self.out_norm = nn.GroupNorm(8, base)
+        self.out = nn.Conv2d(base, 1, 3, padding=1)
+
+    def forward(self, x, t):
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))
+        h1 = self.down1(self.stem(x), temb)                              # (B, base,   28, 28)
+        h2 = self.down2(F.avg_pool2d(h1, 2), temb)                       # (B, 2base,  14, 14)
+        h3 = self.down3(F.avg_pool2d(h2, 2), temb)                       # (B, 4base,   7,  7)
+        m = self.mid(h3, temb)
+        u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), h2], 1), temb)   # 14
+        u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), h1], 1), temb)   # 28
+        return self.out(F.silu(self.out_norm(u)))                        # (B, 1, 28, 28) predicted ε
+
+
+def _recover_x0(x_t, eps_hat, ab):
+    """Invert the forward closed form for x0 given a noise estimate: x̂0 = (x_t - √(1-ᾱ)·ε̂)/√ᾱ.
+    ab is ᾱ_t reshaped to broadcast over pixels. (This is exactly the algebra the sampler uses.)"""
+    return (x_t - (1 - ab).sqrt() * eps_hat) / ab.sqrt()
+
+
+# ---------------------------------------------------------------------------
+# LAYER 1 (the whole game): SEE that the denoiser is just an image->image net, and that it works.
+#
+# Three things you can read/see:
+#   (i)   it's an IMAGE-TO-IMAGE map — (B,1,28,28) in, (B,1,28,28) out; we trace the real shape flow
+#         28->14->7->14->28 with a forward hook (measured, not just documented) and count the params.
+#   (ii)  UNTRAINED it recovers nothing — ε̂≈0, so x̂0 ≈ x_t/√ᾱ is garbage (a number you can read).
+#   (iii) train it briefly and it DENOISES — feed x_t, subtract the predicted ε̂, and the clean digit
+#         reappears. The payoff figure is the row [clean x0 | noised x_t | predicted ε̂ | recovered x̂0].
+# Everything else in this child (why skips, why down/up, why/how t) is a "why" about this picture.
+# ---------------------------------------------------------------------------
+def exp_1_whole_game(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps=300, lr=2e-4):
+    """The whole game of the denoiser: the real TinyUNet is an image->image map (x_t,t)->ε̂. Trace its
+    shape flow, count its params, then train it briefly and SEE it recover clean digits from noise. No
+    derivations yet — see the net work, get the map. exp_2..exp_6 open each box (skips, down/up, t)."""
+    _banner("LAYER 1: the whole game — the denoiser is an image->image net (x_t,t)->ε̂ that denoises")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    print("  the denoiser, in one breath:")
+    print("    it's a plain IMAGE-TO-IMAGE network: (x_t, t) -> ε̂, same 28x28 in and out.")
+    print("    the only two non-obvious parts are SKIP CONNECTIONS and TIME CONDITIONING.\n")
+
+    net = TinyUNet(base=base).to(dev)
+    n_params = sum(p.numel() for p in net.parameters())
+
+    # ---- (i) it's an image->image map: trace the real shape flow with forward hooks -----------
+    x0_probe = _mnist(train=True)[:4].to(dev)
+    x_t_probe, t_probe, _ = make_training_pair(x0_probe, alpha_bars, T)
+    shapes = {}
+    hooks = []
+    for name in ["stem", "down1", "down2", "down3", "mid", "up2", "up1", "out"]:
+        mod = getattr(net, name)
+        hooks.append(mod.register_forward_hook(
+            lambda m, i, o, name=name: shapes.__setitem__(name, tuple(o.shape))))
+    with torch.no_grad():
+        out_probe = net(x_t_probe, t_probe)
+    for h in hooks:
+        h.remove()
+    print(f"  (i) an image-to-image map — in {tuple(x_t_probe.shape)}  ->  out {tuple(out_probe.shape)}"
+          f"   (same spatial size), {n_params:,} params:")
+    print(f"        stem  {shapes['stem']}   ┐ DOWN: pool 28->14->7, channels grow")
+    print(f"        down1 {shapes['down1']}   │")
+    print(f"        down2 {shapes['down2']}   │")
+    print(f"        down3 {shapes['down3']}     ┘")
+    print(f"        mid   {shapes['mid']}       bottleneck (whole digit in view)")
+    print(f"        up2   {shapes['up2']}     ┐ UP: interpolate 7->14->28, concat the skip")
+    print(f"        up1   {shapes['up1']}   ┘")
+    print(f"        out   {shapes['out']}    bare ε̂ (no activation — ε is unbounded)\n")
+
+    # ---- (ii) untrained: recovers nothing -----------------------------------------------------
+    x0 = _mnist(train=True)[:n_train].to(dev)
+    torch.manual_seed(seed + 1)
+    # a fixed display batch at ONE moderate level, so "before vs after" is a fair comparison
+    n_show = 8
+    t_show_val = 250
+    x0_show = x0[:n_show]
+    ab_show = alpha_bars[t_show_val].view(1, 1, 1, 1)
+    eps_show = torch.randn_like(x0_show)
+    x_t_show = ab_show.sqrt() * x0_show + (1 - ab_show).sqrt() * eps_show
+    t_show = torch.full((n_show,), t_show_val, device=dev, dtype=torch.long)
+
+    @torch.no_grad()
+    def recovery_mse():
+        eps_hat = net(x_t_show, t_show)
+        x0_hat = _recover_x0(x_t_show, eps_hat, ab_show)
+        return F.mse_loss(x0_hat.clamp(-1, 1), x0_show).item(), eps_hat, x0_hat
+
+    mse_before, eps_hat_before, x0_hat_before = recovery_mse()
+    print(f"  (ii) UNTRAINED, at t={t_show_val}: it recovers nothing —")
+    print(f"        ε̂ ≈ 0 (std {eps_hat_before.std():.3f}), so x̂0 = (x_t-√(1-ᾱ)ε̂)/√ᾱ is just noise.")
+    print(f"        recover MSE(x̂0, x0) = {mse_before:.4f}   (high = garbage)\n")
+
+    # ---- (iii) train it briefly and watch it denoise ------------------------------------------
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    net.train()
+    print(f"  (iii) train the real U-Net briefly ({n_train} imgs, batch {batch_size}, {steps} steps):")
+    for step in range(steps):
+        idx = torch.randint(0, x0.shape[0], (batch_size,), device=dev)
+        x_t, t, eps = make_training_pair(x0[idx], alpha_bars, T)
+        loss = F.mse_loss(net(x_t, t), eps)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if step % (steps // 6) == 0 or step == steps - 1:
+            print(f"        step {step:>4}: train loss {loss.item():.4f}")
+    net.eval()
+
+    mse_after, eps_hat_after, x0_hat_after = recovery_mse()
+    print(f"    recover MSE(x̂0, x0): {mse_before:.4f} -> {mse_after:.4f}  — the net now DENOISES.\n")
+
+    # ---- the payoff figure: clean / noised / predicted ε̂ / recovered x̂0 ----------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rows = [
+        ("clean x0",        [x0_show[i] for i in range(n_show)]),
+        (f"noised x_t (t={t_show_val})", [x_t_show[i] for i in range(n_show)]),
+        ("predicted ε̂",     [eps_hat_after[i] for i in range(n_show)]),
+        ("recovered x̂0",    [x0_hat_after[i] for i in range(n_show)]),
+    ]
+    fig, axes = plt.subplots(len(rows), n_show, figsize=(n_show * 1.05, len(rows) * 1.15))
+    for r, (label, imgs) in enumerate(rows):
+        for c in range(n_show):
+            ax = axes[r, c]
+            ax.imshow(_to_img(imgs[c]), cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            if c == 0:
+                ax.set_ylabel(label, fontsize=9, rotation=0, ha="right", va="center", labelpad=38)
+    fig.suptitle("the denoiser is an image->image map that WORKS: subtract the predicted noise ε̂,\n"
+                 "and the clean digit x̂0 reappears (real TinyUNet, a few hundred steps)", fontsize=10)
+    fig.tight_layout(rect=(0.06, 0, 1, 0.94))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "01_denoise.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — clean / noised / predicted ε̂ / recovered x̂0.")
+    print("  That's the whole game of the denoiser: an image->image net that denoises. Next (exp_2):")
+    print("  WHY the skip connections — ablate them and watch the recovered digit go blurry.")
+
+
+def run_experiments():
+    exp_1_whole_game()
+    # exp_2_why_skips()
+    # exp_3_why_down_up()
+    # exp_4_why_t_input()
+    # exp_5_how_t_enters()
+    # exp_6_the_block()
+
+
+if __name__ == "__main__":
+    run_experiments()
