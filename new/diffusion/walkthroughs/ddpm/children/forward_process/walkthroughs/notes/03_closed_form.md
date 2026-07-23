@@ -90,19 +90,22 @@ The T steps fold into one because each step just multiplies one more `α` into `
 
 ## (B) why the coefficients are √ — variance preservation
 
-Take unit-variance data `x0 ~ N(0,1)` and measure `Var(x_t)` across `t`:
+Take unit-variance data `x0 ~ N(0,1)`, measure the empirical `Var(x_t)` across `t`, and next to it
+print what the variance *would* be if the amplitudes were `ᾱ` and `1-ᾱ` directly instead of their
+square roots (`ᾱ²+(1-ᾱ)²`):
 
 ```
-   t |    ᾱ      1-ᾱ   | Var(x_t)
- -----+----------------+---------
-    0 |  0.9999  0.0001 |  1.0122
-  250 |  0.5214  0.4786 |  1.0152
-  500 |  0.0778  0.9222 |  0.9958
-  750 |  0.0033  0.9967 |  1.0024
-  999 |  0.0000  1.0000 |  0.9994
+   t |    ᾱ      1-ᾱ   | Var(x_t) | ᾱ²+(1-ᾱ)²
+ -----+----------------+----------+-----------
+    0 |  0.9999  0.0001 |  0.9942  |   0.9998
+  250 |  0.5214  0.4786 |  0.9967  |   0.5009   ← sags
+  500 |  0.0778  0.9222 |  1.0006  |   0.8565
+  750 |  0.0033  0.9967 |  1.0055  |   0.9934
+  999 |  0.0000  1.0000 |  1.0102  |   0.9999
 ```
 
-`Var(x_t)` is pinned at **≈ 1 for every `t`**. The reason (`x0 ⊥ ε`, `Var(x0)=1`):
+The measured `Var(x_t)` (the √ coefficients) is pinned at **≈ 1 for every `t`**. The reason
+(`x0 ⊥ ε`, `Var(x0)=1`):
 
 ```
 Why the coefficients are square roots — VARIANCE PRESERVATION (Var(x0)=1, x0 ⟂ ε):
@@ -115,18 +118,10 @@ fades — it just trades signal for noise.
 ```
 
 That's the whole point of the square roots: it's the **squares** that must sum to 1 (signal power
-`ᾱ` + noise power `1-ᾱ`), so the **amplitudes** have to be `√ᾱ` and `√(1-ᾱ)`. Pick `ᾱ` and `1-ᾱ`
-directly instead and the variance would be `ᾱ²+(1-ᾱ)²` — still 1 at the two ends, but **sagging to
-0.5 in the middle** (at `ᾱ=0.5`), so `x_t`'s scale would wobble across `t`:
-
-```
-   t |   ᾱ    | √-coeffs Var | (ᾱ,1-ᾱ) Var  = ᾱ²+(1-ᾱ)²
- -----+--------+--------------+--------------------------
-    0 | 0.9999 |    1.00      |    1.00
-  250 | 0.5214 |    1.01      |    0.50   ← sags
-  500 | 0.0778 |    1.00      |    0.86
-  999 | 0.0000 |    1.01      |    1.01
-```
+`ᾱ` + noise power `1-ᾱ`), so the **amplitudes** have to be `√ᾱ` and `√(1-ᾱ)`. The `ᾱ²+(1-ᾱ)²`
+column above is what you'd get picking `ᾱ` and `1-ᾱ` as amplitudes directly — still 1 at the two
+ends, but **sagging to 0.5 in the middle** (at `ᾱ=0.5`, `t≈250`), so `x_t`'s scale would wobble
+across `t`.
 
 The same two columns over the whole schedule — the √ choice flat at 1, the naive choice caving in:
 

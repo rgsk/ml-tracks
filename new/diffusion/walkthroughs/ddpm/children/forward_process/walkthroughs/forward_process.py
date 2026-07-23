@@ -300,13 +300,14 @@ def exp_3_closed_form(seed=0, T=1000):
     print("  (B) why the coefficients are √:  (√ᾱ)² + (√(1-ᾱ))² = ᾱ + (1-ᾱ) = 1. On unit-variance")
     print("      data Var(x_t) stays ≈ 1 at EVERY t — signal power drains, noise power fills, sum=1:\n")
     x0v = torch.randn(n, generator=g)
-    print(f"  {'t':>4} | {'ᾱ':>8} {'1-ᾱ':>8} | {'Var(x_t)':>9}")
-    print(f"  {'-'*4}-+-{'-'*8}-{'-'*8}-+-{'-'*9}")
+    print(f"  {'t':>4} | {'ᾱ':>8} {'1-ᾱ':>8} | {'Var(x_t)':>9} | {'ᾱ²+(1-ᾱ)²':>10}")
+    print(f"  {'-'*4}-+-{'-'*8}-{'-'*8}-+-{'-'*9}-+-{'-'*10}")
     for t in [0, 250, 500, 750, T - 1]:
         ab = alpha_bars[t]
         eps = torch.randn(n, generator=g)
         xt = ab.sqrt() * x0v + (1 - ab).sqrt() * eps
-        print(f"  {t:>4} | {ab.item():>8.4f} {(1-ab).item():>8.4f} | {xt.var():>9.4f}")
+        nosqrt = ab.item()**2 + (1 - ab.item())**2      # if amplitudes were ᾱ,(1-ᾱ) not their √
+        print(f"  {t:>4} | {ab.item():>8.4f} {(1-ab).item():>8.4f} | {xt.var():>9.4f} | {nosqrt:>10.4f}")
     print("\n      Var pinned at ~1: THAT is why it's √ and not, say, ᾱ and (1-ᾱ) directly — the")
     print("      squares are what must sum to 1, so the amplitudes are their square roots. No")
     print("      blow-up, no fade — x_t just trades signal for noise as t grows.")
@@ -581,8 +582,8 @@ def exp_7_snr(T=1000):
 
 def run_experiments():
     # exp_1_dissolve()
-    exp_2_schedule()
-    # exp_3_closed_form()
+    # exp_2_schedule()
+    exp_3_closed_form()
     # exp_4_endpoint()
     # exp_5_cosine_schedule()
     # exp_6_linear_vs_cosine()
