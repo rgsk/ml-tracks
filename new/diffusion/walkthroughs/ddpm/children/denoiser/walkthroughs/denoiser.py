@@ -142,7 +142,7 @@ class _Block(nn.Module):
 class TinyUNet(nn.Module):
     """Predicts the noise ε from (x_t, t). Down 28->14->7 (channels grow), up 7->14->28 with skip
     connections; the timestep t is injected into every block. Output is BARE (no activation) — ε is
-    unbounded ~N(0,1)."""
+    unbounded ~N(0,1). `use_skips=False` zeroes the two skip highways (the exp_2 ablation)."""
 
     def __init__(self, base=32, temb_dim=128):
         super().__init__()
@@ -158,14 +158,16 @@ class TinyUNet(nn.Module):
         self.out_norm = nn.GroupNorm(8, base)
         self.out = nn.Conv2d(base, 1, 3, padding=1)
 
-    def forward(self, x, t):
+    def forward(self, x, t, use_skips=True):
         temb = self.time_mlp(timestep_embedding(t, self.temb_dim))
         h1 = self.down1(self.stem(x), temb)                              # (B, base,   28, 28)
         h2 = self.down2(F.avg_pool2d(h1, 2), temb)                       # (B, 2base,  14, 14)
         h3 = self.down3(F.avg_pool2d(h2, 2), temb)                       # (B, 4base,   7,  7)
         m = self.mid(h3, temb)
-        u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), h2], 1), temb)   # 14
-        u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), h1], 1), temb)   # 28
+        s2 = h2 if use_skips else torch.zeros_like(h2)                   # the two skip highways:
+        s1 = h1 if use_skips else torch.zeros_like(h1)                   #   off -> the cats see zeros
+        u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), s2], 1), temb)   # 14
+        u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), s1], 1), temb)   # 28
         return self.out(F.silu(self.out_norm(u)))                        # (B, 1, 28, 28) predicted ε
 
 
@@ -173,6 +175,31 @@ def _recover_x0(x_t, eps_hat, ab):
     """Invert the forward closed form for x0 given a noise estimate: x̂0 = (x_t - √(1-ᾱ)·ε̂)/√ᾱ.
     ab is ᾱ_t reshaped to broadcast over pixels. (This is exactly the algebra the sampler uses.)"""
     return (x_t - (1 - ab).sqrt() * eps_hat) / ab.sqrt()
+
+
+def _hf(e):
+    """High-frequency-energy proxy: the variance LEFT after a 3x3 local blur. A grainy ε̂ (fine
+    pixel detail, like real ε) scores high; a smooth low-frequency ghost scores near 0."""
+    return (e - F.avg_pool2d(e, 3, 1, 1)).pow(2).mean().item()
+
+
+def _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed, use_skips=True):
+    """Train a denoiser from scratch on random (x_t,t)->ε batches and return its final train loss.
+    `use_skips` is threaded into every forward so we can train a net that NEVER gets the skips."""
+    torch.manual_seed(seed)
+    opt = torch.optim.Adam(net.parameters(), lr=lr)
+    net.train()
+    last = float("nan")
+    for _ in range(steps):
+        idx = torch.randint(0, x0.shape[0], (batch_size,), device=x0.device)
+        x_t, t, eps = make_training_pair(x0[idx], alpha_bars, T)
+        loss = F.mse_loss(net(x_t, t, use_skips=use_skips), eps)
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        last = loss.item()
+    net.eval()
+    return last
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +326,104 @@ def exp_1_whole_game(seed=0, T=1000, base=32, n_train=4000, batch_size=128, step
     print("  WHY the skip connections — ablate them and watch the recovered digit go blurry.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 2 (why skips): the up path bottoms out at a 7x7 bottleneck — coarse. So where does the
+# pixel-sharp ε̂ come from? From the SKIP CONNECTIONS: the down side's high-res feature maps are
+# stapled (concat) back onto the up side at the matching resolution, routing fine detail AROUND the
+# funnel. We prove it by TRAINING TWO nets from scratch — one with skips, one that never gets them —
+# and reading three things: the final loss, the recover-MSE, and the high-frequency energy of ε̂
+# (plus a picture where the no-skip ε̂ is a smooth ghost). The 7x7 core can decide WHAT/WHERE; only
+# the skips can carry the pixel grain.
+# ---------------------------------------------------------------------------
+def exp_2_why_skips(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps=300, lr=2e-4):
+    """Why the skip connections: the 7x7 bottleneck is too coarse to emit pixel-sharp noise, so the
+    down-path features are concatenated back onto the up path (the skips). Train one net WITH skips and
+    one that NEVER sees them, then compare loss / recover-MSE / high-freq energy and SEE the no-skip ε̂
+    smear into a low-frequency ghost. Same init, same data, same steps — the only difference is skips."""
+    _banner("LAYER 2: why skips — the 7x7 bottleneck is coarse; the skip highways carry the detail")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    print("  the puzzle: the up path starts from a 7x7 bottleneck (28x28 pooled down 4x). 7x7 is far")
+    print("  too coarse to name every pixel of a noise map. So how does ε̂ come out pixel-sharp?")
+    print("  the two `torch.cat([up, downN], 1)` lines: the DOWN side's high-res maps are stapled back")
+    print("  onto the up side at 14x14 and 28x28 — detail routed AROUND the funnel. use_skips=False")
+    print("  feeds zeros there instead, so we can measure exactly what they buy.\n")
+
+    x0 = _mnist(train=True)[:n_train].to(dev)
+
+    # ---- train two nets from the SAME init: one with skips, one that never gets them -----------
+    net_skip = TinyUNet(base=base).to(dev)
+    net_none = TinyUNet(base=base).to(dev)
+    net_none.load_state_dict(net_skip.state_dict())                # identical starting weights = fair
+    print(f"  training two nets from the same init ({n_train} imgs, {steps} steps each):")
+    loss_skip = _quick_train(net_skip, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7, use_skips=True)
+    loss_none = _quick_train(net_none, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7, use_skips=False)
+    print(f"    final train loss   WITH skips {loss_skip:.4f}   |   NO skips {loss_none:.4f}   (lower = better)\n")
+
+    # ---- a fixed display batch at ONE moderate level, scored both ways -------------------------
+    torch.manual_seed(seed + 1)
+    n_show = 8
+    t_show_val = 250
+    x0_show = x0[:n_show]
+    ab_show = alpha_bars[t_show_val].view(1, 1, 1, 1)
+    eps_show = torch.randn_like(x0_show)
+    x_t_show = ab_show.sqrt() * x0_show + (1 - ab_show).sqrt() * eps_show
+    t_show = torch.full((n_show,), t_show_val, device=dev, dtype=torch.long)
+
+    with torch.no_grad():
+        eps_skip = net_skip(x_t_show, t_show, use_skips=True)
+        eps_none = net_none(x_t_show, t_show, use_skips=False)
+    x0_skip = _recover_x0(x_t_show, eps_skip, ab_show)
+    x0_none = _recover_x0(x_t_show, eps_none, ab_show)
+    mse_skip = F.mse_loss(x0_skip.clamp(-1, 1), x0_show).item()
+    mse_none = F.mse_loss(x0_none.clamp(-1, 1), x0_show).item()
+
+    print(f"  scored on a held-fixed batch at t={t_show_val}:")
+    print(f"    recover MSE(x̂0, x0)        WITH skips {mse_skip:.4f}   |   NO skips {mse_none:.4f}")
+    print(f"    high-freq energy of ε̂      true ε {_hf(eps_show):.3f}  |  skips {_hf(eps_skip):.3f}"
+          f"  |  no skips {_hf(eps_none):.3f}")
+    print("    NO-skip ε̂ has almost no high-freq energy: it's a smooth ghost. The 7x7 core got the")
+    print("    coarse WHAT/WHERE, but with the highways cut it cannot emit the pixel grain.\n")
+
+    # ---- payoff figure: the detail is present with skips, gone without ------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rows = [
+        ("clean x0",         [x0_show[i] for i in range(n_show)]),
+        ("true ε",           [eps_show[i] for i in range(n_show)]),
+        ("ε̂  WITH skips",    [eps_skip[i] for i in range(n_show)]),
+        ("ε̂  NO skips",      [eps_none[i] for i in range(n_show)]),
+        ("x̂0 WITH skips",    [x0_skip[i] for i in range(n_show)]),
+        ("x̂0 NO skips",      [x0_none[i] for i in range(n_show)]),
+    ]
+    fig, axes = plt.subplots(len(rows), n_show, figsize=(n_show * 1.05, len(rows) * 1.12))
+    for r, (label, imgs) in enumerate(rows):
+        for c in range(n_show):
+            ax = axes[r, c]
+            ax.imshow(_to_img(imgs[c]), cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            if c == 0:
+                ax.set_ylabel(label, fontsize=9, rotation=0, ha="right", va="center", labelpad=40)
+    fig.suptitle("why skips: the 7x7 bottleneck carries WHAT/WHERE, the skips carry the DETAIL\n"
+                 "no-skip ε̂ is a smooth ghost (little high-freq) → recovered digit blurs", fontsize=10)
+    fig.tight_layout(rect=(0.07, 0, 1, 0.94))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "02_why_skips.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {out} — with-vs-without skips: ε̂ grain and recovered digit.")
+    print("  So the U-Net = autoencoder + detail highways. Next (exp_3): WHY down/up at all — the")
+    print("  receptive field, i.e. why pooling to 7x7 lets a small net see the WHOLE digit cheaply.")
+
+
 def run_experiments():
-    exp_1_whole_game()
-    # exp_2_why_skips()
+    # exp_1_whole_game()
+    exp_2_why_skips()
     # exp_3_why_down_up()
     # exp_4_why_t_input()
     # exp_5_how_t_enters()
