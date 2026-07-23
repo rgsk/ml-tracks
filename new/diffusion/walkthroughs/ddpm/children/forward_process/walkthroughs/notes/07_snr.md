@@ -9,15 +9,34 @@ modern schedules (EDM, flow matching) are actually written in. Run it with
 
 ## SNR = ᾱ, repackaged as difficulty
 
-From the closed form `x_t = √ᾱ·x0 + √(1-ᾱ)·ε`, the signal amplitude `√ᾱ` has power `ᾱ` and the noise
-amplitude `√(1-ᾱ)` has power `1-ᾱ`. Their ratio is the signal-to-noise ratio:
+From the closed form `x_t = √ᾱ·x0 + √(1-ᾱ)·ε`, SNR is the ratio of the two terms' *powers* (variance
+= amplitude²). The `√` amplitudes square to exactly `ᾱ` and `1-ᾱ` — and this is the **same
+unit-variance normalization from exp_3** (`Var(x0) = Var(ε) = 1`) that makes those squares land clean:
 
 ```
-  SNR(t) = signal power / noise power = ᾱ / (1 - ᾱ)
+  SNR(t) = signal variance / noise variance
+         = (√ᾱ_t)²·Var(x0) / [ (√(1-ᾱ_t))²·Var(ε) ]
+         = ᾱ_t·1 / [ (1-ᾱ_t)·1 ]
+         = ᾱ_t / (1 - ᾱ_t)
 ```
 
 - **high SNR** (small `t`) = barely noised = **easy** to denoise
 - **low SNR** (big `t`) = mostly noise = **hard**
+
+**Proof it's literally that ratio.** Split `x_t` into its two independent pieces — `√ᾱ·x0` (signal)
+and `√(1-ᾱ)·ε` (noise) — draw 200k unit-variance `x0` and `ε`, and measure each piece's variance:
+
+```
+   t | Var(√ᾱ·x0) Var(√(1-ᾱ)·ε) | their ratio | ᾱ/(1-ᾱ)
+ -----+-----------------------------+-------------+---------
+  100 |   0.8955      0.1051        |   8.5194    |  8.5366
+  250 |   0.5216      0.4797        |   1.0873    |  1.0895
+  500 |   0.0778      0.9244        |   0.0842    |  0.0844
+  750 |   0.0033      0.9991        |   0.0033    |  0.0033
+```
+
+`Var(√ᾱ·x0) ≈ ᾱ` and `Var(√(1-ᾱ)·ε) ≈ 1-ᾱ` (the `√` amplitudes squared, on unit-variance draws), so
+their ratio matches the analytic `ᾱ/(1-ᾱ)` at every `t` — the derivation above, confirmed empirically.
 
 Since each training step draws a random `t`, the schedule decides how the training budget spreads
 across difficulties.

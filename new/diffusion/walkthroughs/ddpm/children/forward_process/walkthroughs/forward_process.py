@@ -533,6 +533,27 @@ def exp_7_snr(T=1000):
 
     print("  SNR(t) = ᾱ / (1 - ᾱ) = signal power / noise power.")
     print("  high SNR = barely noised = EASY denoise ; low SNR = mostly noise = HARD.\n")
+
+    # PROVE it's literally Var(signal part) / Var(noise part). Split x_t into its two independent
+    # pieces — √ᾱ·x0 (signal) and √(1-ᾱ)·ε (noise) on unit-variance draws — measure each piece's
+    # variance, and confirm the ratio is ᾱ/(1-ᾱ). This is exp_3's unit-variance normalization at
+    # work: (√ᾱ)²·Var(x0) = ᾱ·1, (√(1-ᾱ))²·Var(ε) = (1-ᾱ)·1.
+    g = torch.Generator().manual_seed(0)
+    n = 200_000
+    x0 = torch.randn(n, generator=g)                   # unit-variance data
+    eps = torch.randn(n, generator=g)                  # unit-variance noise
+    print("  proof — SNR IS Var(signal part) / Var(noise part) of x_t (linear schedule):\n")
+    print(f"  {'t':>4} | {'Var(√ᾱ·x0)':>11} {'Var(√(1-ᾱ)·ε)':>14} | {'their ratio':>12} | {'ᾱ/(1-ᾱ)':>10}")
+    print(f"  {'-'*4}-+-{'-'*11}-{'-'*14}-+-{'-'*12}-+-{'-'*10}")
+    for t in [100, 250, 500, 750]:
+        ab = ab_lin[t]
+        sig = ab.sqrt() * x0                           # the signal component of x_t
+        noi = (1 - ab).sqrt() * eps                    # the noise component of x_t
+        vs, vn = sig.var().item(), noi.var().item()
+        print(f"  {t:>4} | {vs:>11.4f} {vn:>14.4f} | {vs / vn:>12.4f} | {snr_lin[t].item():>10.4f}")
+    print("\n      Var(√ᾱ·x0) ≈ ᾱ and Var(√(1-ᾱ)·ε) ≈ 1-ᾱ (the √ amplitudes squared, on unit-variance")
+    print("      draws), so their ratio matches the analytic ᾱ/(1-ᾱ). That's WHY SNR = ᾱ/(1-ᾱ).\n")
+
     print(f"  {'t':>4} | {'lin SNR':>10} {'lin logSNR':>10} | {'cos SNR':>10} {'cos logSNR':>10}")
     print(f"  {'-'*4}-+-{'-'*10}-{'-'*10}-+-{'-'*10}-{'-'*10}")
     for t in [0, 100, 250, 500, 750, 900, T - 1]:
@@ -583,11 +604,11 @@ def exp_7_snr(T=1000):
 def run_experiments():
     # exp_1_dissolve()
     # exp_2_schedule()
-    exp_3_closed_form()
+    # exp_3_closed_form()
     # exp_4_endpoint()
     # exp_5_cosine_schedule()
     # exp_6_linear_vs_cosine()
-    # exp_7_snr()
+    exp_7_snr()
 
 
 if __name__ == "__main__":
