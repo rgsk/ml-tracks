@@ -14,7 +14,7 @@ Output channel `o` slides its own kernel over the (padded) input; **each output 
 multiply-and-sum**:
 
 ```
-out[o, i, j] = Σ over the kH×kW×Cin window of  kernel[o] · input_window
+out[o, i, j] = Σ over the Cin×kH×kW window of  kernel[o] · input_window
 ```
 
 That's the *entire* operation — three loops (out-channel, row, col), each cell a dot product. The

@@ -6,9 +6,16 @@ the two things that make an image an image, and a conv keeps both: **(A)** local
 structure (shift a digit → a dense net sees a near-new input, a conv's output just shifts), and
 **(B)** the parameter count. Run it with `python cnn.py` (`exp_3_why_conv`).
 
+> **Two properties a conv has that a flatten+dense throws away:**
+> - **locality** — nearby pixels are processed together; adjacency is represented.
+> - **translation equivariance** — shift the input → the output just shifts: `f(Sx) = S(f(x))`.
+>
+> (Distinct from translation *invariance* — shift the input → output *unchanged* — which pooling/GAP
+> add later; see exp_6.)
+
 ---
 
-## 1. The thing we're arguing against: flatten + dense
+## 1. The thing we're arguing against: flatten + dense — no locality
 
 `nn.Flatten` lays the `(1, 28, 28)` grid into a `784`-vector, row-major, so pixel `(r, c)` lands at
 index:
@@ -27,7 +34,7 @@ A dense layer then computes `y = W @ x_flat`, and `W[h, i]` is the weight from h
 
 ---
 
-## 2. A shift wrecks the flattened vector
+## 2. A shift wrecks the flattened vector — no translation structure
 
 Take a clean `7` and shift it down-and-right by 4px. To your eye it's the *same digit*. But the ink
 at index `i = r·28 + c` moves to:

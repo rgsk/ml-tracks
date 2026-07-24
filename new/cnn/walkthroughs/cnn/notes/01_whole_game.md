@@ -42,18 +42,37 @@ That's it — `raw pixels → features → 10 scores`.
 
 Train on all 60k MNIST images, cross-entropy loss, Adam, 5 epochs. Test accuracy after each epoch:
 
-```
+```-
 before training : test acc 13.05%   (~chance, 10 classes)
-epoch 1         : train loss 0.2689   test acc 97.14%
-epoch 2         : train loss 0.0751   test acc 98.07%
-epoch 3         : train loss 0.0534   test acc 98.44%
-epoch 4         : train loss 0.0415   test acc 98.67%
-epoch 5         : train loss 0.0338   test acc 98.80%
+epoch 1         : train loss 0.2691   test acc 97.20%
+epoch 2         : train loss 0.0752   test acc 98.08%
+epoch 3         : train loss 0.0532   test acc 98.49%
+epoch 4         : train loss 0.0414   test acc 98.71%
+epoch 5         : train loss 0.0341   test acc 98.71%
 ```
 
-From ~chance to **~99% in a few seconds** — a real digit reader in **54,666 params** (for scale, a
-single MLP dense layer `784×768` alone is 602,880). The convolutional structure is doing a lot of
-work with very few weights; *why* is the whole rest of the walkthrough.
+From ~chance to **~99% in a few seconds** — a real digit reader in **54,666 params**. The
+convolutional structure is doing a lot of work with very few weights; *why* is the whole rest of the
+walkthrough.
+
+---
+
+## Does a *bigger* dense net do better? (no)
+
+Tempting counter-argument: the CNN is tiny — maybe a plain dense net with **more** capacity would do
+just as well. So we train one head-to-head — same data, same optimizer, same 5 epochs: a
+`flatten → 768 → 10` MLP. Its **first layer alone** (`784×768 + 768 = 602,880`) already dwarfs the
+*entire* CNN, and the whole MLP is **610,570 params — ~11× the CNN**.
+
+```-
+MLP  610,570 params : test acc 96.88%
+CNN   54,666 params : test acc 98.71%
+```
+
+~11× the weights, and it still reads digits **worse**. So the CNN's edge isn't size — it's the right
+**bias for images** (locality + translation equivariance), built into the architecture rather than
+paid for in parameters. *Why* a conv has that bias and a flatten+dense throws it away is exactly what
+**exp_3** opens.
 
 ---
 

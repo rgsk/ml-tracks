@@ -96,9 +96,10 @@ class SmallCNN(nn.Module):
 
 def exp_1_whole_game(seed=0, epochs=5, batch_size=128, lr=1e-3):
     """The whole game, top-down: assemble SmallCNN, train it on all of MNIST, and WATCH test accuracy
-    climb from ~chance to ~99% — a real digit reader in ~55k params. Then save a grid of held-out
-    digits with the model's predictions. No derivations yet; the point is to see it work and get the
-    map. exp_2..exp_6 open each piece of this exact model and explain the why."""
+    climb from ~chance to ~99% — a real digit reader in ~55k params. Then pit it against a bigger
+    flatten->768->10 DENSE baseline (it reads digits WORSE despite ~11x the params) and save a grid of
+    held-out digits with the model's predictions. No derivations yet; the point is to see it work and
+    get the map. exp_2..exp_6 open each piece of this exact model and explain the why."""
     _banner("EXP 1: the whole game — build a CNN, train on MNIST, watch it read digits (~99%)")
 
     torch.manual_seed(seed)
@@ -110,36 +111,59 @@ def exp_1_whole_game(seed=0, epochs=5, batch_size=128, lr=1e-3):
     loader = torch.utils.data.DataLoader(train, batch_size=batch_size, shuffle=True)
     xte, yte = xte.to(dev), yte.to(dev)
 
+    @torch.no_grad()
+    def test_acc(m):
+        m.eval()
+        correct = 0
+        for i in range(0, len(xte), 2000):
+            correct += (m(xte[i:i + 2000]).argmax(1) == yte[i:i + 2000]).sum().item()
+        m.train()
+        return correct / len(xte)
+
+    def fit(m, verbose):
+        """Adam for `epochs`, same data/optimizer for every model. Returns final test acc."""
+        opt = torch.optim.Adam(m.parameters(), lr=lr)
+        for ep in range(1, epochs + 1):
+            run = 0.0
+            for xb, yb in loader:
+                xb, yb = xb.to(dev), yb.to(dev)
+                loss = F.cross_entropy(m(xb), yb)
+                opt.zero_grad()
+                loss.backward()
+                opt.step()
+                run += loss.item()
+            if verbose:
+                print(f"        epoch {ep}         : train loss {run / len(loader):.4f}   test acc {test_acc(m) * 100:5.2f}%")
+        return test_acc(m)
+
     model = SmallCNN().to(dev)
     n_params = sum(p.numel() for p in model.parameters())
 
     print("  the model, in one breath:")
     print("    features: conv->relu x3, downsampling 28 -> 14 -> 7 while channels grow 1 -> 16 -> 32 -> 64")
     print("    head:     flatten the 64x7x7 grid -> Linear -> 10 class scores")
-    print(f"    params:   {n_params:,} total (compare: an MLP's first dense layer 784x768 = 602,880)\n")
+    print(f"    params:   {n_params:,} total\n")
 
-    @torch.no_grad()
-    def test_acc():
-        model.eval()
-        correct = 0
-        for i in range(0, len(xte), 2000):
-            correct += (model(xte[i:i + 2000]).argmax(1) == yte[i:i + 2000]).sum().item()
-        model.train()
-        return correct / len(xte)
-
-    opt = torch.optim.Adam(model.parameters(), lr=lr)
     print(f"  training on {len(xtr)} images ({dev}), {len(loader)} steps/epoch. watch test accuracy:")
-    print(f"        before training : test acc {test_acc() * 100:5.2f}%   (~chance, 10 classes)")
-    for ep in range(1, epochs + 1):
-        run = 0.0
-        for xb, yb in loader:
-            xb, yb = xb.to(dev), yb.to(dev)
-            loss = F.cross_entropy(model(xb), yb)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            run += loss.item()
-        print(f"        epoch {ep}         : train loss {run / len(loader):.4f}   test acc {test_acc() * 100:5.2f}%")
+    print(f"        before training : test acc {test_acc(model) * 100:5.2f}%   (~chance, 10 classes)")
+    cnn_acc = fit(model, verbose=True)
+
+    # ---- a trained baseline: does a BIGGER dense net do better? (exp_3 opens why not) ---------
+    # make the params aside concrete: a flatten->768->10 MLP whose FIRST layer alone is 784*768+768 =
+    # 602,880. Same data, same optimizer, same epochs. More params, and it STILL reads digits worse.
+    torch.manual_seed(seed)
+    mlp = nn.Sequential(
+        nn.Flatten(),
+        nn.Linear(28 * 28, 768), nn.ReLU(),
+        nn.Linear(768, 10),
+    ).to(dev)
+    mlp_params = sum(p.numel() for p in mlp.parameters())
+    print(f"\n  a BIGGER dense baseline (flatten -> 768 -> 10; first layer 784x768+768 = 602,880):")
+    mlp_acc = fit(mlp, verbose=False)
+    print(f"        MLP  {mlp_params:>7,} params : test acc {mlp_acc * 100:5.2f}%")
+    print(f"        CNN  {n_params:>7,} params : test acc {cnn_acc * 100:5.2f}%")
+    print(f"      -> ~{mlp_params / n_params:.0f}x the params, yet it reads digits WORSE. Size isn't the CNN's edge —")
+    print("         the right BIAS for images is. exp_3 opens WHY (locality + translation equivariance).")
 
     # ---- the payoff: read held-out digits -------------------------------------------------
     import matplotlib
@@ -291,8 +315,8 @@ def exp_2_open_features(seed=0):
 #       input it must relearn per position. A conv slides ONE kernel over every position, so shifting
 #       the input just SHIFTS the feature map: featmap(shift(x)) = shift(featmap(x)) — translation
 #       EQUIVARIANCE, which we verify to numerical noise.
-#   (B) PARAMETER BLOW-UP. A dense first layer 784 -> H costs 784*H weights (exp_1's aside: 784*768 =
-#       602,880). A conv learns one tiny 3x3 kernel per channel and REUSES it at all 784 positions —
+#   (B) PARAMETER BLOW-UP. A dense first layer 784 -> H costs 784*H + H params (exp_1's aside:
+#       784*768+768 = 602,880). A conv learns one tiny 3x3 kernel per channel and REUSES it at all 784 positions —
 #       exp_1's first conv is 160 weights. ~3,700x fewer, and the right bias baked in.
 # ---------------------------------------------------------------------------
 def exp_3_why_conv(seed=0):
@@ -768,12 +792,12 @@ def exp_6_head_and_loss(seed=0):
 
 
 def run_experiments():
-    # exp_1_whole_game()
+    exp_1_whole_game()
     # exp_2_open_features()
     # exp_3_why_conv()
     # exp_4_stack_and_relu()
     # exp_5_downsample()
-    exp_6_head_and_loss()
+    # exp_6_head_and_loss()
 
 
 if __name__ == "__main__":

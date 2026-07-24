@@ -32,8 +32,8 @@ b = f.mean(dim=(2, 3))                       # (2, 64, 7, 7) -> (2, 64)
 size; at `k=1` it's exactly this global mean.
 
 Global-average-pool is the **standard** head on big images (ResNet, etc.): when the object can sit
-anywhere in the frame, averaging over position gives you translation *invariance*, which is exactly
-what you want. But MNIST digits are **centered** — *where* a stroke sits is a genuine cue (a
+anywhere in the frame, averaging over position gives you translation *invariance* (shift the
+input → output unchanged), which is exactly what you want. But MNIST digits are **centered** — *where* a stroke sits is a genuine cue (a
 horizontal bar near the top vs. the middle helps separate a `7` from a `2`). So here, throwing
 position away should hurt. Same trunk, same init, 3 epochs on 20k images, **only the head differs:**
 
