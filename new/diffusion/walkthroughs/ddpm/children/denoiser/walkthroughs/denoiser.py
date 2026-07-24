@@ -171,6 +171,29 @@ class TinyUNet(nn.Module):
         return self.out(F.silu(self.out_norm(u)))                        # (B, 1, 28, 28) predicted ε
 
 
+class FlatNet(nn.Module):
+    """The ablation for 'why down/up': same DEPTH as TinyUNet (stem + 6 _Blocks + out = 14 convs) but
+    NO pooling — every block runs at full 28x28, channels held at `base`. Same conv COUNT means the same
+    theoretical receptive field, yet with no pool the EFFECTIVE receptive field grows only ~√depth, so a
+    center output pixel never really sees the whole digit (measured in exp_3). Callable as net(x, t)."""
+
+    def __init__(self, base=32, temb_dim=128):
+        super().__init__()
+        self.temb_dim = temb_dim
+        self.time_mlp = nn.Sequential(nn.Linear(temb_dim, temb_dim), nn.SiLU(), nn.Linear(temb_dim, temb_dim))
+        self.stem = nn.Conv2d(1, base, 3, padding=1)
+        self.blocks = nn.ModuleList([_Block(base, base, temb_dim) for _ in range(6)])  # 6 blocks, all 28x28
+        self.out_norm = nn.GroupNorm(8, base)
+        self.out = nn.Conv2d(base, 1, 3, padding=1)
+
+    def forward(self, x, t):
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))
+        h = self.stem(x)
+        for b in self.blocks:
+            h = b(h, temb)                                               # stays 28x28 the whole way
+        return self.out(F.silu(self.out_norm(h)))
+
+
 def _recover_x0(x_t, eps_hat, ab):
     """Invert the forward closed form for x0 given a noise estimate: x̂0 = (x_t - √(1-ᾱ)·ε̂)/√ᾱ.
     ab is ᾱ_t reshaped to broadcast over pixels. (This is exactly the algebra the sampler uses.)"""
@@ -181,6 +204,31 @@ def _hf(e):
     """High-frequency-energy proxy: the variance LEFT after a 3x3 local blur. A grainy ε̂ (fine
     pixel detail, like real ε) scores high; a smooth low-frequency ghost scores near 0."""
     return (e - F.avg_pool2d(e, 3, 1, 1)).pow(2).mean().item()
+
+
+def _effective_rf(make_net, dev, seed, n_avg=8, size=28):
+    """Measure the EFFECTIVE receptive field of the CENTER output pixel: how much each input pixel
+    actually influences it. For fresh random nets (RF is an ARCHITECTURE property, no training needed)
+    we push a random image through, backprop from output[center], and accumulate |∂out_center/∂input|.
+    Averaging over n_avg random (net, input) draws smooths the map (the standard ERF recipe). Returns
+    (mean influence map (size,size), effective radius = RMS spread in px, coverage = frac pixels >1% max)."""
+    c = size // 2
+    accum = torch.zeros(size, size)
+    for k in range(n_avg):
+        torch.manual_seed(seed + k)
+        net = make_net().to(dev).eval()
+        x = torch.randn(1, 1, size, size, device=dev, requires_grad=True)  # normal operating regime
+        t = torch.randint(0, 1000, (1,), device=dev)
+        net.zero_grad(set_to_none=True)
+        net(x, t)[0, 0, c, c].backward()                                # influence of every input pixel
+        accum += x.grad.detach().abs()[0, 0].cpu()
+    g = accum / n_avg
+    p = g / g.sum()                                                     # normalize to a distribution
+    ys, xs = torch.meshgrid(torch.arange(size), torch.arange(size), indexing="ij")
+    dist2 = (ys - c).float() ** 2 + (xs - c).float() ** 2
+    eff_radius = (p * dist2).sum().sqrt().item()                        # RMS distance of influence
+    coverage = (g > 0.01 * g.max()).float().mean().item()              # frac of pixels that matter
+    return g, eff_radius, coverage
 
 
 def _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed, use_skips=True):
@@ -321,7 +369,7 @@ def exp_1_whole_game(seed=0, T=1000, base=32, n_train=4000, batch_size=128, step
     out = os.path.join(_FIGS, "01_denoise.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
-    print(f"  wrote {out} — clean / noised / predicted ε̂ / recovered x̂0.")
+    print(f"  wrote {os.path.relpath(out, _HERE)} — clean / noised / predicted ε̂ / recovered x̂0.")
     print("  That's the whole game of the denoiser: an image->image net that denoises. Next (exp_2):")
     print("  WHY the skip connections — ablate them and watch the recovered digit go blurry.")
 
@@ -416,15 +464,80 @@ def exp_2_why_skips(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps
     out = os.path.join(_FIGS, "02_why_skips.png")
     fig.savefig(out, dpi=130, bbox_inches="tight")
     plt.close(fig)
-    print(f"  wrote {out} — with-vs-without skips: ε̂ grain and recovered digit.")
+    print(f"  wrote {os.path.relpath(out, _HERE)} — with-vs-without skips: ε̂ grain and recovered digit.")
     print("  So the U-Net = autoencoder + detail highways. Next (exp_3): WHY down/up at all — the")
     print("  receptive field, i.e. why pooling to 7x7 lets a small net see the WHOLE digit cheaply.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 3 (why down/up): exp_2 showed the 7x7 bottleneck forces us to add skips — so why pool down to
+# 7x7 at ALL? Because a plain 3x3 conv only sees its 8 neighbours; to denoise a stroke CONSISTENTLY the
+# net must know the GLOBAL digit (is this arc part of a 3 or an 8?). Pooling is how a SMALL conv net
+# buys that reach: each pool DOUBLES how far a later conv sees, in original pixels. We prove it by
+# measuring the EFFECTIVE receptive field of a center output pixel for the real U-Net vs a FLAT net with
+# the SAME number of convs but no pooling — same conv count (same theoretical reach), yet the flat net's
+# effective reach is a tiny central blob (~√depth), while the U-Net's spans the whole 28x28. And it's
+# CHEAP: a conv at 7x7 costs (7/28)^2 = 1/16 the FLOPs of one at 28x28. Reach AND cost, both from pool.
+# ---------------------------------------------------------------------------
+def exp_3_why_down_up(seed=0, base=32, n_avg=8):
+    """Why down/up at all: to denoise a stroke consistently the net needs the GLOBAL digit, but a 3x3
+    conv sees only its neighbours. Pooling buys reach cheaply. Measure the EFFECTIVE receptive field of a
+    center output pixel for the real TinyUNet vs a FLAT net with the SAME conv count but no pool: same
+    theoretical reach, but the flat net's effective reach is a tiny blob while the U-Net's covers 28x28.
+    Architectural (no training needed) — averaged over a few random inits. exp_4 opens WHY t is an input."""
+    _banner("LAYER 3: why down/up — pooling buys a big receptive field cheaply; a flat net can't reach")
+
+    dev = _device()
+    print("  the puzzle: a 3x3 conv sees only its 8 neighbours. But to predict the noise on a stroke")
+    print("  CONSISTENTLY, the net must know the whole digit (is this arc part of a 3 or an 8?). How")
+    print("  does a SMALL conv net see all 28x28? pooling: each pool DOUBLES a later conv's reach in")
+    print("  original pixels, so the 7x7 mid block has the entire digit in view.\n")
+
+    print(f"  measuring the EFFECTIVE receptive field of the center output pixel (avg over {n_avg} random")
+    print("  inits — it's an architecture property, no training needed):")
+    print("    real TinyUNet (down/up, 3 pools)   vs   FlatNet (same 14 convs, NO pool, all at 28x28)\n")
+
+    g_flat, r_flat, cov_flat = _effective_rf(lambda: FlatNet(base=base), dev, seed=seed, n_avg=n_avg)
+    g_unet, r_unet, cov_unet = _effective_rf(lambda: TinyUNet(base=base), dev, seed=seed, n_avg=n_avg)
+
+    print(f"    effective radius (RMS spread)   FlatNet {r_flat:5.2f} px   |   TinyUNet {r_unet:5.2f} px")
+    print(f"    coverage (frac of pixels >1% max) FlatNet {cov_flat:5.1%}   |   TinyUNet {cov_unet:5.1%}")
+    print("    SAME 14 convs, so the same reach ON PAPER — but with no pool the flat net's influence")
+    print("    stays a small central blob (~√depth); the U-Net's spans the whole digit. And it's cheap:")
+    print("    a conv at 7x7 costs (7/28)^2 = 1/16 the FLOPs of one at 28x28 — deep reach, small bill.\n")
+
+    # ---- payoff figure: the two effective-receptive-field maps, side by side ------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Circle
+    size = g_flat.shape[0]
+    c = size // 2
+    fig, axes = plt.subplots(1, 2, figsize=(7.2, 3.9))
+    for ax, g, name, r in [(axes[0], g_flat, "FlatNet (no pool)", r_flat),
+                           (axes[1], g_unet, "TinyUNet (down/up)", r_unet)]:
+        ax.imshow((g / g.max()).numpy(), cmap="magma", vmin=0, vmax=1)
+        ax.add_patch(Circle((c, c), r, fill=False, color="cyan", lw=1.4, ls="--"))  # effective radius
+        ax.plot(c, c, "+", color="cyan", ms=8)
+        ax.set_title(f"{name}\neff. radius {r:.1f}px", fontsize=9)
+        ax.set_xticks([]); ax.set_yticks([])
+    fig.suptitle("effective receptive field of the CENTER output pixel (brighter = more influence)\n"
+                 "same 14 convs — but pooling lets the U-Net's center pixel SEE the whole 28x28 digit",
+                 fontsize=10)
+    fig.tight_layout(rect=(0, 0, 1, 0.9))
+    os.makedirs(_FIGS, exist_ok=True)
+    out = os.path.join(_FIGS, "03_why_down_up.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  wrote {os.path.relpath(out, _HERE)} — effective receptive field: flat blob vs full-digit reach.")
+    print("  So down/up isn't just about the bottleneck — it's how a small net gets GLOBAL sight cheaply.")
+    print("  Next (exp_4): WHY t is an input — the same x_t means different things at different levels.")
+
+
 def run_experiments():
     # exp_1_whole_game()
-    exp_2_why_skips()
-    # exp_3_why_down_up()
+    # exp_2_why_skips()
+    exp_3_why_down_up()
     # exp_4_why_t_input()
     # exp_5_how_t_enters()
     # exp_6_the_block()
