@@ -792,10 +792,10 @@ def exp_6_head_and_loss(seed=0):
 
 
 def run_experiments():
-    exp_1_whole_game()
+    # exp_1_whole_game()
     # exp_2_open_features()
     # exp_3_why_conv()
-    # exp_4_stack_and_relu()
+    exp_4_stack_and_relu()
     # exp_5_downsample()
     # exp_6_head_and_loss()
 

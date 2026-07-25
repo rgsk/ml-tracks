@@ -52,6 +52,9 @@ to reach `RF 28`; only ~4 stride-2.
 Same depth — **3 convs** — but the stride-2 cell's `15×15` window covers half the digit where the
 stride-1 cell's `7×7` sees a sliver. *That's* what stride buys: reach, cheaply.
 
+<img src="../figures/handmade/receptive_field_stride_1.png" alt="receptive_field_stride_1" width="500px">
+<img src="../figures/handmade/receptive_field_stride_2.png" alt="receptive_field_stride_2" width="500px">
+
 ---
 
 ## 3. Channels grow *for free* — the footprint stays bounded

@@ -35,6 +35,8 @@ It grows `3×3 → 5×5 → 7×7` — one cell more of context per layer, per si
 exp_5's stride-2 downsampling is what makes it *explode* so late layers see the whole `28×28` digit
 without dozens of layers.)
 
+<img src="../figures/handmade/receptive_field_stride_1.png" alt="receptive_field_stride_1" width="500px">
+
 ---
 
 ## 2. Why the ReLU — without it the stack collapses to one conv
