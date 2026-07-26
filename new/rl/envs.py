@@ -72,15 +72,17 @@ class GridWorld:
         cell = self.states[self.s]
         actual = int(self.rng.choice([a, (a + 1) % 4, (a - 1) % 4],
                                      p=[1 - self.noise, self.noise / 2, self.noise / 2]))
-        nxt = self._move(cell, actual)
+        nxt = self.intended_move(cell, actual)
         reward = self.terminals.get(nxt, self.step_reward)
         done = nxt in self.terminals
         self.s = self.s2i[nxt]
         return self.s, reward, done
 
-    # --- the model (used from exp_3 on) ------------------------------------------------------
-    def _move(self, cell: tuple[int, int], a: int) -> tuple[int, int]:
-        """Where action `a` lands you from `cell`, ignoring slip. Wall/edge -> stay put."""
+    # --- the model side: not part of the black box -------------------------------------------
+    def intended_move(self, cell: tuple[int, int], a: int) -> tuple[int, int]:
+        """Where action `a` lands you from `cell` IF it doesn't slip. Wall/edge -> stay put.
+
+        Used to build `P` and to draw intended routes in figures — an agent never gets this."""
         dr, dc = DIRS[a]
         nxt = (cell[0] + dr, cell[1] + dc)
         if (not 0 <= nxt[0] < self.rows or not 0 <= nxt[1] < self.cols
@@ -103,7 +105,7 @@ class GridWorld:
                             (a - 1) % 4: self.noise / 2}
                 agg: dict[int, list] = {}       # next_state -> [prob, reward, done]
                 for act, prob in outcomes.items():
-                    nxt = self._move(cell, act)
+                    nxt = self.intended_move(cell, act)
                     ns = self.s2i[nxt]
                     if ns in agg:               # two different slips can land in the same cell
                         agg[ns][0] += prob

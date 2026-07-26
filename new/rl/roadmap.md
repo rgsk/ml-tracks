@@ -26,6 +26,7 @@ new/rl/
       q_learning.py            experiments exp_1 .. exp_N
       notes/*.md               one write-up per experiment
       figures/{experiments,generated,handmade}/
+      children/environment/    dig-in: the MDP — (S,A,P,R,γ), the return, γ, reward design
       children/exploration/    dig-in: bandits (one state, k arms) — the ε knob on its own
     dqn/                       rung 2 — Q with a neural net (CartPole)
     ppo/                       rung 3 — learn the policy directly (CartPole → continuous)
@@ -51,10 +52,12 @@ policy printed as arrows. Rough narration only: *score every (state, action), ac
 nudge each score toward what actually happened next.*
 > After this you have the vocabulary. Everything below opens one box of this agent.
 
-**`exp_2` — the environment (what an MDP actually is).** `(S, A, P, R, γ)` and the `reset`/`step`
-interface; episode, trajectory, the return `G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + …`. Why discount at
-all, made visible: **sweep γ and watch the optimal route change** (low γ = impatient, takes the risky
-shortcut; high γ = takes the safe long way).
+**`exp_2` — the environment (what an MDP actually is)** → dig-in `children/environment/`. Big enough
+for its own folder: `(S, A, P, R, γ)` and the Markov property, the `reset`/`step` black box (the samples
+*are* the model), episodes and the return `G_t = r_t + γ·r_{t+1} + γ²·r_{t+2} + …`, **γ as the patience
+dial**, reward design (the `-0.04` is a choice — reward hacking in miniature), and termination vs
+truncation. Opens on the whole-game move: **the same agent, four worlds** — turn `P` and `R` and watch
+the learned behaviour flip, including one world where diving into the `-1` is correct.
 
 **`exp_3` — the value functions + the ground truth.** `V^π`, `Q^π`, and the Bellman equations as
 "value now = reward now + γ·value next". With the model **known**, solve exactly: policy evaluation,
