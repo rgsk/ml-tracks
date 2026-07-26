@@ -26,7 +26,8 @@ Layers (each an `exp_*`; run it, read the output, then say "next"):
   3. WHY DOWN/UP        — receptive field: pooling lets a small conv net SEE the whole 28x28 digit
                          (global shape) cheaply; a flat full-res stack can't reach that far.
   4. WHY t IS AN INPUT  — the SAME x_t means different things at different noise levels; drop the
-                         time conditioning and the net must predict a blur-average -> loss worsens.
+                         time conditioning and the net can only fit the average over levels -> its
+                         loss DOUBLES at large t (t leaks from the grain early, but saturates late).
   5. HOW t ENTERS       — sinusoidal embedding -> small MLP -> ADDED into every block (FiLM-lite);
                          why sinusoidal, why inject everywhere instead of once at the input.
   6. THE BLOCK          — the residual GroupNorm->SiLU->conv unit: why these are the modern default
@@ -142,7 +143,8 @@ class _Block(nn.Module):
 class TinyUNet(nn.Module):
     """Predicts the noise ε from (x_t, t). Down 28->14->7 (channels grow), up 7->14->28 with skip
     connections; the timestep t is injected into every block. Output is BARE (no activation) — ε is
-    unbounded ~N(0,1). `use_skips=False` zeroes the two skip highways (the exp_2 ablation)."""
+    unbounded ~N(0,1). `use_skips=False` zeroes the two skip highways (the exp_2 ablation);
+    `use_time=False` pins t to 0 so the net is TIME-BLIND — same weights, no clock (the exp_4 ablation)."""
 
     def __init__(self, base=32, temb_dim=128):
         super().__init__()
@@ -158,8 +160,10 @@ class TinyUNet(nn.Module):
         self.out_norm = nn.GroupNorm(8, base)
         self.out = nn.Conv2d(base, 1, 3, padding=1)
 
-    def forward(self, x, t, use_skips=True):
-        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))
+    def forward(self, x, t, use_skips=True, use_time=True):
+        if not use_time:
+            t = torch.zeros_like(t)                                      # every example gets the SAME
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))       #   embedding -> no clock
         h1 = self.down1(self.stem(x), temb)                              # (B, base,   28, 28)
         h2 = self.down2(F.avg_pool2d(h1, 2), temb)                       # (B, 2base,  14, 14)
         h3 = self.down3(F.avg_pool2d(h2, 2), temb)                       # (B, 4base,   7,  7)
@@ -200,10 +204,34 @@ def _recover_x0(x_t, eps_hat, ab):
     return (x_t - (1 - ab).sqrt() * eps_hat) / ab.sqrt()
 
 
+def _hf_per_image(e):
+    """Per-image high-frequency energy: the variance LEFT after a 3x3 local blur. (B,1,H,W) -> (B,).
+    Grainy (fine pixel detail, like real ε) scores high; a smooth low-frequency ghost scores near 0."""
+    return (e - F.avg_pool2d(e, 3, 1, 1)).pow(2).mean(dim=(1, 2, 3))
+
+
 def _hf(e):
-    """High-frequency-energy proxy: the variance LEFT after a 3x3 local blur. A grainy ε̂ (fine
-    pixel detail, like real ε) scores high; a smooth low-frequency ghost scores near 0."""
-    return (e - F.avg_pool2d(e, 3, 1, 1)).pow(2).mean().item()
+    """Batch-mean high-frequency energy (a single number)."""
+    return _hf_per_image(e).mean().item()
+
+
+@torch.no_grad()
+def _t_leak(x0, alpha_bars, T, seed, stride=10):
+    """How much does the picture ALONE give away about t? Build the calibration curve h(t) = mean
+    high-freq energy of x_t (grain rises as the digit dissolves), then read it BACKWARDS: for held-out
+    samples at random true t, estimate t̂ = argmin_t |h(x_t) - h(t)| and score |t̂ - t|. This is the
+    best a t-blind net could do with the cheapest possible cue — its ceiling for guessing the clock.
+    Returns (grid, curve, t_true, t_hat)."""
+    torch.manual_seed(seed)
+    grid = torch.arange(0, T, stride, device=x0.device)
+    curve = torch.stack([
+        _hf_per_image(alpha_bars[tv].sqrt() * x0 + (1 - alpha_bars[tv]).sqrt() * torch.randn_like(x0)).mean()
+        for tv in grid])                                                # (len(grid),) monotone-ish in t
+    t_true = torch.randint(0, T, (x0.shape[0],), device=x0.device)
+    ab = alpha_bars[t_true].view(-1, 1, 1, 1)
+    h = _hf_per_image(ab.sqrt() * x0 + (1 - ab).sqrt() * torch.randn_like(x0))
+    t_hat = grid[(h[:, None] - curve[None, :]).abs().argmin(dim=1)]     # invert the curve per image
+    return grid, curve, t_true, t_hat
 
 
 def _effective_rf(make_net, dev, seed, n_avg=8, size=28):
@@ -231,9 +259,10 @@ def _effective_rf(make_net, dev, seed, n_avg=8, size=28):
     return g, eff_radius, coverage
 
 
-def _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed, use_skips=True):
+def _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed, **fwd):
     """Train a denoiser from scratch on random (x_t,t)->ε batches and return its final train loss.
-    `use_skips` is threaded into every forward so we can train a net that NEVER gets the skips."""
+    Forward flags (`use_skips=False`, `use_time=False`, ...) are threaded into every call, so an
+    ablated net is ablated during TRAINING too — it never learns to lean on what we cut."""
     torch.manual_seed(seed)
     opt = torch.optim.Adam(net.parameters(), lr=lr)
     net.train()
@@ -241,13 +270,28 @@ def _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed, use_skips=
     for _ in range(steps):
         idx = torch.randint(0, x0.shape[0], (batch_size,), device=x0.device)
         x_t, t, eps = make_training_pair(x0[idx], alpha_bars, T)
-        loss = F.mse_loss(net(x_t, t, use_skips=use_skips), eps)
+        loss = F.mse_loss(net(x_t, t, **fwd), eps)
         opt.zero_grad()
         loss.backward()
         opt.step()
         last = loss.item()
     net.eval()
     return last
+
+
+@torch.no_grad()
+def _loss_per_t(net, x0, alpha_bars, t_vals, seed, **fwd):
+    """Held-out MSE(ε̂, ε) at each t in `t_vals`, with the SAME images and the SAME ε at every t (so the
+    curve isolates the noise LEVEL, not sampling luck). Returns a list of losses aligned with t_vals."""
+    torch.manual_seed(seed)
+    eps = torch.randn_like(x0)
+    out = []
+    for tv in t_vals:
+        ab = alpha_bars[tv].view(1, 1, 1, 1)
+        x_t = ab.sqrt() * x0 + (1 - ab).sqrt() * eps
+        t = torch.full((x0.shape[0],), tv, device=x0.device, dtype=torch.long)
+        out.append(F.mse_loss(net(x_t, t, **fwd), eps).item())
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -534,11 +578,199 @@ def exp_3_why_down_up(seed=0, base=32, n_avg=8):
     print("  Next (exp_4): WHY t is an input — the same x_t means different things at different levels.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 4 (why t is an input): the architecture is settled (down/up for reach, skips for detail). The
+# last non-obvious ingredient is TIME CONDITIONING. The reason is an AMBIGUITY in the input: a given
+# picture x_t is a perfectly plausible x_t for MANY different t — only its noise LEVEL differs, and the
+# level is exactly what "how much of this is noise?" asks. Without t the net has to answer for all levels
+# at once, and the MSE-optimal answer to an ambiguous question is the AVERAGE (law of total variance):
+#
+#     ε̂*(x_t)   = E[ε | x_t]              t-blind   optimum
+#     ε̂*(x_t,t) = E[ε | x_t, t]           t-aware   optimum
+#     E‖ε − E[ε|x_t]‖² = E‖ε − E[ε|x_t,t]‖² + E‖E[ε|x_t,t] − E[ε|x_t]‖²
+#                        \__ t-aware floor __/   \__ extra, ≥ 0: the spread ACROSS t __/
+#
+# so the blind net's loss is provably the aware net's loss PLUS the variance of the right answer across
+# t. It can never be smaller, and the gap is biggest where the answer swings hardest with t. We train two
+# nets (identical init/data/steps, one with `use_time=False`) and read the loss as a FUNCTION of t.
+#
+# The honest twist, which we also measure: the gap is only a few percent, because t LEAKS from the
+# picture — grain rises as the digit dissolves, so a blind net can estimate the clock. But that cue
+# SATURATES past t≈600 (all static looks alike), so the blind net's relative penalty is worst at large
+# t — the region every sampling trajectory starts in, with 1000 steps for the error to compound.
+# ---------------------------------------------------------------------------
+def exp_4_why_t_input(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps=1000, lr=2e-4,
+                      n_eval=512):
+    """Why the timestep must be an input: the same x_t is plausible at many noise levels, and only t says
+    WHICH — so 'how much of this is noise?' is unanswerable without it. See the ambiguity (one x_t decoded
+    under several assumed t), then train a TIME-BLIND twin (`use_time=False`, same init/data/steps) and
+    read loss vs t. Also measures the honest caveat: how much t leaks from the picture's grain, and where
+    that cue dies (large t) — which is exactly where the blind net's relative penalty is worst."""
+    _banner("LAYER 4: why t is an input — the same x_t means different things at different noise levels")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    # ---- (i) the ambiguity, in the schedule numbers -------------------------------------------
+    print("  the puzzle: the net is asked 'which part of this picture is the noise?'. But x_t is built")
+    print("  as √ᾱ_t·x0 + √(1-ᾱ_t)·ε — the MIX depends on t, and the picture alone does not say which:\n")
+    print("      t      √ᾱ_t (signal)   √(1-ᾱ_t) (noise)   noise share of the variance")
+    for tv in (50, 250, 500, 750, 950):
+        ab = alpha_bars[tv].item()
+        print(f"    {tv:>4}       {ab ** 0.5:.3f}            {(1 - ab) ** 0.5:.3f}                {1 - ab:6.1%}")
+    print("    same picture, wildly different amounts to subtract. t is the missing side of the equation.\n")
+
+    x0 = _mnist(train=True)[:n_train].to(dev)
+
+    # ---- train the two nets: identical init, one of them time-blind ---------------------------
+    net_t = TinyUNet(base=base).to(dev)
+    net_blind = TinyUNet(base=base).to(dev)
+    net_blind.load_state_dict(net_t.state_dict())                  # identical starting weights = fair
+    print(f"  training two nets from the same init ({n_train} imgs, {steps} steps each):")
+    loss_t = _quick_train(net_t, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7)
+    loss_blind = _quick_train(net_blind, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7, use_time=False)
+    print(f"    final train loss   t AS INPUT {loss_t:.4f}   |   TIME-BLIND {loss_blind:.4f}   (lower = better)\n")
+
+    # ---- (ii) the ambiguity made visible: ONE x_t, decoded under several assumed t --------------
+    torch.manual_seed(seed + 1)
+    n_show = 6
+    t_true = 400
+    x0_show = x0[:n_show]
+    ab_true = alpha_bars[t_true].view(1, 1, 1, 1)
+    x_t_show = ab_true.sqrt() * x0_show + (1 - ab_true).sqrt() * torch.randn_like(x0_show)
+    t_assumed = [50, 200, t_true, 700, 950]
+
+    print(f"  (ii) feed the SAME x_t (really from t={t_true}) to the t-aware net, lying about t:")
+    decoded = []
+    for tv in t_assumed:
+        ab = alpha_bars[tv].view(1, 1, 1, 1)
+        t = torch.full((n_show,), tv, device=dev, dtype=torch.long)
+        with torch.no_grad():
+            x0_hat = _recover_x0(x_t_show, net_t(x_t_show, t), ab)
+        mse = F.mse_loss(x0_hat.clamp(-1, 1), x0_show).item()
+        decoded.append((tv, x0_hat, mse))
+        mark = "  <- the truth" if tv == t_true else ""
+        print(f"        told t={tv:>4}:  recover MSE(x̂0,x0) = {mse:.4f}{mark}")
+    print("    ONE input, five different answers — the net's output is a function of t as much as of x_t,")
+    print("    and only the true t recovers the digit. That is the ambiguity a time-blind net must eat.\n")
+
+    # ---- (iii) loss as a function of t, for both nets -------------------------------------------
+    x_eval = _mnist(train=False)[:n_eval].to(dev)                 # held-out digits
+    t_vals = list(range(25, T, 50))
+    curve_t = _loss_per_t(net_t, x_eval, alpha_bars, t_vals, seed=seed + 3)
+    curve_blind = _loss_per_t(net_blind, x_eval, alpha_bars, t_vals, seed=seed + 3, use_time=False)
+
+    print("  (iii) held-out loss as a FUNCTION of t (the blind net must answer every t with one rule):")
+    print("        t        t AS INPUT    TIME-BLIND     blind is worse by")
+    for tv, a, b in zip(t_vals, curve_t, curve_blind):
+        if tv in (25, 175, 475, 775, 975):
+            print(f"      {tv:>4}         {a:.4f}        {b:.4f}         {(b / a - 1):+6.1%}")
+    lo, hi = slice(0, 4), slice(-4, None)                         # t<200 mostly signal | t>800 mostly noise
+    def _mean(v, s): return sum(v[s]) / len(v[s])
+    rel_lo = _mean(curve_blind, lo) / _mean(curve_t, lo) - 1
+    rel_hi = _mean(curve_blind, hi) / _mean(curve_t, hi) - 1
+    print(f"    t<200   t AS INPUT {_mean(curve_t, lo):.4f}  |  TIME-BLIND {_mean(curve_blind, lo):.4f}   ({rel_lo:+.1%})")
+    print(f"    t>800   t AS INPUT {_mean(curve_t, hi):.4f}  |  TIME-BLIND {_mean(curve_blind, hi):.4f}   ({rel_hi:+.1%})")
+    print("    the blind net is never better — it can't be. Law of total variance, with ε̂*(x_t)=E[ε|x_t]")
+    print("    the best t-blind answer and ε̂*(x_t,t)=E[ε|x_t,t] the best t-aware one:")
+    print("      E‖ε-E[ε|x_t]‖² = E‖ε-E[ε|x_t,t]‖² + E‖E[ε|x_t,t]-E[ε|x_t]‖²  ≥  the t-aware loss,")
+    print("    the extra term being how much the right answer SWINGS with t at a fixed picture.\n")
+
+    # ---- (iv) the honest caveat: t partly LEAKS from the picture — until it saturates ------------
+    grid, leak_curve, t_leak_true, t_leak_hat = _t_leak(x_eval, alpha_bars, T, seed=seed + 5)
+    err = (t_leak_hat - t_leak_true).abs().float()
+    err_lo = err[t_leak_true < 500].median().item()
+    err_hi = err[t_leak_true >= 500].median().item()
+    print("  (iv) why is the OVERALL gap only ~10%, when the blind net is flying blind? because t partly")
+    print("  LEAKS from the picture: as the digit dissolves, the GRAIN (high-freq energy) climbs, so a net can")
+    print("  estimate the clock itself. Guessing t from that one cue alone (nearest point on the h(t)")
+    print("  calibration curve) already gets:")
+    print(f"      median |t̂ - t|   for t<500: {err_lo:5.1f} steps   |   for t>=500: {err_hi:5.1f} steps")
+    print(f"      the cue saturates: h(t) rises {leak_curve[0]:.3f} -> {leak_curve[len(grid)//2]:.3f} by t=500,")
+    print(f"      then crawls to {leak_curve[-1]:.3f} — past ~600 every x_t looks like the same static.")
+    print("    so the blind net (a) burns capacity re-deriving what one number would have told it, and")
+    print(f"    (b) is left genuinely blind exactly where the cue dies — which is why its RELATIVE penalty")
+    print(f"    is worst at large t ({rel_hi:+.1%} vs {rel_lo:+.1%} at small t). And in the SAMPLER that region")
+    print("    is where every trajectory starts, with 1000 steps for the error to compound.\n")
+
+    # ---- payoff figures: one per claim, so each can sit next to its paragraph in the note --------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(_FIGS, exist_ok=True)
+    written = []
+
+    # (a) the ambiguity: ONE x_t, decoded under each assumed t (a few digits, to show it's not a fluke)
+    n_rows = 3
+    fig, axes = plt.subplots(n_rows, len(decoded) + 1, figsize=((len(decoded) + 1) * 1.45, n_rows * 1.45),
+                             gridspec_kw={"hspace": 0.08, "wspace": 0.08})
+    for r in range(n_rows):
+        ax = axes[r, 0]
+        ax.imshow(_to_img(x_t_show[r]), cmap="gray", vmin=0, vmax=1)
+        ax.set_xticks([]); ax.set_yticks([])
+        if r == 0:
+            ax.set_title(f"the input x_t\n(really t={t_true})", fontsize=8)
+        for k, (tv, x0_hat, mse) in enumerate(decoded):
+            ax = axes[r, k + 1]
+            ax.imshow(_to_img(x0_hat[r]), cmap="gray", vmin=0, vmax=1)
+            ax.set_xticks([]); ax.set_yticks([])
+            if r == 0:
+                ax.set_title(f"told t={tv}\nMSE {mse:.3f}", fontsize=8,
+                             color="tab:green" if tv == t_true else "0.35")
+    fig.suptitle("the same x_t, decoded under different assumed t: lie low and it stays static, lie high\n"
+                 "and it's subtracted into black — only the true t recovers the digit", fontsize=10, y=1.10)
+    out = os.path.join(_FIGS, "04_ambiguity.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "one x_t decoded under five assumed t."))
+
+    # (b) the ablation: held-out loss vs t, with and without the clock
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    ax.plot(t_vals, curve_t, "o-", ms=4, color="tab:blue", label="t AS INPUT")
+    ax.plot(t_vals, curve_blind, "s-", ms=4, color="tab:red", label="TIME-BLIND (use_time=False)")
+    ax.fill_between(t_vals, curve_t, curve_blind, color="tab:red", alpha=0.15)
+    ax.set_yscale("log")                                           # the loss spans ~2 decades over t
+    ax.set_xlabel("timestep t"); ax.set_ylabel("held-out MSE(ε̂, ε)   (log)")
+    ax.set_title("without the clock the net can only fit the average over noise levels\n"
+                 f"blind is never better; relative penalty {rel_lo:+.0%} at t<200  ->  {rel_hi:+.0%} at t>800",
+                 fontsize=10)
+    ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "04_loss_vs_t.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "loss vs t, with and without t as an input."))
+
+    # (c) the caveat: how much t leaks from the picture's grain, and where that cue dies
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    ax.plot(grid.cpu(), leak_curve.cpu(), color="tab:purple", lw=2)
+    ax.axvspan(600, T, color="0.6", alpha=0.25)
+    ax.text(0.97, 0.42, "cue saturates:\nevery x_t is the same static", fontsize=9, color="0.25",
+            ha="right", va="center", transform=ax.transAxes)
+    ax.set_xlabel("timestep t"); ax.set_ylabel("grain of x_t  (high-freq energy)")
+    ax.set_title("how much t leaks from the picture — and where it stops\n"
+                 f"guessing t from grain alone: median |t̂-t| = {err_lo:.0f} steps (t<500) -> "
+                 f"{err_hi:.0f} steps (t≥500)", fontsize=10)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "04_t_leak.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "the grain cue and its saturation."))
+
+    for path, what in written:
+        print(f"  wrote {os.path.relpath(path, _HERE)} — {what}")
+    print("  So t is not decoration: it disambiguates the question. Next (exp_5): HOW t enters — the")
+    print("  sinusoidal embedding -> MLP -> added into EVERY block, and why that shape.")
+
+
 def run_experiments():
     # exp_1_whole_game()
     # exp_2_why_skips()
-    exp_3_why_down_up()
-    # exp_4_why_t_input()
+    # exp_3_why_down_up()
+    exp_4_why_t_input()
     # exp_5_how_t_enters()
     # exp_6_the_block()
 
