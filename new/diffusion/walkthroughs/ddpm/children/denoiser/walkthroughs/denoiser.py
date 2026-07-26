@@ -31,8 +31,9 @@ Layers (each an `exp_*`; run it, read the output, then say "next"):
   5. HOW t ENTERS       — sinusoidal embedding -> small MLP -> ADDED into every block (FiLM-lite).
                          The code is what matters: sinusoids beat a raw scalar t/T and a free
                          embedding table; injection depth, honestly, doesn't move at this size.
-  6. THE BLOCK          — the residual GroupNorm->SiLU->conv unit: why these are the modern default
-                         (stable training, crisp samples) over BatchNorm / ReLU / plain conv stacks.
+  6. THE BLOCK          — the residual GroupNorm->SiLU->conv unit. BatchNorm is structurally wrong
+                         here (its stats couple across a batch that mixes noise levels); SiLU and the
+                         residual each pay ~2x at large t, where the answer is nearly the identity.
 
 Content re-sequences the old bottom-up diffusion/ denoiser pieces top-down as a child dig-in. The
 model here is the REAL parent TinyUNet (this box's whole job is to open it). No torchvision; shared
@@ -238,6 +239,68 @@ class TimeVariantUNet(TinyUNet):
         u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), h2], 1), rest)
         u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), h1], 1), rest)
         return self.out(F.silu(self.out_norm(u)))
+
+
+class _VariantBlock(nn.Module):
+    """The exp_6 harness: `_Block` with each of its three defaults swappable —
+        norm      "group" (the real thing) | "batch" | "none"
+        act       "silu"  (the real thing) | "relu"
+        residual  True    (the real thing) | False  (drop the `+ skip(x)` highway)
+    Same convs, same timestep injection, same parameter count (BatchNorm/GroupNorm both hold 2C)."""
+
+    def __init__(self, cin, cout, temb_dim, norm="group", act="silu", residual=True):
+        super().__init__()
+        self.norm1, self.norm2 = _make_norm(norm, cin), _make_norm(norm, cout)
+        self.conv1 = nn.Conv2d(cin, cout, 3, padding=1)
+        self.temb = nn.Linear(temb_dim, cout)
+        self.conv2 = nn.Conv2d(cout, cout, 3, padding=1)
+        self.act = act
+        self.residual = residual
+        self.skip = nn.Conv2d(cin, cout, 1) if cin != cout else nn.Identity()
+
+    def forward(self, x, temb):
+        h = self.conv1(_apply_act(self.act, self.norm1(x)))
+        h = h + self.temb(temb)[:, :, None, None]
+        h = self.conv2(_apply_act(self.act, self.norm2(h)))
+        return h + self.skip(x) if self.residual else h
+
+
+def _make_norm(kind, c):
+    if kind == "group":
+        return nn.GroupNorm(8, c)                                        # per-sample, per-group stats
+    if kind == "batch":
+        return nn.BatchNorm2d(c)                                         # per-channel stats OVER THE BATCH
+    return nn.Identity()
+
+
+def _apply_act(kind, x):
+    return F.relu(x) if kind == "relu" else F.silu(x)
+
+
+class BlockVariantUNet(TinyUNet):
+    """The same U-Net wired from `_VariantBlock`s, so exp_6 can ablate one ingredient of the block at a
+    time (norm / activation / residual) with everything else — depth, channels, skips, clock — fixed."""
+
+    def __init__(self, norm="group", act="silu", residual=True, base=32, temb_dim=128):
+        super().__init__(base=base, temb_dim=temb_dim)
+        def mk(cin, cout):
+            return _VariantBlock(cin, cout, temb_dim, norm=norm, act=act, residual=residual)
+        self.down1, self.down2, self.down3 = mk(base, base), mk(base, base * 2), mk(base * 2, base * 4)
+        self.mid = mk(base * 4, base * 4)
+        self.up2 = mk(base * 4 + base * 2, base * 2)
+        self.up1 = mk(base * 2 + base, base)
+        self.out_norm = _make_norm(norm, base)
+        self.act = act
+
+    def forward(self, x, t, **_):
+        temb = self.time_mlp(timestep_embedding(t, self.temb_dim))
+        h1 = self.down1(self.stem(x), temb)
+        h2 = self.down2(F.avg_pool2d(h1, 2), temb)
+        h3 = self.down3(F.avg_pool2d(h2, 2), temb)
+        m = self.mid(h3, temb)
+        u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), h2], 1), temb)
+        u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), h1], 1), temb)
+        return self.out(_apply_act(self.act, self.out_norm(u)))
 
 
 def _recover_x0(x_t, eps_hat, ab):
@@ -1003,13 +1066,186 @@ def exp_5_how_t_enters(seed=0, T=1000, base=32, n_train=4000, batch_size=128, st
     print("  and what BatchNorm / ReLU / a plain conv stack cost instead.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 6 (the block): every box is open except the unit the whole net is built from —
+#
+#     GroupNorm -> SiLU -> conv3x3   (+temb)   GroupNorm -> SiLU -> conv3x3   + skip(x)
+#
+# Three defaults to justify: the NORM (why GroupNorm, not BatchNorm), the ACTIVATION (why SiLU, not
+# ReLU), and the RESIDUAL. We ablate one at a time and read loss vs t. Two things make this box more
+# than a leaderboard:
+#
+#   * BatchNorm is not merely worse, it is STRUCTURALLY wrong for diffusion: its statistics are shared
+#     across the batch, and a training batch MIXES noise levels while a sampling batch is all one t. So
+#     the stats the net trained under never recur at sampling time. We measure both failure modes.
+#   * the differences all live at LARGE t — and there is a reason. At large t, x_t ≈ ε, so the optimal
+#     answer ε̂ = x_t is nearly the IDENTITY MAP. How cheaply an architecture can express a pass-through
+#     is exactly what residual highways decide, which is why that region separates the variants. We plot
+#     the zero-parameter "copy the input" rule alongside, and it is humbling.
+# ---------------------------------------------------------------------------
+def exp_6_the_block(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps=1000, lr=2e-4,
+                    n_eval=512, n_init=6):
+    """The residual GroupNorm->SiLU->conv block: ablate the norm (group/batch/none), the activation
+    (SiLU/ReLU) and the residual, one at a time, and read held-out loss vs t. Shows why BatchNorm is
+    structurally wrong here (its stats couple across a batch that mixes noise levels), why the gaps all
+    open at large t (where the answer is nearly the identity map), and what the residual buys at init."""
+    _banner("LAYER 6: the block — GroupNorm -> SiLU -> conv, twice, plus a residual")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    print("  the unit the whole net is built from (_Block), and what each piece is for:")
+    print("      h = conv1(SiLU(GroupNorm(x)))      norm: keep activations at a usable scale")
+    print("      h = h + temb_proj(temb)            the clock (exp_5), added per channel")
+    print("      h = conv2(SiLU(GroupNorm(h)))      activation: smooth, signed, non-saturating")
+    print("      return h + skip(x)                 residual: a free pass-through path")
+    print("  the ablations below change exactly ONE of those three and keep everything else fixed.\n")
+
+    x0 = _mnist(train=True)[:n_train].to(dev)
+    x_eval = _mnist(train=False)[:n_eval].to(dev)
+    t_vals = list(range(25, T, 50))
+
+    variants = [
+        ("GroupNorm + SiLU + residual (real)", dict(), "tab:blue", "-"),
+        ("BatchNorm instead", dict(norm="batch"), "tab:red", "-"),
+        ("no norm at all", dict(norm="none"), "tab:purple", "-"),
+        ("ReLU instead of SiLU", dict(act="relu"), "tab:orange", "-"),
+        ("no residual", dict(residual=False), "tab:green", "-"),
+    ]
+    print(f"  training each variant from scratch ({n_train} imgs, {steps} steps, identical seed):")
+    results = []
+    bn_batch_stats = None
+    for name, kw, color, ls in variants:
+        torch.manual_seed(seed)
+        net = BlockVariantUNet(base=base, **kw).to(dev)
+        loss = _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7)
+        curve = _loss_per_t(net, x_eval, alpha_bars, t_vals, seed=seed + 3)
+        if kw.get("norm") == "batch":
+            net.train()                                    # BN now uses THIS batch's stats, not running
+            bn_batch_stats = _loss_per_t(net, x_eval, alpha_bars, t_vals, seed=seed + 3)
+            net.eval()
+        results.append((name, curve, color, ls))
+        print(f"    {name:<36} train loss {loss:.4f}")
+
+    hi = slice(-4, None)                                   # t>800, the region that separates them
+    def _mean(v): return sum(v[hi]) / len(v[hi])
+    ref = _mean(results[0][1])
+    print("\n  held-out loss at t>800 (where the answer is nearly ε̂ = x_t, the identity map):")
+    for name, curve, _, _ in results:
+        print(f"    {name:<36} {_mean(curve):.4f}   ({_mean(curve) / ref:.2f}x the real block)")
+    print("    dropping ANY of the three costs about 2x there, while the all-t train loss barely moves —")
+    print("    the aggregate number hides it because large-t losses are small in absolute terms.\n")
+
+    # ---- BatchNorm is structurally wrong here, not just worse -----------------------------------
+    print("  WHY NOT BatchNorm — its statistics are shared across the batch, and in diffusion a training")
+    print("  batch mixes noise levels (t random per example) while a SAMPLING batch is all one t. So the")
+    print("  stats it normalized under during training never recur when you use it. Same trained BN net,")
+    print("  scored two ways on batches that are all-one-t (as sampling is):")
+    print("        t          GroupNorm    BN, running stats    BN, this batch's stats")
+    for tv, g, b_run, b_batch in zip(t_vals, results[0][1], results[1][1], bn_batch_stats):
+        if tv in (25, 225, 475, 725, 975):
+            print(f"      {tv:>4}         {g:.4f}          {b_run:.4f}               {b_batch:.4f}")
+    print(f"    running stats: an average over ALL t, so it is wrong at every t ({_mean(results[1][1]) / ref:.1f}x at large t).")
+    print(f"    batch stats:   catastrophic ({_mean(bn_batch_stats) / ref:.0f}x) — a uniform-t batch has statistics the")
+    print("      net never saw. GroupNorm sidesteps both: it normalizes each SAMPLE over channel groups,")
+    print("      so a forward pass never depends on what else is in the batch. Nothing to get wrong.\n")
+
+    # ---- why large t is the discriminating region: the answer there is a pass-through -----------
+    torch.manual_seed(seed + 3)
+    eps_ref = torch.randn_like(x_eval)
+    copy_curve = []
+    for tv in t_vals:                                      # the zero-parameter rule: ε̂ = x_t
+        ab = alpha_bars[tv].view(1, 1, 1, 1)
+        x_t = ab.sqrt() * x_eval + (1 - ab).sqrt() * eps_ref
+        copy_curve.append(F.mse_loss(x_t, eps_ref).item())
+    print("  WHY the gaps live at large t: as ᾱ_t -> 0, x_t -> ε, so the best answer ε̂ = x_t is nearly the")
+    print("  IDENTITY. How cheaply a net can express a pass-through is exactly what the residual decides.")
+    print("  For reference, the zero-parameter rule 'copy the input' scores:")
+    for tv, c, g in zip(t_vals, copy_curve, results[0][1]):
+        if tv in (25, 475, 775, 975):
+            print(f"      t={tv:>4}   copy-the-input {c:8.5f}   |   the real block {g:.5f}")
+    cross = next((tv for tv, c, g in zip(t_vals, copy_curve, results[0][1]) if c < g), None)
+    print(f"    note this honestly: past t≈{cross} our trained net is WORSE than copying its input.")
+    print("    uniform-t training weights every t equally in the loss, but the achievable loss there is")
+    print("    ~1e-4, so those steps contribute almost no gradient and the region stays underfit. That is")
+    print("    what loss-weighting schemes (min-SNR and friends) exist to fix — a later subtopic.\n")
+
+    # ---- what the residual buys at init: how much gradient reaches the first layer ---------------
+    ratios = {}
+    for res in (True, False):
+        stem, deep = [], []
+        for k in range(n_init):
+            torch.manual_seed(seed + k)
+            net = BlockVariantUNet(base=base, residual=res).to(dev)
+            x = torch.randn(32, 1, 28, 28, device=dev)
+            t = torch.randint(0, T, (32,), device=dev)
+            out = net(x, t)
+            net.zero_grad(set_to_none=True)
+            F.mse_loss(out, torch.randn_like(out)).backward()
+            stem.append(net.stem.weight.grad.norm().item())
+            deep.append(net.up1.conv2.weight.grad.norm().item())
+        ratios[res] = sum(stem) / sum(deep)                # fraction of the gradient that survives
+    print(f"  and at INIT (no training, avg of {n_init} random nets): the fraction of the gradient that")
+    print("  survives the trip from the last block back to the stem —")
+    print(f"      with residual {ratios[True]:.3f}   |   without {ratios[False]:.3f}   ({ratios[True] / ratios[False]:.1f}x)")
+    print("    a 2x edge, not a rescue: at 6 blocks nothing vanishes either way. The residual's classic")
+    print("    optimization payoff needs real depth; here it earns its keep on expressivity instead.\n")
+
+    # ---- figures -------------------------------------------------------------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(_FIGS, exist_ok=True)
+    written = []
+
+    fig, ax = plt.subplots(figsize=(7.6, 4.8))
+    for name, curve, color, ls in results:
+        ax.plot(t_vals, curve, ls, marker="o", ms=3, color=color, label=name)
+    ax.plot(t_vals, copy_curve, ":", color="0.4", lw=1.6, label="copy the input (0 params)")
+    ax.set_yscale("log")
+    ax.set_xlabel("timestep t"); ax.set_ylabel("held-out MSE(ε̂, ε)   (log)")
+    ax.set_title("ablate one ingredient of the block at a time\n"
+                 "the all-t train loss barely moves; at large t each ablation costs ~2x", fontsize=10)
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "06_ablations.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "loss vs t for each block ablation, with the copy-the-input reference."))
+
+    fig, ax = plt.subplots(figsize=(7.2, 4.6))
+    ax.plot(t_vals, results[0][1], "o-", ms=3, color="tab:blue", label="GroupNorm (per sample)")
+    ax.plot(t_vals, results[1][1], "s-", ms=3, color="tab:red", label="BatchNorm, running stats")
+    ax.plot(t_vals, bn_batch_stats, "^--", ms=3, color="darkred", label="BatchNorm, this batch's stats")
+    ax.set_yscale("log")
+    ax.set_xlabel("timestep t"); ax.set_ylabel("held-out MSE(ε̂, ε)   (log)")
+    ax.set_title("BatchNorm is structurally wrong for diffusion, not just worse\n"
+                 "training batches MIX noise levels; sampling batches are all one t — its stats never recur",
+                 fontsize=10)
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "06_batchnorm.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "the two ways BatchNorm fails here."))
+
+    for path, what in written:
+        print(f"  wrote {os.path.relpath(path, _HERE)} — {what}")
+    print("  That closes the denoiser: an image->image net (1) with down/up for cheap global sight, (2)")
+    print("  skips for pixel detail, (3) told t because the level is otherwise ambiguous, (4) via a")
+    print("  multi-scale sinusoidal code, (5) built from residual GroupNorm/SiLU blocks. Back to the")
+    print("  parent ddpm.py — the remaining box is SAMPLING (the reverse process).")
+
+
 def run_experiments():
     # exp_1_whole_game()
     # exp_2_why_skips()
     # exp_3_why_down_up()
     # exp_4_why_t_input()
-    exp_5_how_t_enters()
-    # exp_6_the_block()
+    # exp_5_how_t_enters()
+    exp_6_the_block()
 
 
 if __name__ == "__main__":
