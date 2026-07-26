@@ -28,8 +28,9 @@ Layers (each an `exp_*`; run it, read the output, then say "next"):
   4. WHY t IS AN INPUT  — the SAME x_t means different things at different noise levels; drop the
                          time conditioning and the net can only fit the average over levels -> its
                          loss DOUBLES at large t (t leaks from the grain early, but saturates late).
-  5. HOW t ENTERS       — sinusoidal embedding -> small MLP -> ADDED into every block (FiLM-lite);
-                         why sinusoidal, why inject everywhere instead of once at the input.
+  5. HOW t ENTERS       — sinusoidal embedding -> small MLP -> ADDED into every block (FiLM-lite).
+                         The code is what matters: sinusoids beat a raw scalar t/T and a free
+                         embedding table; injection depth, honestly, doesn't move at this size.
   6. THE BLOCK          — the residual GroupNorm->SiLU->conv unit: why these are the modern default
                          (stable training, crisp samples) over BatchNorm / ReLU / plain conv stacks.
 
@@ -196,6 +197,47 @@ class FlatNet(nn.Module):
         for b in self.blocks:
             h = b(h, temb)                                               # stays 28x28 the whole way
         return self.out(F.silu(self.out_norm(h)))
+
+
+class TimeVariantUNet(TinyUNet):
+    """The exp_5 harness: the SAME U-Net, only the CLOCK CHANNEL swapped. Two knobs —
+
+      mode   how t is encoded before the MLP:
+             "sinusoidal" the real thing: cos/sin at many frequencies (multi-scale, shift-invariant)
+             "scalar"     one number t/T — a rank-1 code: every t points the same direction
+             "learned"    a free nn.Embedding table: T independent vectors, no smoothness prior
+      inject where the embedding is ADDED:
+             "all"        into every block (the real thing)
+             "first"      only into down1; the rest get a zero temb and must carry t in activations
+
+    Everything else — channels, blocks, skips, params outside the clock — is TinyUNet's."""
+
+    def __init__(self, mode="sinusoidal", inject="all", T=1000, base=32, temb_dim=128):
+        super().__init__(base=base, temb_dim=temb_dim)
+        self.mode, self.inject, self.T = mode, inject, T
+        if mode == "scalar":
+            self.time_mlp = nn.Sequential(nn.Linear(1, temb_dim), nn.SiLU(), nn.Linear(temb_dim, temb_dim))
+        elif mode == "learned":
+            self.table = nn.Embedding(T, temb_dim)                       # T free vectors, learned
+
+    def encode(self, t):
+        """t (B,) -> the raw code (B, *) handed to time_mlp. This IS the thing exp_5 compares."""
+        if self.mode == "sinusoidal":
+            return timestep_embedding(t, self.temb_dim)
+        if self.mode == "scalar":
+            return (t.float() / self.T)[:, None]                         # (B,1) — one direction only
+        return self.table(t)
+
+    def forward(self, x, t, **_):
+        temb = self.time_mlp(self.encode(t))
+        rest = temb if self.inject == "all" else torch.zeros_like(temb)  # "first": later blocks get none
+        h1 = self.down1(self.stem(x), temb)
+        h2 = self.down2(F.avg_pool2d(h1, 2), rest)
+        h3 = self.down3(F.avg_pool2d(h2, 2), rest)
+        m = self.mid(h3, rest)
+        u = self.up2(torch.cat([F.interpolate(m, scale_factor=2, mode="nearest"), h2], 1), rest)
+        u = self.up1(torch.cat([F.interpolate(u, scale_factor=2, mode="nearest"), h1], 1), rest)
+        return self.out(F.silu(self.out_norm(u)))
 
 
 def _recover_x0(x_t, eps_hat, ab):
@@ -766,12 +808,207 @@ def exp_4_why_t_input(seed=0, T=1000, base=32, n_train=4000, batch_size=128, ste
     print("  sinusoidal embedding -> MLP -> added into EVERY block, and why that shape.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 5 (how t enters): exp_4 settled that the net must be TOLD t. Now the design question — what
+# shape should that channel have? The real net does:
+#
+#     t (an integer) --sinusoidal--> (B,128) --small MLP--> temb --ADD into every block-->
+#
+# Two choices to justify. WHY SINUSOIDAL: write e(t) = [cos(ω_k t) ; sin(ω_k t)], ω_k = 10000^(-k/K).
+# Then, by cos(a)cos(b)+sin(a)sin(b) = cos(a-b),
+#
+#     e(t)·e(t') = Σ_k [cos(ω_k t)cos(ω_k t') + sin(ω_k t)sin(ω_k t')] = Σ_k cos(ω_k·(t-t'))
+#     ‖e(t)‖²    = Σ_k [cos²(ω_k t) + sin²(ω_k t)] = K            (the same for EVERY t)
+#
+# so the code is a constant-length ruler whose geometry depends only on the GAP t-t', read at K scales
+# at once (periods ~6 steps up to ~50,000 steps). Neighbours land close (so what the net learns at t
+# transfers to t±1) while distant levels are far apart. We measure that against the two obvious
+# alternatives — one raw scalar t/T, and a free nn.Embedding table — and then train all three.
+# WHERE it's injected we also measure, and report honestly: at this size it does not matter.
+# ---------------------------------------------------------------------------
+def _code_separation(e, deltas):
+    """How far apart does a code place two timesteps Δ apart, in units of its own scale?
+        sep(Δ) = mean_t ‖e(t+Δ) - e(t)‖ / mean_t ‖e(t)‖
+    Small sep = the two levels look alike to the net (hard to tell apart); large sep = unrelated."""
+    n = e.norm(dim=1).mean()
+    return [((e[d:] - e[:-d]).norm(dim=1).mean() / n).item() for d in deltas]
+
+
+def exp_5_how_t_enters(seed=0, T=1000, base=32, n_train=4000, batch_size=128, steps=1000, lr=2e-4,
+                       n_eval=512, temb_dim=128):
+    """How t enters: sinusoidal embedding -> small MLP -> added into every block. Derive the two
+    properties that make sinusoids the right code (constant norm, inner product that depends only on
+    t-t', read at many scales), measure them against a raw scalar t/T and a free embedding table, then
+    train all three plus a time-blind floor and read loss vs t. Also tests injection depth (every block
+    vs only the first) — which, honestly, makes no measurable difference at this size."""
+    _banner("LAYER 5: how t enters — sinusoidal code -> MLP -> added into every block")
+
+    torch.manual_seed(seed)
+    dev = _device()
+    _, _, alpha_bars = make_linear_schedule(T=T)
+    alpha_bars = alpha_bars.to(dev)
+
+    # ---- (i) what the code IS: a ladder of frequencies -----------------------------------------
+    half = temb_dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half) / half)
+    periods = 2 * math.pi / freqs
+    print("  the channel is three steps:  t --sinusoidal--> (B,128) --MLP--> temb --ADD into blocks-->")
+    print(f"  the embedding is {half} cos/sin pairs at geometrically spaced frequencies — a ladder of")
+    print("  clocks, from one that ticks every few steps to one that barely moves over the whole run:")
+    print("      pair k        0      16      32      48      63")
+    print(f"      period    {periods[0]:6.1f}  {periods[16]:6.1f}  {periods[32]:6.1f}  {periods[48]:6.0f}  {periods[63]:6.0f}   steps")
+    print("    fast pairs resolve NEIGHBOURING t; slow pairs say where we are in the run overall.\n")
+
+    t_all = torch.arange(T)
+    e_sin = timestep_embedding(t_all, temb_dim)                    # (T, 128) the real code
+    e_scalar = (t_all.float() / T)[:, None]                        # (T, 1)   one number
+    torch.manual_seed(seed)
+    e_learned = torch.randn(T, temb_dim)                           # (T, 128) a free table, at init
+
+    dots = (e_sin[:T - 10] * e_sin[10:]).sum(1)
+    print("  two facts fall out of cos(a)cos(b)+sin(a)sin(b) = cos(a-b):")
+    print(f"    ‖e(t)‖² = Σ_k 1 = K = {half}  ->  ‖e(t)‖ = {e_sin.norm(dim=1).mean():.3f} for EVERY t (constant length)")
+    print(f"    e(t)·e(t') = Σ_k cos(ω_k(t-t')) depends only on the GAP: at gap 10, dot = {dots.mean():.3f}")
+    print(f"      with std {dots.std():.2e} across all t — measured, and flat as the algebra says.")
+    print("    a constant-length, shift-invariant ruler: no preferred origin, no dead zone.\n")
+
+    # ---- (ii) resolution: how well does each code separate nearby vs distant t? ------------------
+    deltas = [1, 2, 5, 10, 25, 50, 100, 250, 500]
+    sep_sin = _code_separation(e_sin, deltas)
+    sep_scalar = _code_separation(e_scalar, deltas)
+    sep_learned = _code_separation(e_learned, deltas)
+    print("  (ii) sep(Δ) = ‖e(t+Δ)-e(t)‖ / ‖e‖ — how far apart the code puts two levels Δ steps apart:")
+    print("        Δ            " + "".join(f"{d:>8}" for d in deltas))
+    for name, s in [("sinusoidal", sep_sin), ("scalar t/T", sep_scalar), ("learned table", sep_learned)]:
+        print(f"    {name:<14}" + "".join(f"{v:8.3f}" for v in s))
+    print(f"    sinusoidal: neighbours are already {sep_sin[0]:.2f} apart (tellable) yet the code saturates —")
+    print("      near is near, far is far. BOTH resolution and boundedness, at every scale.")
+    print(f"    scalar: {sep_scalar[0]:.3f} at Δ=1 — {sep_sin[0] / sep_scalar[0]:.0f}x blunter. It is also rank-1: every t is the")
+    print("      SAME direction at a different length, so the net must resolve the level by magnitude")
+    print("      alone, through a nonlinearity, at a scale (t/T ≤ 1) far below its activations.")
+    print(f"    learned table: ~{sep_learned[0]:.2f} at EVERY Δ — all 1000 rows mutually orthogonal. No notion of")
+    print("      'nearby t' at all, so nothing learned at t helps at t±1: each row must be fit alone.\n")
+
+    # ---- (iii) does it matter? train the variants ----------------------------------------------
+    x0 = _mnist(train=True)[:n_train].to(dev)
+    x_eval = _mnist(train=False)[:n_eval].to(dev)
+    t_vals = list(range(25, T, 50))
+
+    variants = [
+        ("sinusoidal, every block", dict(mode="sinusoidal", inject="all"),   "tab:blue",   "-"),
+        ("sinusoidal, FIRST block only", dict(mode="sinusoidal", inject="first"), "tab:cyan", "--"),
+        ("scalar t/T", dict(mode="scalar", inject="all"),                    "tab:orange", "-"),
+        ("learned table", dict(mode="learned", inject="all"),                "tab:green",  "-"),
+    ]
+    print(f"  (iii) train each clock variant from scratch ({n_train} imgs, {steps} steps, identical seed):")
+    results = []
+    for name, kw, color, ls in variants:
+        torch.manual_seed(seed)                                    # same init for the shared U-Net body
+        net = TimeVariantUNet(T=T, base=base, temb_dim=temb_dim, **kw).to(dev)
+        moved = None
+        if kw["mode"] == "learned":
+            table0 = net.table.weight.detach().clone()
+        loss = _quick_train(net, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7)
+        if kw["mode"] == "learned":
+            moved = ((net.table.weight.detach() - table0).norm() / table0.norm()).item()
+        curve = _loss_per_t(net, x_eval, alpha_bars, t_vals, seed=seed + 3)
+        results.append((name, curve, color, ls, moved))
+        print(f"    {name:<30} train loss {loss:.4f}")
+    torch.manual_seed(seed)                                        # the exp_4 floor: no clock at all
+    net_blind = TinyUNet(base=base, temb_dim=temb_dim).to(dev)
+    loss_blind = _quick_train(net_blind, x0, alpha_bars, T, steps, batch_size, lr, seed=seed + 7, use_time=False)
+    curve_blind = _loss_per_t(net_blind, x_eval, alpha_bars, t_vals, seed=seed + 3, use_time=False)
+    results.append(("TIME-BLIND (exp_4 floor)", curve_blind, "tab:red", ":", None))
+    print(f"    {'TIME-BLIND (exp_4 floor)':<30} train loss {loss_blind:.4f}\n")
+
+    hi = slice(-4, None)                                           # t>800: where exp_4 showed t matters most
+    def _mean(v): return sum(v[hi]) / len(v[hi])
+    ref = _mean(results[0][1])
+    print("  held-out loss at t>800 (the region exp_4 flagged — and where every sample starts):")
+    for name, curve, _, _, _ in results:
+        print(f"    {name:<30} {_mean(curve):.4f}   ({_mean(curve) / ref:.2f}x the sinusoidal net)")
+    moved = [m for *_, m in results if m is not None][0]
+    print(f"    the learned table moved only {moved:.1%} from its random init in {steps} steps — each row saw")
+    print(f"    ~{steps * batch_size // T} gradients, and rows never help each other. Sinusoids hand the net that")
+    print("    structure for free, which is the whole reason they are the default.\n")
+
+    # ---- (iv) injection depth: the honest null result -------------------------------------------
+    print("  (iv) WHERE it enters: 'every block' vs 'first block only' land on top of each other above —")
+    print("  no measurable difference here, and that is worth saying plainly. With 6 blocks at 28x28 the")
+    print("  net can just carry the clock forward in its activations. Injecting everywhere is standard")
+    print("  because (a) each block's GroupNorm re-centers its input, eroding a constant added once, and")
+    print("  (b) at real depth/resolution the transported clock costs channels in every block it crosses.")
+    print("  It becomes decisive when the time signal MODULATES normalization instead of being added —")
+    print("  FiLM/AdaLN, which is how DiT conditions (a later subtopic). At MNIST scale: free either way.\n")
+
+    # ---- figures: one per claim ----------------------------------------------------------------
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    os.makedirs(_FIGS, exist_ok=True)
+    written = []
+
+    # (a) the code itself: the frequency ladder as an image
+    fig, ax = plt.subplots(figsize=(7.4, 4.6))
+    im = ax.imshow(e_sin.numpy(), aspect="auto", cmap="coolwarm", vmin=-1, vmax=1,
+                   extent=(0, temb_dim, T, 0))
+    ax.set_xlabel("embedding dimension  (cos pairs 0-63 | sin pairs 0-63; left = fast, right = slow)")
+    ax.set_ylabel("timestep t")
+    ax.set_title("the sinusoidal timestep code: a ladder of clocks\n"
+                 f"periods {periods[0]:.0f} -> {periods[63]:.0f} steps; every row has the same length ‖e(t)‖ = {e_sin.norm(dim=1)[0]:.0f}",
+                 fontsize=10)
+    fig.colorbar(im, ax=ax, shrink=0.85, label="value")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "05_sinusoidal_code.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "the code as an image: fast pairs left, slow pairs right."))
+
+    # (b) resolution: separation vs gap, for the three codes
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    for name, s, color in [("sinusoidal", sep_sin, "tab:blue"), ("scalar t/T", sep_scalar, "tab:orange"),
+                           ("learned table (init)", sep_learned, "tab:green")]:
+        ax.plot(deltas, s, "o-", ms=4, color=color, label=name)
+    ax.set_xscale("log"); ax.set_yscale("log")
+    ax.set_xlabel("gap Δ between the two timesteps"); ax.set_ylabel("sep(Δ) = ‖e(t+Δ)-e(t)‖ / ‖e‖")
+    ax.set_title("what each code does with 'nearby' and 'far apart'\n"
+                 "sinusoidal: neighbours tellable AND bounded · scalar: blunt up close · table: everything unrelated",
+                 fontsize=9.5)
+    ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "05_separation.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "code geometry: separation vs gap."))
+
+    # (c) does it matter: per-t loss for every variant
+    fig, ax = plt.subplots(figsize=(7.4, 4.6))
+    for name, curve, color, ls, _ in results:
+        ax.plot(t_vals, curve, ls, marker="o", ms=3, color=color, label=name)
+    ax.set_yscale("log")
+    ax.set_xlabel("timestep t"); ax.set_ylabel("held-out MSE(ε̂, ε)   (log)")
+    ax.set_title("the clock's ENCODING matters, its injection depth (here) does not\n"
+                 "sinusoidal < scalar < learned table < no clock — the spread opens up at large t",
+                 fontsize=10)
+    ax.legend(fontsize=8); ax.grid(alpha=0.3, which="both")
+    fig.tight_layout()
+    out = os.path.join(_FIGS, "05_which_code.png")
+    fig.savefig(out, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    written.append((out, "loss vs t for every clock variant."))
+
+    for path, what in written:
+        print(f"  wrote {os.path.relpath(path, _HERE)} — {what}")
+    print("  Next (exp_6): THE BLOCK — why GroupNorm->SiLU->conv with a residual is the modern default,")
+    print("  and what BatchNorm / ReLU / a plain conv stack cost instead.")
+
+
 def run_experiments():
     # exp_1_whole_game()
     # exp_2_why_skips()
     # exp_3_why_down_up()
-    exp_4_why_t_input()
-    # exp_5_how_t_enters()
+    # exp_4_why_t_input()
+    exp_5_how_t_enters()
     # exp_6_the_block()
 
 
