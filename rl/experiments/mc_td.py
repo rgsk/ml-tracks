@@ -31,7 +31,7 @@ import numpy as np
 # Reuse exercise 2's gridworld (the MDP model) + its exact ground-truth solver.
 # (Module name starts with a digit, so load it by path rather than `import`.)
 _spec = importlib.util.spec_from_file_location(
-    "mdp_dp", pathlib.Path(__file__).with_name("02_mdp_dp.py"))
+    "mdp_dp", pathlib.Path(__file__).parent.parent / "02_mdp_dp.py")
 mdp_dp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mdp_dp)
 GridWorld = mdp_dp.GridWorld
@@ -529,13 +529,13 @@ def exp_nstep_dial(M=4000, seed=0):
 
 def run_experiments():
     # exp_samples_are_the_model()
-    # exp_one_episode()
+    exp_one_episode()
     # exp_returns()
     # exp_mc_prediction()
     # exp_td_prediction()
     # exp_mc_vs_td()
     # exp_batch_ab()
-    exp_nstep_dial()
+    # exp_nstep_dial()
 
 
 @contextlib.contextmanager
