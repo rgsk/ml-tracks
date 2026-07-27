@@ -176,8 +176,13 @@ def policy_evaluation(grid, policy, step_reward, goal_reward, gamma,
 
         V(s) <- r(s, pi(s)) + gamma * V(s')
     """
-    V = {cell: 0.0 for cell in cells(grid)}
-    for _ in range(max_iters):
+    v_init = 0.0
+    V = {cell: (0.0 if is_terminal(grid, cell) else v_init) for cell in cells(grid)}
+    verbose = False
+    if verbose:
+        show(grid, V, f"iter 0 (initial V = {v_init} on non-terminals, 0 at goal):")
+    
+    for it in range(1, max_iters + 1):
         newV = dict(V)                # synchronous: backups read the OLD V
         delta = 0.0
         for cell in cells(grid):
@@ -188,6 +193,8 @@ def policy_evaluation(grid, policy, step_reward, goal_reward, gamma,
             delta = max(delta, abs(v_new - V[cell]))
             newV[cell] = v_new
         V = newV
+        if verbose:
+            show(grid, V, f"iter {it}  (max change this sweep = {delta:.4f}):")
         if delta < theta:
             break
     return V
@@ -293,7 +300,7 @@ def value_iteration_experiments():
                         v_init=-50.0, max_iters=15)
 
     # comment/uncomment the experiments you want to run
-    # exp_a()
+    exp_a()
     # exp_b()
     # exp_b_init50()
     # exp_a_gamma1()
@@ -302,7 +309,7 @@ def value_iteration_experiments():
     # exp_sealed_gamma09()
     # exp_sealed_gamma09_init50()
     # exp_sealed_gamma1()
-    exp_sealed_gamma1_init50()
+    # exp_sealed_gamma1_init50()
 
 
 def policy_iteration_experiments():
@@ -321,8 +328,8 @@ def policy_iteration_experiments():
         policy_iteration(SEALED, step_reward=-1.0, goal_reward=0.0, gamma=0.9)
 
     # comment/uncomment the experiments you want to run
-    exp_a()
-    # exp_b()
+    # exp_a()
+    exp_b()
     # exp_sealed()
 
 
