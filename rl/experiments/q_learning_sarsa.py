@@ -34,7 +34,7 @@ import numpy as np
 # Reuse exercise 2's gridworld (the MDP model) + its exact solvers, loaded by path
 # (the module name starts with a digit, so a plain `import` won't parse).
 _spec = importlib.util.spec_from_file_location(
-    "mdp_dp", pathlib.Path(__file__).with_name("02_mdp_dp.py"))
+    "mdp_dp", pathlib.Path(__file__).parent.parent / "02_mdp_dp.py")
 mdp_dp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(mdp_dp)
 GridWorld = mdp_dp.GridWorld
@@ -711,12 +711,12 @@ def exp_max_bias(seed=0):
 
 
 def run_experiments():
-    # exp_why_q()
+    exp_why_q()
     # exp_epsilon_greedy()
     # exp_sarsa()
     # exp_qlearning()
     # exp_cliff()
-    exp_cliff_dissect()
+    # exp_cliff_dissect()
     # exp_max_bias()
     # (all six layers built — uncomment any to re-run it)
 
