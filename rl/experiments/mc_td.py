@@ -615,6 +615,13 @@ def _nstep_return(ep, n, gamma, V_boot):
         G += disc * V_boot[ep[n - 1][2]]     # disc == gamma^n here
     return G
 
+'''
+The best n depends on how good your value function already is.
+
+Bad V (left): RMSE falls monotonically with n. Early in training, MC-like targets win — bias dominates and only real rewards can fix it.
+Good V (right): RMSE is minimized at n=1. At convergence, TD(0) wins — there's no bias left to fix, so the only thing n buys you is variance.
+Real training moves from the left table to the right one, which means the ideal n shrinks over training. 
+'''
 
 def exp_nstep_dial(M=4000, seed=0):
     """Sweep n and report, aggregated over all non-terminal start states:
