@@ -547,7 +547,9 @@ def batch_mc(episodes, gamma=1.0):
             rcnt[s] = rcnt.get(s, 0) + 1
     return {s: rsum[s] / rcnt[s] for s in rsum}
 
-
+'''
+The difference is that TD uses the Markov property and MC doesn't. Under Markov, what happens after you reach B is independent of how you got there, so all eight B-episodes are evidence about A's future. MC treats A's value as a question only A's own episodes can answer, and throws away seven-eighths of the relevant data.
+'''
 def batch_td(episodes, gamma=1.0, alpha=0.01, sweeps=20000):
     """Batch TD(0) fixed point: present all transitions repeatedly until V stops
     moving. Converges to the value of the MAXIMUM-LIKELIHOOD MDP built from the
@@ -661,9 +663,9 @@ def run_experiments():
     # exp_mc_prediction()
     # exp_td_prediction()
     # exp_mc_vs_td()
-    exp_td_alpha_floor()
+    # exp_td_alpha_floor()
     # exp_batch_ab()
-    # exp_nstep_dial()
+    exp_nstep_dial()
 
 
 @contextlib.contextmanager
