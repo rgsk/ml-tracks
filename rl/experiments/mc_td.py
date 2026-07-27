@@ -15,7 +15,8 @@ build it up in layers (run each, watch the output):
   3. returns G_t — turn a trajectory into the numbers we average (Monte Carlo).
   4. mc_prediction — first-visit MC; watch V converge to the truth.
   5. td0_prediction — the bootstrap; the TD error; online learning.
-  6. MC vs TD — the bias/variance payoff, side by side.
+  6. MC vs TD — side by side with the STEP SIZE held fixed, because most of the
+     apparent gap is the step size (1/n vs constant), not the bootstrap.
 
 Ground truth for grading comes from exercise 2's exact linear solve.
 """
@@ -254,6 +255,31 @@ def mc_prediction(env, sampler, policy, gamma, num_episodes, rng):
     return V
 
 
+def _mc_curve(env, sampler, policy, gamma, checkpoints, rng):
+    """mc_prediction over ONE episode stream, snapshotting V at each checkpoint.
+    Same algorithm as above — just doesn't throw the estimate away between budgets,
+    so a learning curve costs one run instead of one run per budget."""
+    returns_sum = np.zeros(env.nS)
+    returns_cnt = np.zeros(env.nS)
+    V = np.zeros(env.nS)
+    snapshots, prev = [], 0
+    for cp in checkpoints:
+        for _ in range(cp - prev):
+            ep = generate_episode(sampler, policy, rng)
+            G = returns_from_episode(ep, gamma)
+            seen = set()
+            for t, (s, _r, _ns, _d) in enumerate(ep):
+                if s not in seen:
+                    seen.add(s)
+                    returns_sum[s] += G[t]
+                    returns_cnt[s] += 1
+        prev = cp
+        nz = returns_cnt > 0
+        V[nz] = returns_sum[nz] / returns_cnt[nz]
+        snapshots.append(V.copy())
+    return snapshots
+
+
 def _rms(V_hat, V_true, states):
     d = V_hat[states] - V_true[states]
     return float(np.sqrt(np.mean(d ** 2)))
@@ -293,27 +319,14 @@ def exp_mc_prediction(seed=0):
     print("episodes |  RMS error vs exact V^pi")
     print("---------+--------------------------")
     checkpoints = [100, 500, 2000, 10000, 50000]
-    prev = 0
-    returns_sum = np.zeros(env.nS)
-    returns_cnt = np.zeros(env.nS)
-    V = np.zeros(env.nS)
-    for cp in checkpoints:
-        for _ in range(cp - prev):           # extend, reusing accumulated counts
-            ep = generate_episode(sampler, opt_policy, rng)
-            G = returns_from_episode(ep, gamma)
-            seen = set()
-            for t, (s, _r, _ns, _d) in enumerate(ep):
-                if s not in seen:
-                    seen.add(s)
-                    returns_sum[s] += G[t]
-                    returns_cnt[s] += 1
-        prev = cp
-        nz = returns_cnt > 0
-        V[nz] = returns_sum[nz] / returns_cnt[nz]
+    snapshots = _mc_curve(env, sampler, opt_policy, gamma, checkpoints, rng)
+    for cp, V in zip(checkpoints, snapshots):
         print(f"{cp:8d} |  {_rms(V, V_true, nonterm):.4f}")
+    print("note: error keeps falling ~1/sqrt(N) — a 1/N average has no floor.")
 
     print()
-    _show_two(env, V_true, V, "exact V^pi (linear solve)", "MC estimate (50k eps)")
+    _show_two(env, V_true, snapshots[-1],
+              "exact V^pi (linear solve)", "MC estimate (50k eps)")
 
 
 # ---------------------------------------------------------------------------
@@ -323,13 +336,34 @@ def exp_mc_prediction(seed=0):
 # ---------------------------------------------------------------------------
 
 def td0_prediction(env, sampler, policy, gamma, num_episodes, alpha, rng):
-    """TD(0) estimate of V^pi with constant step size alpha."""
+    """TD(0) estimate of V^pi. alpha = constant step size, or None for a per-state
+    1/count step — the SAME decaying average MC uses. Which one you pick matters
+    more than MC-vs-TD does; layer 6 measures exactly that."""
     V = np.zeros(env.nS)
+    cnt = np.zeros(env.nS)
     for _ in range(num_episodes):
         for (s, r, ns, done) in generate_episode(sampler, policy, rng):
+            cnt[s] += 1
+            step = alpha if alpha is not None else 1.0 / cnt[s]
             target = r + gamma * V[ns] * (1.0 - done)   # no bootstrap past the end
-            V[s] += alpha * (target - V[s])
+            V[s] += step * (target - V[s])
     return V
+
+
+def _td_curve(env, sampler, policy, gamma, checkpoints, alpha, rng):
+    """td0_prediction over ONE episode stream, snapshotting V at each checkpoint."""
+    V = np.zeros(env.nS)
+    cnt = np.zeros(env.nS)
+    snapshots, prev = [], 0
+    for cp in checkpoints:
+        for _ in range(cp - prev):
+            for (s, r, ns, done) in generate_episode(sampler, policy, rng):
+                cnt[s] += 1
+                step = alpha if alpha is not None else 1.0 / cnt[s]
+                V[s] += step * (r + gamma * V[ns] * (1.0 - done) - V[s])
+        prev = cp
+        snapshots.append(V.copy())
+    return snapshots
 
 
 def exp_td_prediction(seed=0, alpha=0.05):
@@ -347,52 +381,145 @@ def exp_td_prediction(seed=0, alpha=0.05):
     print("episodes |  RMS error vs exact V^pi")
     print("---------+--------------------------")
     checkpoints = [100, 500, 2000, 10000, 50000]
-    prev = 0
-    V = np.zeros(env.nS)
-    for cp in checkpoints:
-        for _ in range(cp - prev):
-            for (s, r, ns, done) in generate_episode(sampler, opt_policy, rng):
-                V[s] += alpha * (r + gamma * V[ns] * (1.0 - done) - V[s])
-        prev = cp
+    snapshots = _td_curve(env, sampler, opt_policy, gamma, checkpoints, alpha, rng)
+    for cp, V in zip(checkpoints, snapshots):
         print(f"{cp:8d} |  {_rms(V, V_true, nonterm):.4f}")
+    print("note: unlike MC this stalls, and can even get WORSE with more data —")
+    print("      a constant alpha random-walks around the truth. Layer 6 measures it.")
 
     print()
+    V = snapshots[-1]
     _show_two(env, V_true, V, "exact V^pi (linear solve)", "TD(0) estimate (50k eps)")
+
+    # The floor isn't spread evenly: it piles up in whichever state has the most
+    # target spread, which here is the one that can slip into the -1 terminal.
+    worst = max(nonterm, key=lambda s: abs(V[s] - V_true[s]))
+    cell = env.states[worst]
+    pit = [c for c in (env._move(cell, a) for a in range(env.nA))
+           if env.terminals.get(c, 0.0) < 0]
+    print(f"\nworst state {cell}: TD {V[worst]:+.3f} vs true {V_true[worst]:+.3f}"
+          + (f", one slip from the {pit[0]} pit." if pit else "."))
+    print("Its targets swing between -1 and ~+0.3, and alpha=0.05 keeps chasing the")
+    print("latest one — the noise floor concentrates in high-variance states.")
 
 
 # ---------------------------------------------------------------------------
 # LAYER 6: MC vs TD head-to-head.
-#   A) bias/variance over many seeds (mean +/- std of RMS).
+#   A) the honest comparison — MC, TD with a constant step, and TD with MC's OWN
+#      1/n step, all on identical episode streams. The naive MC-vs-TD table
+#      confounds two knobs at once: bootstrapping (MC vs TD) and step size
+#      (1/n vs constant). Column 3 holds the step size fixed so you can see
+#      which knob the difference actually came from. Spoiler: the step size.
+#   Ax) the constant-alpha NOISE FLOOR, swept — error stalls at ~c*sqrt(alpha)
+#      no matter how much data you add. Constant alpha never stops chasing the
+#      newest sample; that is a feature (non-stationarity) paid for in precision.
 #   B) the batch A/B example — same data, different fixed points; TD = the
 #      certainty-equivalence (max-likelihood-MDP) estimate, MC = training-set fit.
 # ---------------------------------------------------------------------------
 
+_BUDGETS = (200, 1000, 5000, 25000)
+
+
+def _sweep(env, V_true, budgets, seeds, run):
+    """Run `run(sampler, checkpoints, rng) -> [V per checkpoint]` once per seed on a
+    FRESH stream seeded 0..seeds-1, and return (mean, std) of RMS error per budget.
+    Every learner gets seed k's identical episodes, so differences are the method."""
+    errs = np.zeros((seeds, len(budgets)))
+    for seed in range(seeds):
+        rng = np.random.default_rng(seed)
+        samp = Sampler(env, rng)
+        nt = samp._nonterminal
+        for j, V in enumerate(run(samp, list(budgets), rng)):
+            errs[seed, j] = _rms(V, V_true, nt)
+    return errs.mean(axis=0), errs.std(axis=0)
+
+
 def exp_mc_vs_td(seeds=12, alpha=0.05):
-    """Run BOTH methods for several episode budgets across many seeds; report mean
-    and std of RMS vs the exact V^pi. TD: lower variance early; MC: lower bias
-    (its constant-alpha-free 1/N average keeps shrinking, TD hits a noise floor)."""
+    """MC vs TD on identical episode streams, with the step size CONTROLLED.
+
+    Three learners, `seeds` seeds each, RMS error vs the exact V^pi:
+      MC          first-visit average of returns          (1/n step, implicitly)
+      TD a=const  bootstrap, fixed step size              (differs in BOTH knobs)
+      TD a=1/n    bootstrap, MC's own decaying step       (differs only in bootstrap)
+    Read column 1 vs column 3 for the real MC-vs-TD verdict; column 2 vs column 3
+    for what the step size alone costs.
+    """
     env = GridWorld()
     gamma = env.gamma
     opt_policy, _ = mdp_dp.value_iteration(env, gamma)
     V_true = mdp_dp.analytic_policy_value(env, opt_policy, gamma)
 
-    _banner(f"LAYER 6A: MC vs TD(0) bias/variance  ({seeds} seeds, alpha={alpha})")
-    print("episodes |     MC  mean+/-std    |     TD  mean+/-std")
-    print("---------+-----------------------+----------------------")
-    for n in (200, 1000, 5000, 25000):
-        mc_errs, td_errs = [], []
-        for seed in range(seeds):
-            rng = np.random.default_rng(seed)
-            samp = Sampler(env, rng)
-            nt = samp._nonterminal
-            mc_errs.append(_rms(mc_prediction(env, samp, opt_policy, gamma, n, rng),
-                                V_true, nt))
-            rng = np.random.default_rng(seed)         # same episodes for TD
-            samp = Sampler(env, rng)
-            td_errs.append(_rms(td0_prediction(env, samp, opt_policy, gamma, n,
-                                               alpha, rng), V_true, nt))
-        print(f"{n:8d} |  {np.mean(mc_errs):.4f} +/- {np.std(mc_errs):.4f}   "
-              f"|  {np.mean(td_errs):.4f} +/- {np.std(td_errs):.4f}")
+    def mc(samp, cps, rng):
+        return _mc_curve(env, samp, opt_policy, gamma, cps, rng)
+
+    def td(a):
+        return lambda samp, cps, rng: _td_curve(env, samp, opt_policy, gamma,
+                                                cps, a, rng)
+
+    _banner(f"LAYER 6A: MC vs TD(0), step size controlled  "
+            f"({seeds} seeds, alpha={alpha})")
+    mc_m, mc_s = _sweep(env, V_true, _BUDGETS, seeds, mc)
+    tdc_m, tdc_s = _sweep(env, V_true, _BUDGETS, seeds, td(alpha))
+    tdd_m, tdd_s = _sweep(env, V_true, _BUDGETS, seeds, td(None))
+
+    print("episodes |      MC  (1/n)      |   TD  a=%.2f const   |    TD  a=1/n"
+          % alpha)
+    print("---------+---------------------+---------------------+--------------------")
+    for j, n in enumerate(_BUDGETS):
+        print(f"{n:8d} |  {mc_m[j]:.4f} +/- {mc_s[j]:.4f}  "
+              f"|  {tdc_m[j]:.4f} +/- {tdc_s[j]:.4f}  "
+              f"|  {tdd_m[j]:.4f} +/- {tdd_s[j]:.4f}")
+
+    print("\nwhat to read off:")
+    print(f"  * col 2 STALLS (~{tdc_m[-1]:.3f} from {_BUDGETS[1]} episodes on); "
+          "cols 1 and 3 keep falling.")
+    print("    So the plateau is the CONSTANT STEP, not the bootstrap: give TD a")
+    print("    1/n step and it converges like MC. Only cols 1 vs 3 isolate MC-vs-TD.")
+    print(f"  * early on (n={_BUDGETS[0]}) TD's +/- is the tighter one "
+          f"({tdc_s[0]:.4f} vs MC's {mc_s[0]:.4f}):")
+    print("    its target r + gamma*V(s') holds ONE random reward; MC's holds the")
+    print("    whole trajectory. Lower variance, but biased while V is still wrong.")
+    print("  * MC wins on error here because this env flatters it: episodes are ~10")
+    print("    steps and gamma=0.9, so returns barely vary. TD's variance edge pays")
+    print("    off in long / non-terminating episodes, which this gridworld isn't.")
+
+
+def exp_td_alpha_floor(seeds=12, alphas=(0.2, 0.05, 0.01)):
+    """Sweep the constant step size to expose the noise floor and its size.
+
+    A constant alpha keeps pulling V a fixed fraction toward a NOISY target, so V
+    never settles — it random-walks in a ball around V^pi whose radius is set by
+    alpha, not by the amount of data. Bigger alpha = faster start, wider ball.
+    The floor scales like sqrt(alpha); the last row checks that prediction.
+    """
+    env = GridWorld()
+    gamma = env.gamma
+    opt_policy, _ = mdp_dp.value_iteration(env, gamma)
+    V_true = mdp_dp.analytic_policy_value(env, opt_policy, gamma)
+
+    _banner(f"LAYER 6Ax: the constant-alpha noise floor  ({seeds} seeds)")
+    cols = {}
+    for a in alphas:
+        cols[a], _ = _sweep(
+            env, V_true, _BUDGETS, seeds,
+            lambda samp, cps, rng, a=a: _td_curve(env, samp, opt_policy, gamma,
+                                                  cps, a, rng))
+
+    print("episodes | " + " | ".join(f"a={a:<6.2f}" for a in alphas))
+    print("---------+" + "-+".join(["-" * 9] * len(alphas)) + "-")
+    for j, n in enumerate(_BUDGETS):
+        print(f"{n:8d} | " + " | ".join(f"{cols[a][j]:.4f}  " for a in alphas))
+
+    ratios = [cols[a][-1] / np.sqrt(a) for a in alphas]
+    print("\nfloor / sqrt(alpha) at the largest budget: "
+          + ", ".join(f"{r:.3f}" for r in ratios))
+    print(f"  near-constant => floor ~ {np.mean(ratios):.2f} * sqrt(alpha). "
+          "Halving alpha")
+    print("  buys ~1.4x accuracy and costs ~2x the episodes to get there.")
+    print("  Look along a ROW too: at n=200 the biggest alpha wins (it has actually")
+    print("  moved off V=0), at n=25000 it loses. Fast start vs low floor, one dial.")
+    print("  Fix: decay alpha (see the TD a=1/n column in 6A) — Robbins-Monro says")
+    print("  sum(alpha)=inf with sum(alpha^2)<inf converges; constants fail the 2nd.")
 
 
 # The classic A/B batch (Sutton & Barto, Example 6.4). gamma = 1, two states A,B.
@@ -529,11 +656,12 @@ def exp_nstep_dial(M=4000, seed=0):
 
 def run_experiments():
     # exp_samples_are_the_model()
-    exp_one_episode()
+    # exp_one_episode()
     # exp_returns()
     # exp_mc_prediction()
     # exp_td_prediction()
     # exp_mc_vs_td()
+    exp_td_alpha_floor()
     # exp_batch_ab()
     # exp_nstep_dial()
 
