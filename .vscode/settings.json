@@ -1,2 +1,10 @@
 {
+  "editor.tokenColorCustomizations": {
+    "textMateRules": [
+      {
+        "scope": "invalid.deprecated.semicolon.python",
+        "settings": { "foreground": "#CCCCCC" }
+      }
+    ]
+  }
 }
