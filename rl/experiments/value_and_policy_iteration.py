@@ -334,8 +334,8 @@ def policy_iteration_experiments():
 
 
 def run_experiments():
-    # value_iteration_experiments()
-    policy_iteration_experiments()
+    value_iteration_experiments()
+    # policy_iteration_experiments()
 
 
 @contextlib.contextmanager

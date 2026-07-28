@@ -16,4 +16,6 @@ nb/llm/data/input.txt
 # jupytext-paired notebooks: the .py is source of truth, the .ipynb is regenerated
 # with `jupytext --to ipynb --execute` (outputs not committed). Covers walkthroughs/
 # and custom/ (from-scratch impls are paired too, for LaTeX/figures in their write-ups).
-nb/**/*.ipynb
+nb/**/walkthroughs/*.ipynb
+nb/**/custom/*.ipynb
+nb/**/rough/*.ipynb
