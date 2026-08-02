@@ -711,10 +711,10 @@ def exp_max_bias(seed=0):
 
 
 def run_experiments():
-    exp_why_q()
+    # exp_why_q()
     # exp_epsilon_greedy()
     # exp_sarsa()
-    # exp_qlearning()
+    exp_qlearning()
     # exp_cliff()
     # exp_cliff_dissect()
     # exp_max_bias()
