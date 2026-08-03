@@ -2,6 +2,25 @@
   "version": "2.0.0",
   "tasks": [
     {
+      // Run the current .py file. Bound to shift+enter (keybindings.json).
+      // Exists instead of `python.execInTerminal` purely for FOCUS: the extension
+      // reveals its terminal asynchronously, so chaining a refocus after it races.
+      // A task's `presentation.focus: false` is honoured by VS Code itself.
+      "label": "python: run current file",
+      "type": "shell",
+      "command": "uv run python \"${file}\"",
+      "options": { "cwd": "${workspaceFolder}" },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "focus": false,
+        "panel": "dedicated",
+        "showReuseMessage": false,
+        "clear": true,
+        "close": false
+      }
+    },
+    {
       // Rebuild + execute the paired notebook for the file you're looking at.
       // Uses the sibling .py as source, so it works whether the .py OR the .ipynb is focused.
       "label": "jupytext: rebuild current notebook",
