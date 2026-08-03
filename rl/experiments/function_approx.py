@@ -176,9 +176,208 @@ def exp_table_dies(num_episodes=200, seed=0):
     print("     it automatically. Next layer: what 'sharing' actually does to the numbers.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 2: function approximation with NO reinforcement learning in it.
+#
+# Before mixing in bootstrapping, strip the problem down: SUPPOSE someone handed
+# you the true values V(s) for every state. Storing them is a table. FITTING them
+# with a parameterized v(s; w) is ordinary supervised regression — least squares —
+# and that is ALL "function approximation" means. Every RL-specific difficulty in
+# the next layers comes from not having those true values, never from this step.
+#
+# The env: Sutton & Barto's 19-state random walk. States 1..19 in a line, step
+# left/right with prob 1/2 each, terminate at 0 (reward 0) or 20 (reward +1). The
+# policy is FIXED, so this is prediction, and V^pi is exactly solvable:
+#       V(s) = 0.5*gamma*V(s-1) + 0.5*(r + gamma*V(s+1))
+# a linear system (I - gamma*P) V = r — exercise 2's analytic policy value.
+#
+# Three things to see here:
+#   A) 19 numbers compressed into 2 weights, exactly.
+#   B) GENERALIZATION is a property of phi, not of RL: one update at ONE state
+#      moves other states' values, and HOW FAR that spreads is your design choice.
+#   C) CAPACITY: when the true V is not in the span of phi there is an error FLOOR.
+#      The best point in the span is the PROJECTION of V onto it — remember that
+#      word, layer 3 is about which point TD actually lands on.
+# ---------------------------------------------------------------------------
+
+class RandomWalk:
+    """19-state random walk. Fixed uniform-random policy => PREDICTION, like ex 3.
+    step() ignores its action, and true_V() solves the MDP exactly (no sampling)."""
+
+    N = 19
+
+    def __init__(self, rng=None):
+        self.rng = rng
+        self.s = None
+
+    def reset(self):
+        self.s = (self.N + 1) // 2                      # start in the middle
+        return self.s
+
+    def step(self, _a=None):
+        self.s += int(self.rng.choice([-1, 1]))
+        if self.s == 0:
+            return self.s, 0.0, True
+        if self.s == self.N + 1:
+            return self.s, 1.0, True
+        return self.s, 0.0, False
+
+    def true_V(self, gamma):
+        """Exact V^pi for states 1..N by linear solve (ground truth for grading)."""
+        N = self.N
+        P = np.zeros((N, N))                            # non-terminal transitions
+        r = np.zeros(N)
+        for i, s in enumerate(range(1, N + 1)):
+            for ns in (s - 1, s + 1):
+                if ns == 0:
+                    continue                            # left end: reward 0, absorbing
+                if ns == N + 1:
+                    r[i] += 0.5 * 1.0                   # right end: reward +1
+                    continue
+                P[i, ns - 1] += 0.5
+        return np.linalg.solve(np.eye(N) - gamma * P, r)
+
+
+def make_phi(kind, N=RandomWalk.N):
+    """Feature MATRIX (N, d): row i is phi(s) for state s = i+1. v(s;w) = phi(s) . w.
+    The choice of phi is the choice of how much states share — the whole ballgame."""
+    x = np.arange(1, N + 1) / (N + 1)                   # normalized position in (0,1)
+    if kind == "const":
+        return np.ones((N, 1))                          # one weight for the whole world
+    if kind.startswith("poly"):
+        deg = int(kind[4:])
+        return np.stack([x ** k for k in range(deg + 1)], axis=1)
+    if kind == "agg5":                                  # state aggregation: 5 groups
+        g = np.minimum((np.arange(N) // 4), 4)
+        return np.eye(5)[g]
+    if kind == "rbf5":                                  # 5 gaussian bumps, width 0.125
+        c = np.linspace(0.1, 0.9, 5)
+        return np.exp(-((x[:, None] - c[None, :]) ** 2) / (2 * 0.125 ** 2))
+    if kind == "onehot":
+        return np.eye(N)                                # == the TABLE (layer 4)
+    raise ValueError(kind)
+
+
+def sgd_fit(Phi, targets, alpha, n_steps, rng):
+    """Plain SGD least-squares fit of v(s;w) = Phi[s] . w to KNOWN targets.
+    Sample a state uniformly, take one gradient step on (target - v)^2 / 2:
+        delta = target[s] - Phi[s] . w
+        w    += alpha * delta * Phi[s]        # grad_w v = Phi[s] for a linear v
+    This is genuine SGD — the target is a constant, nothing to be 'semi' about yet.
+    alpha is annealed linearly to 0: constant alpha would leave a noise floor and we
+    want to compare the converged point against the exact projection."""
+    w = np.zeros(Phi.shape[1])
+    for t in range(n_steps):
+        s = int(rng.integers(len(Phi)))
+        w += alpha * (1 - t / n_steps) * (targets[s] - Phi[s] @ w) * Phi[s]
+    return w
+
+
+def _rms(a, b):
+    return float(np.sqrt(np.mean((a - b) ** 2)))
+
+
+def exp_fa_is_regression(seed=0):
+    """A) fit the true V with 2 weights instead of 19 numbers.
+    B) one update at ONE state — how far does it spread, for four choices of phi?
+    C) capacity: curve the true V (gamma<1) and watch an error FLOOR appear."""
+    rng = np.random.default_rng(seed)
+    env = RandomWalk()
+
+    # --- A) 19 numbers -> 2 weights, by regression ----------------------------
+    V = env.true_V(gamma=1.0)
+    _banner("LAYER 2A: fitting a KNOWN V is just least squares",
+            "  19-state random walk, gamma=1  =>  true V(s) = s/20 exactly")
+    print(f"  check the exact solve against the closed form s/20: max diff "
+          f"{np.abs(V - np.arange(1, 20) / 20).max():.2e}")
+    print("\n  phi(s) = [1, s/20]  ->  2 weights for 19 states.")
+    Phi = make_phi("poly1")
+    print("   SGD steps |    w = [bias, slope]    | RMS vs true V")
+    print("  -----------+-------------------------+---------------")
+    w = np.zeros(2)
+    prev = 0
+    for n in (10, 100, 1000, 10000, 100000):
+        for _ in range(n - prev):                       # keep fitting the same w
+            s = int(rng.integers(len(Phi)))
+            w += 0.05 * (V[s] - Phi[s] @ w) * Phi[s]    # == one sgd_fit step
+        prev = n
+        print(f"  {n:9,d}  |  [{w[0]:+.4f}, {w[1]:+.4f}]     |    {_rms(Phi @ w, V):.5f}")
+    print("\n  w -> [0, 1]: v(s) = 0*1 + 1*(s/20) = s/20. The 19-number table is now TWO")
+    print("  numbers, with zero error. Note what got destroyed to buy that: the states are")
+    print("  no longer independent parameters. Which is the point — and the danger.")
+
+    # --- B) generalization is a property of phi -------------------------------
+    _banner("LAYER 2B: ONE update at state 5 — where does it land?")
+    print("  start from w = 0, do a single update toward the true V(5) = 0.25 (alpha=0.5),")
+    print("  then print how much v(s) moved AT EVERY OTHER STATE.\n")
+    s0 = 5 - 1                                          # state 5 -> row index 4
+    kinds = ["onehot", "agg5", "rbf5", "poly1"]
+    labels = {"onehot": "one-hot  (= the TABLE)", "agg5": "agg5     (5 groups of 4)",
+              "rbf5": "rbf5     (5 gaussian bumps)", "poly1": "poly1    ([1, s/20])"}
+    shown = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 19]
+    header = "  phi                       | " + " ".join(f"{s:5d}" for s in shown)
+    print(header)
+    print("  " + "-" * (len(header) - 2))
+    dvs = {}
+    for kind in kinds:
+        P = make_phi(kind)
+        dw = 0.5 * (V[s0] - 0.0) * P[s0]                # one SGD step from w = 0
+        dv = P @ dw                                     # change in value at EVERY state
+        dvs[kind] = dv
+        print(f"  {labels[kind]:25s} | " + " ".join(f"{dv[s - 1]:+.3f}" for s in shown))
+    print("\n  same delta, same alpha, four different worlds:")
+    print("    one-hot : only state 5 moves. That IS the tabular update — no sharing, so")
+    print("              19 states need 19 independent visits (layer 1's death sentence).")
+    print("    agg5    : states 5-8 move by the SAME amount — they are indistinguishable")
+    print("              to the approximator. Sharing by force = the ALIASING of layer 1.")
+    print("    rbf5    : a smooth local bump — nearby states move a lot, far ones a little.")
+    print("              Sharing by SIMILARITY: evidence spreads where it is plausible.")
+    print("    poly1   : every state moves, including state 19 at the far end. Global")
+    print("              sharing: cheap and fast, but one bad target perturbs everything.")
+    print("\n  So 'generalization' is not something RL does — it is what you asked for when")
+    print("  you picked phi. Aliasing (agg5) and generalization (rbf5) are the same")
+    print("  mechanism at different widths; only the second one is a choice you control.")
+
+    # --- C) capacity and the error floor --------------------------------------
+    gamma = 0.9
+    Vg = env.true_V(gamma)
+    _banner(f"LAYER 2C: capacity — at gamma={gamma} the true V is CURVED, not a line")
+    print("  discounting kills the far-away +1, so V bends. Now some phi's simply cannot")
+    print("  represent it. 'Best possible' = the PROJECTION of V onto span(phi) (lstsq).\n")
+    print("   phi     | weights | best possible RMS |  SGD reached  | gap to best")
+    print("  ---------+---------+-------------------+---------------+------------")
+    for kind in ("const", "poly1", "poly2", "poly3", "agg5", "rbf5", "onehot"):
+        P = make_phi(kind)
+        w_star = np.linalg.lstsq(P, Vg, rcond=None)[0]  # the projection
+        w_sgd = sgd_fit(P, Vg, alpha=0.05, n_steps=200000, rng=rng)
+        print(f"   {kind:7s} |   {P.shape[1]:3d}   |      {_rms(P @ w_star, Vg):.5f}      |"
+              f"    {_rms(P @ w_sgd, Vg):.5f}    |   {_rms(P @ w_sgd, P @ w_star):.5f}")
+
+    print("\n  values at a few states (true vs what each phi can manage at BEST):")
+    print("   state |   true V  |  const  |  poly1  |  poly2  |  agg5   |  onehot")
+    print("  -------+-----------+---------+---------+---------+---------+---------")
+    best = {k: make_phi(k) @ np.linalg.lstsq(make_phi(k), Vg, rcond=None)[0]
+            for k in ("const", "poly1", "poly2", "agg5", "onehot")}
+    for s in (1, 5, 10, 15, 19):
+        row = "  ".join(f"{best[k][s - 1]:+.4f}" for k in
+                        ("const", "poly1", "poly2", "agg5", "onehot"))
+        print(f"    {s:3d}  |  {Vg[s - 1]:+.4f}  | {row}")
+
+    print("\n  Three lessons to carry into layer 3:")
+    print("   1. SGD lands on the projection (gap-to-best ~ 0 in every row) — with TRUE")
+    print("      targets, function approximation is solved. Regression, nothing more.")
+    print("   2. The floor is set by phi alone. const can only say the mean; poly2 nearly")
+    print("      nails a curve poly1 cannot; onehot (the table) always hits 0 — a table is")
+    print("      the maximum-capacity, zero-generalization end of this same spectrum.")
+    print("   3. We do NOT have the true V. Layer 3 replaces `targets` with something we")
+    print("      can sample — and the moment that target contains w itself, this clean")
+    print("      regression story breaks in a specific, nameable way.")
+
+
 def run_experiments():
-    exp_table_dies()
-    # (layers 2-6 to come)
+    # exp_table_dies()
+    exp_fa_is_regression()
+    # (layers 3-6 to come)
 
 
 @contextlib.contextmanager

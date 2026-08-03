@@ -2,6 +2,37 @@ import numpy as np
 import gymnasium as gym
 DIMS = ["x (cart pos)", "x_dot (cart vel)", "theta (pole angle)", "theta_dot (pole vel)"]
 BOX = np.array([[-2.4, 2.4], [-3.0, 3.0], [-0.2095, 0.2095], [-3.0, 3.0]])
+def rule(header):
+    """Separator for a '|'-joined header: '+' under every '|', '-' everywhere else."""
+    start = max(len(header) - len(header.lstrip()), 0)
+    return " " * start + "".join("+" if c == "|" else "-" for c in header[start:])
+def table_header(header):
+    print(header)
+    print(rule(header))
+
+def header(columns, debug=False):
+    """Header block for an ASCII table: the label rows, then the rule.
+
+    A column is a string, or a tuple of 2+ lines whose extra rows are centered
+    under the first. Column width = the widest of that column's own lines.
+    debug=True prepends a row showing each column's computed width."""
+    cols = [(c,) if isinstance(c, str) else tuple(c) for c in columns]
+    widths = [max(map(len, c)) for c in cols]
+
+    lines = []
+    for r in range(max(map(len, cols))):
+        cells = []
+        for col, w in zip(cols, widths):
+            text = col[r] if r < len(col) else ""
+            cells.append(text.ljust(w) if r == 0 else text.center(w))
+        lines.append(" | ".join(cells))
+
+    rule = "".join("+" if ch == "|" else "-" for ch in lines[0])
+    if debug:
+        lines.insert(0, " | ".join(str(w).center(w) for w in widths))
+    lines.append(rule)
+    print("\n".join(line.rstrip() for line in lines))
+
 
 def rollout_states(num_episodes=200, seed=0):
     env = gym.make('CartPole-v1')
@@ -25,6 +56,7 @@ def to_cell(states, bins):
     idx = ((states - lo) / (hi - lo) * bins).astype(int)
     idx = np.clip(idx, 0, bins - 1)
     # each state as a 4-digit number written in base bins
+    # for bins=3
     # id = i0*bins³ + i1*bins² + i2*bins¹ + i3
     # [1,0,2,1] -> 34
     result = np.ravel_multi_index(idx.T, (bins,) * 4)
@@ -43,7 +75,7 @@ def exp_table_dies(num_episodes=200, seed=0):
     print('B')
     env = gym.make('CartPole-v1')
     space = env.observation_space
-    print(f'{'dim':22s} | observed min | observed max | env bounds')
+    table_header(f'{'dim':22s} | observed min | observed max | env bounds')
 
     for i, name in enumerate(DIMS):
         bound = f'[{space.low[i]:.2f}, {space.high[i]:.2f}]'
@@ -52,19 +84,42 @@ def exp_table_dies(num_episodes=200, seed=0):
             f" | {bound}"
         )
     print('C')
+    table_header(f"bins/dim | table cells | (s,a) pairs | cells seen | coverage | visits/seen")
     for bins in (3, 5, 10, 20, 50):
         cells = bins ** 4
         c = to_cell(states, bins)
         counts = np.bincount(c)
         seen = int((counts > 0).sum())
-        print(f'{bins:5d}')
-        
-        
-    print('Rough')
-    print('hello')
-    print('hello world')
-    print('fuck me')
-   
+        # 2 actions per state
+        sa = 2 * cells
+        print(
+            f"{bins:8d} | {cells:11,d} | {sa:11,d} | {seen:10,d}"
+            f" | {100 * seen/cells:7.2f}% | {counts[counts > 0].mean():11.1f}"
+        )
+    print('D')
+    print("one step changes the state by (mean |s' - s| per dim):")
+    for i, name in enumerate(DIMS):
+        print(f'{name:22} {deltas[:, i].mean():.4f}')
+
+    print()
+    header([
+        'bins/dim',
+        'theta bin width',
+        ('steps to cross one theta bin', '(bin width / mean step)'),
+        ('mean steps', 'inside a cell'),
+    ])
+    for bins in (3, 5, 10, 20, 50):
+        width = (BOX[2, 1] - BOX[2, 0]) / bins
+        cross = width / deltas[:, 2].mean()
+        c = to_cell(states, bins)
+        changes = int((c[1:] != c[:-1]).sum())
+        dwell = len(c) / (changes + 1)
+        print(f'{bins:8d} | {width:^15.4f} | {f'{cross:>4.1f}':^28} | {dwell:^13.2f}')
+
+
+
+    print('\n\n----End----')
+
 
 def run_experiments():
     exp_table_dies()
