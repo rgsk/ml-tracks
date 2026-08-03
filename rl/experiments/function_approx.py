@@ -299,7 +299,7 @@ def exp_fa_is_regression(seed=0):
     for n in (10, 100, 1000, 10000, 100000):
         for _ in range(n - prev):                       # keep fitting the same w
             s = int(rng.integers(len(Phi)))
-            w += 0.05 * (V[s] - Phi[s] @ w) * Phi[s]    # == one sgd_fit step
+            w += 0.05 * (V[s] - Phi[s] @ w) * Phi[s]    # sgd_fit's step, constant alpha
         prev = n
         print(f"  {n:9,d}  |  [{w[0]:+.4f}, {w[1]:+.4f}]     |    {_rms(Phi @ w, V):.5f}")
     print("\n  w -> [0, 1]: v(s) = 0*1 + 1*(s/20) = s/20. The 19-number table is now TWO")
@@ -312,8 +312,8 @@ def exp_fa_is_regression(seed=0):
     print("  then print how much v(s) moved AT EVERY OTHER STATE.\n")
     s0 = 5 - 1                                          # state 5 -> row index 4
     kinds = ["onehot", "agg5", "rbf5", "poly1"]
-    labels = {"onehot": "one-hot  (= the TABLE)", "agg5": "agg5     (5 groups of 4)",
-              "rbf5": "rbf5     (5 gaussian bumps)", "poly1": "poly1    ([1, s/20])"}
+    labels = {"onehot": "one-hot (= the TABLE)", "agg5": "agg5    (5 groups of 4)",
+              "rbf5": "rbf5    (5 gaussian bumps)", "poly1": "poly1   ([1, s/20])"}
     shown = [1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 19]
     header = "  phi                       | " + " ".join(f"{s:5d}" for s in shown)
     print(header)
@@ -353,30 +353,37 @@ def exp_fa_is_regression(seed=0):
         print(f"   {kind:7s} |   {P.shape[1]:3d}   |      {_rms(P @ w_star, Vg):.5f}      |"
               f"    {_rms(P @ w_sgd, Vg):.5f}    |   {_rms(P @ w_sgd, P @ w_star):.5f}")
 
+    print("  (poly3 is the one row where SGD hasn't reached its projection: raw powers")
+    print("   1,x,x^2,x^3 are nearly collinear, so that lstsq solution sits in a long")
+    print("   narrow valley SGD crawls along. Conditioning of phi is a real cost too.)")
+
     print("\n  values at a few states (true vs what each phi can manage at BEST):")
-    print("   state |   true V  |  const  |  poly1  |  poly2  |  agg5   |  onehot")
-    print("  -------+-----------+---------+---------+---------+---------+---------")
-    best = {k: make_phi(k) @ np.linalg.lstsq(make_phi(k), Vg, rcond=None)[0]
-            for k in ("const", "poly1", "poly2", "agg5", "onehot")}
+    print("   state |  true V  |  const  |  poly1  |  poly2  |  agg5   | onehot")
+    print("  -------+----------+---------+---------+---------+---------+---------")
+    cols = ("const", "poly1", "poly2", "agg5", "onehot")
+    best = {k: make_phi(k) @ np.linalg.lstsq(make_phi(k), Vg, rcond=None)[0] for k in cols}
     for s in (1, 5, 10, 15, 19):
-        row = "  ".join(f"{best[k][s - 1]:+.4f}" for k in
-                        ("const", "poly1", "poly2", "agg5", "onehot"))
-        print(f"    {s:3d}  |  {Vg[s - 1]:+.4f}  | {row}")
+        row = " | ".join(f"{best[k][s - 1]:+.4f}" for k in cols)
+        print(f"    {s:3d}  | {Vg[s - 1]:+.4f}  | {row}")
+    print("  note poly1 reports v(1) = -0.12: a NEGATIVE value in a walk where every")
+    print("  return is 0 or +1. Fitting globally, it spends error where it must — an")
+    print("  approximator will happily state things the true value function never could.")
 
     print("\n  Three lessons to carry into layer 3:")
-    print("   1. SGD lands on the projection (gap-to-best ~ 0 in every row) — with TRUE")
-    print("      targets, function approximation is solved. Regression, nothing more.")
-    print("   2. The floor is set by phi alone. const can only say the mean; poly2 nearly")
-    print("      nails a curve poly1 cannot; onehot (the table) always hits 0 — a table is")
-    print("      the maximum-capacity, zero-generalization end of this same spectrum.")
+    print("   1. SGD lands on the projection (gap-to-best is ~0, i.e. small next to the")
+    print("      floor itself) — with TRUE targets, FA is solved. Regression, nothing more.")
+    print("   2. The floor is set by phi alone, and it is a real constraint here: at")
+    print("      gamma=0.9 the curve is steep, so each extra polynomial term only halves")
+    print("      the error. onehot (the table) always hits 0 — the table is just the")
+    print("      maximum-capacity, zero-generalization end of this same spectrum.")
     print("   3. We do NOT have the true V. Layer 3 replaces `targets` with something we")
     print("      can sample — and the moment that target contains w itself, this clean")
     print("      regression story breaks in a specific, nameable way.")
 
 
 def run_experiments():
-    # exp_table_dies()
-    exp_fa_is_regression()
+    exp_table_dies()
+    # exp_fa_is_regression()
     # (layers 3-6 to come)
 
 
