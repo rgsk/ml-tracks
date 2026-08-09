@@ -19,3 +19,6 @@ nb/llm/data/input.txt
 nb/**/walkthroughs/*.ipynb
 nb/**/custom/*.ipynb
 nb/**/rough/*.ipynb
+
+# per-notebook section checkbox state (which sections `cell_allowed()` lets run)
+*.sections.json
