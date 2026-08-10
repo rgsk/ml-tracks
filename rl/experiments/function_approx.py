@@ -222,20 +222,38 @@ class RandomWalk:
             return self.s, 1.0, True
         return self.s, 0.0, False
 
-    def true_V(self, gamma):
-        """Exact V^pi for states 1..N by linear solve (ground truth for grading)."""
+    def model(self):
+        """The MDP as matrices over the N non-terminal states (row i = state i+1):
+        P (N,N) interior transition probs, rbar (N,) expected immediate reward.
+        Terminals are not states — their rows/cols are simply absent, which is the
+        `done` convention: nothing to bootstrap off. Used ONLY for ground truth."""
         N = self.N
-        P = np.zeros((N, N))                            # non-terminal transitions
-        r = np.zeros(N)
+        P = np.zeros((N, N))
+        rbar = np.zeros(N)
         for i, s in enumerate(range(1, N + 1)):
             for ns in (s - 1, s + 1):
                 if ns == 0:
-                    continue                            # left end: reward 0, absorbing
+                    continue                            # left end: reward 0, episode over
                 if ns == N + 1:
-                    r[i] += 0.5 * 1.0                   # right end: reward +1
+                    rbar[i] += 0.5 * 1.0                # right end: reward +1, episode over
                     continue
                 P[i, ns - 1] += 0.5
-        return np.linalg.solve(np.eye(N) - gamma * P, r)
+        return P, rbar
+
+    def true_V(self, gamma):
+        """Exact V^pi for states 1..N by linear solve (ground truth for grading)."""
+        P, rbar = self.model()
+        return np.linalg.solve(np.eye(self.N) - gamma * P, rbar)
+
+    def visit_dist(self):
+        """mu(s): the ON-POLICY state distribution — expected visits to s per episode,
+        normalized. d = e_start (I - P)^-1 sums P^t over all t. Every claim in layer 3
+        is about accuracy weighted by THIS: states you visit often matter more."""
+        P, _ = self.model()
+        e = np.zeros(self.N)
+        e[self.reset() - 1] = 1.0
+        d = np.linalg.solve(np.eye(self.N) - P.T, e)
+        return d / d.sum()
 
 
 def make_phi(kind, N=RandomWalk.N):
@@ -381,10 +399,295 @@ def exp_fa_is_regression(seed=0):
     print("      regression story breaks in a specific, nameable way.")
 
 
+# ---------------------------------------------------------------------------
+# LAYER 3: where does the target come from? (and what "SEMI-gradient" means)
+#
+# Layer 2 assumed a teacher handing us V(s). There is no teacher. We have samples,
+# and exactly two ways to turn them into a regression target — the same two from
+# exercise 3, now aimed at WEIGHTS instead of table cells:
+#
+#   MC :  target = G_t                     the return actually observed. Contains no
+#                                          w at all => a genuine constant => plain SGD.
+#   TD :  target = r + gamma * v(s'; w)    contains w. THIS is where it gets subtle.
+#
+# The TD update is written the same way regardless:
+#       delta = target - v(s; w)
+#       w    += alpha * delta * grad_w v(s; w)
+# but note what we did NOT differentiate: the target. It contains w through v(s';w),
+# so the true gradient of delta^2 has a second piece. We throw that piece away and
+# pretend the target is a constant. That amputation is the entire meaning of the word
+# "SEMI-gradient" (in torch: `.detach()` / `torch.no_grad()` around the target).
+#
+#       semi-gradient TD :  w += alpha * delta * phi(s)
+#       FULL gradient    :  w += alpha * delta * (phi(s) - gamma * phi(s'))
+#                                                          ^^^^^^^^^^^^^^^ the piece
+#                                                          semi-gradient discards
+#
+# It looks like laziness. It is not: this layer measures four things and shows the
+# amputated update is both FASTER and CLOSER to the truth than the honest one.
+#
+#   A) the two targets side by side: MC is unbiased but wildly noisy; TD is nearly
+#      noise-free but is only as good as the w inside it. Bias/variance, made of numbers.
+#   B) a step-size sweep: TD reaches a lower error AND tolerates ~30x bigger alpha.
+#   C) they converge to DIFFERENT PLACES. MC lands on layer 2's projection (the best
+#      point in span(phi)); semi-gradient TD lands on the "TD fixed point", which is
+#      worse than the projection but provably not too much worse.
+#   D) the FULL gradient converges too — to something worse than both. It minimizes
+#      the Bellman ERROR, not the distance to V. And the naive sampled version doesn't
+#      even reach that: it needs two independent successors per state (DOUBLE SAMPLING),
+#      so with one sample it optimizes variance instead of value.
+# ---------------------------------------------------------------------------
+
+def run_episode(env, rng, start=None):
+    """One sampled episode as a list of (s, r, s_next, done). Uses only reset/step —
+    the model is never consulted (it exists in this file solely to grade the result)."""
+    env.rng = rng
+    s = env.reset() if start is None else start
+    env.s = s
+    out = []
+    while True:
+        ns, r, done = env.step()
+        out.append((s, r, ns, done))
+        if done:
+            return out
+        s = ns
+
+
+def linear_prediction(kind, env, Phi, gamma, num_episodes, alpha, rng, anneal=True):
+    """Linear prediction from SAMPLES. The three `kind`s differ in ONE line each —
+    that line is the whole content of this layer.
+
+        mc  : target is the observed return G_t.        w += a * (G - v(s)) * phi(s)
+        td  : target bootstraps off v(s'), NOT differentiated (semi-gradient).
+                                                        w += a * delta * phi(s)
+        rg  : same delta, but differentiate the target too (full/'residual' gradient).
+                                                        w += a * delta * (phi(s) - g*phi(s'))
+    """
+    w = np.zeros(Phi.shape[1])
+    zero = np.zeros(Phi.shape[1])
+    for ep in range(num_episodes):
+        a = alpha * (1 - ep / num_episodes) if anneal else alpha
+        traj = run_episode(env, rng)
+        if kind == "mc":
+            G = 0.0
+            for (s, r, _ns, _done) in reversed(traj):       # walk backwards for G_t
+                G = r + gamma * G                           # the FULL observed return
+                w += a * (G - Phi[s - 1] @ w) * Phi[s - 1]
+        else:
+            for (s, r, ns, done) in traj:
+                phi_next = zero if done else Phi[ns - 1]    # `done` => nothing to bootstrap
+                delta = r + gamma * (phi_next @ w) - Phi[s - 1] @ w
+                if kind == "td":
+                    w += a * delta * Phi[s - 1]                        # semi-gradient
+                else:
+                    w += a * delta * (Phi[s - 1] - gamma * phi_next)   # full gradient
+    return w
+
+
+# --- the four points these algorithms can converge to, computed EXACTLY ------
+# (all in the mu-weighted norm: error at a state counts as much as you visit it)
+
+def projection(Phi, V, mu):
+    """argmin_w ||Phi w - V||_mu — layer 2's best-possible point. MC converges here."""
+    D = np.diag(mu)
+    return np.linalg.solve(Phi.T @ D @ Phi, Phi.T @ D @ V)
+
+
+def td_fixed_point(Phi, P, rbar, mu, gamma):
+    """The w where the EXPECTED semi-gradient TD update is zero:
+    Phi^T D (I - gamma P) Phi w = Phi^T D rbar. Not the projection — a different point."""
+    D = np.diag(mu)
+    A = Phi.T @ D @ (np.eye(len(P)) - gamma * P) @ Phi
+    return np.linalg.solve(A, Phi.T @ D @ rbar)
+
+
+def msbe_min(Phi, P, rbar, mu, gamma):
+    """argmin of the mean-squared BELLMAN error ||(I - gamma P) Phi w - rbar||_mu.
+    What the FULL gradient is honestly trying to minimize (given exact expectations)."""
+    D = np.diag(mu)
+    M = (np.eye(len(P)) - gamma * P) @ Phi
+    return np.linalg.solve(M.T @ D @ M, M.T @ D @ rbar)
+
+
+def naive_rg_min(Phi, env, mu, gamma):
+    """argmin of E[(r + gamma v(s') - v(s))^2] over SINGLE sampled transitions — the
+    thing the full-gradient update actually reaches. It differs from msbe_min by the
+    variance of the successor: E[X^2] = (E X)^2 + Var X, and the update can shrink the
+    loss by shrinking that Var — i.e. by flattening v where the future is uncertain.
+    Killing that term needs TWO independent successors per update (DOUBLE SAMPLING)."""
+    N = env.N
+    rows, tgts, wts = [], [], []
+    for i, s in enumerate(range(1, N + 1)):
+        for ns in (s - 1, s + 1):                       # each sampled successor is a row
+            done = ns in (0, N + 1)
+            r = 1.0 if ns == N + 1 else 0.0
+            phi_next = np.zeros(Phi.shape[1]) if done else Phi[ns - 1]
+            rows.append(gamma * phi_next - Phi[i])      # residual = row @ w + r
+            tgts.append(-r)
+            wts.append(mu[i] * 0.5)
+    A = np.array(rows) * np.sqrt(wts)[:, None]
+    b = np.array(tgts) * np.sqrt(wts)
+    return np.linalg.lstsq(A, b, rcond=None)[0]
+
+
+def _murms(Phi, w, V, mu):
+    """RMS error weighted by the on-policy visit distribution."""
+    return float(np.sqrt(np.sum(mu * (Phi @ w - V) ** 2)))
+
+
+def exp_the_target(seed=0):
+    """A) MC vs TD targets: bias and variance, measured.
+    B) step-size sweep — which method learns faster from the same episodes.
+    C) they converge to DIFFERENT fixed points; both predicted exactly by theory.
+    D) the FULL gradient: stable, honest, and worse. Plus the double-sampling trap."""
+    env = RandomWalk()
+    mu = env.visit_dist()
+    P, rbar = env.model()
+
+    # --- A) what the two targets look like as random variables -----------------
+    gamma = 1.0
+    V = env.true_V(gamma)
+    rng = np.random.default_rng(seed)
+    n = 20000
+    _banner("LAYER 3A: the two targets, as random variables (gamma=1, 20k samples)",
+            "  MC target = G_t (the whole observed episode) | TD target = r + gamma*v(s')")
+    print("\n  first with a PERFECT bootstrap (v = true V), so both are unbiased and only")
+    print("  the NOISE differs:")
+    print("    s | true V |   MC target       |   TD target       | MC std / TD std")
+    print("  ----+--------+-------------------+-------------------+----------------")
+    for s0 in (5, 10, 15):
+        mc_t, td_t = [], []
+        for _ in range(n):
+            traj = run_episode(env, rng, start=s0)
+            mc_t.append(sum(r for (_s, r, _n, _d) in traj))      # gamma=1 => plain sum
+            s, r, ns, done = traj[0]                             # ONE step for TD
+            td_t.append(r + gamma * (0.0 if done else V[ns - 1]))
+        mc_t, td_t = np.array(mc_t), np.array(td_t)
+        print(f"   {s0:2d} |  {V[s0 - 1]:.2f}  | {mc_t.mean():+.3f} +- {mc_t.std():.3f} |"
+              f" {td_t.mean():+.3f} +- {td_t.std():.3f} |      {mc_t.std() / td_t.std():.1f}x")
+    print("\n  Both means hit the true value — both targets are unbiased WHEN the bootstrap")
+    print("  is right. The spread is the story. At gamma=1 the return is literally Bernoulli")
+    print("  (you end at +1 or 0), so MC's std is sqrt(V(1-V)) ~ 0.5: every single target is")
+    print("  0 or 1, never the 0.5 you want. TD's target is r + V(s+-1) = V(s) +- 0.05, so its")
+    print("  std is 0.05 — TD replaced 'the rest of the episode' with ONE step plus a stored")
+    print("  estimate, and threw away all the randomness in between.")
+
+    print("\n  now the catch — the same TD target with an UNTRAINED w = 0:")
+    print("    s | true V | TD target (w=0)   | comment")
+    print("  ----+--------+-------------------+---------------------------------")
+    for s0 in (5, 10, 15, 19):
+        td0 = []
+        for _ in range(4000):
+            _s, r, _ns, _done = run_episode(env, rng, start=s0)[0]
+            td0.append(r + 0.0)                          # v(s'; 0) = 0 everywhere
+        td0 = np.array(td0)
+        note = "reward only fires next to the goal" if s0 == 19 else "target says 0. it is not 0."
+        print(f"   {s0:2d} |  {V[s0 - 1]:.2f}  | {td0.mean():+.3f} +- {td0.std():.3f} | {note}")
+    print("\n  Zero variance, maximum BIAS. That is the trade in one table: MC's noise comes")
+    print("  from the sampled future, TD's error comes from trusting its own estimate. MC's")
+    print("  shrinks with more episodes; TD's shrinks as w improves — it bootstraps itself up.")
+
+    # --- B) which one actually learns faster ----------------------------------
+    Phi = make_phi("poly1")                             # can represent V exactly at gamma=1
+    _banner("LAYER 3B: step-size sweep, 1000 episodes, poly1 features, gamma=1",
+            "  (mean on-policy RMS over 6 seeds; phi CAN represent V exactly here,",
+            "   so both methods are aiming at the same target — only the ROUTE differs)")
+    print("\n     alpha  |    MC    |    TD")
+    print("   ---------+----------+---------")
+    best = {"mc": (9, 0), "td": (9, 0)}
+    for alpha in (0.0003, 0.001, 0.003, 0.01, 0.03, 0.1):
+        errs = {}
+        for kind in ("mc", "td"):
+            e = np.mean([_murms(Phi, linear_prediction(
+                kind, env, Phi, gamma, 1000, alpha, np.random.default_rng(s), anneal=False),
+                V, mu) for s in range(6)])
+            errs[kind] = e
+            if e < best[kind][0]:
+                best[kind] = (e, alpha)
+        print(f"    {alpha:.4f} |  {errs['mc']:.4f}  |  {errs['td']:.4f}")
+    print(f"\n   best MC: {best['mc'][0]:.4f} at alpha={best['mc'][1]}     "
+          f"best TD: {best['td'][0]:.4f} at alpha={best['td'][1]}")
+    print(f"   TD is better at its best alpha AND that alpha is {best['td'][1] / best['mc'][1]:.0f}x"
+          " larger. Why: MC feeds")
+    print("   the SAME 0/1 return to every state in the episode, so with shared weights one")
+    print("   lucky episode yanks the whole function; you must use tiny steps to survive it.")
+    print("   TD's targets are small local corrections, so it can take big steps safely.")
+
+    # --- C) the fixed points: MC and TD do not converge to the same w ----------
+    gamma = 0.9
+    Vg = env.true_V(gamma)
+    Phi = make_phi("agg5")                              # deliberately CANNOT represent Vg
+    w_proj = projection(Phi, Vg, mu)
+    w_td = td_fixed_point(Phi, P, rbar, mu, gamma)
+    _banner("LAYER 3C: same data, same features — DIFFERENT answers",
+            "  gamma=0.9 + agg5 features (5 groups): V is NOT representable now, so",
+            "  where each method settles becomes visible")
+    print("  5000 episodes, alpha annealed to 0.\n")
+    w_mc_run = linear_prediction("mc", env, Phi, gamma, 5000, 0.05, np.random.default_rng(2))
+    w_td_run = linear_prediction("td", env, Phi, gamma, 5000, 0.05, np.random.default_rng(2))
+    print("   method            | predicted by theory | actually reached | on-policy RMS")
+    print("  -------------------+---------------------+------------------+--------------")
+    print(f"   MC  (true SGD)    |  the PROJECTION     |     matches      |   "
+          f"{_murms(Phi, w_mc_run, Vg, mu):.5f}   (theory {_murms(Phi, w_proj, Vg, mu):.5f})")
+    print(f"   TD  (semi-grad)   |  the TD FIXED POINT |     matches      |   "
+          f"{_murms(Phi, w_td_run, Vg, mu):.5f}   (theory {_murms(Phi, w_td, Vg, mu):.5f})")
+    print(f"\n   w from MC run : {np.round(w_mc_run, 4)}")
+    print(f"   w projection  : {np.round(w_proj, 4)}   <- MC's destination")
+    print(f"   w from TD run : {np.round(w_td_run, 4)}")
+    print(f"   w TD fixedpt  : {np.round(w_td, 4)}   <- TD's destination")
+    ratio = _murms(Phi, w_td, Vg, mu) / _murms(Phi, w_proj, Vg, mu)
+    print(f"\n   TD's answer is {ratio:.2f}x worse than the best point in span(phi). It is NOT")
+    print("   minimizing distance to V — it is solving its own Bellman-shaped equation, and")
+    print("   the bootstrap drags it off the projection. The classic bound says it can't be")
+    print(f"   arbitrarily bad: TD error <= 1/(1-gamma) x best error = "
+          f"{1 / (1 - gamma):.0f}x here (we got {ratio:.2f}x).")
+    print("   That 1/(1-gamma) is why long-horizon problems make people nervous.")
+
+    # --- D) the full gradient: honest, stable, and worse -----------------------
+    w_be = msbe_min(Phi, P, rbar, mu, gamma)
+    w_rg_theory = naive_rg_min(Phi, env, mu, gamma)
+    w_rg_run = linear_prediction("rg", env, Phi, gamma, 5000, 0.05, np.random.default_rng(2))
+    _banner("LAYER 3D: so why not take the FULL gradient?")
+    print("  Same setup, but differentiate the target too:")
+    print("     w += alpha * delta * (phi(s) - gamma * phi(s'))     <- 'residual gradient'")
+    print("  This IS honest gradient descent on delta^2, so it always converges. Look where.\n")
+    print("   where a method lands                          | on-policy RMS vs true V")
+    print("  ----------------------------------------------+------------------------")
+    for label, w in (("projection (best possible in span(phi))", w_proj),
+                     ("MC run                                ", w_mc_run),
+                     ("semi-gradient TD run                  ", w_td_run),
+                     ("full-gradient (residual) run          ", w_rg_run),
+                     ("  ...its ideal target: min Bellman err", w_be),
+                     ("  ...what one sample actually reaches ", w_rg_theory)):
+        print(f"   {label:44s} |        {_murms(Phi, w, Vg, mu):.5f}")
+    print("\n  Two separate problems, both visible above:")
+    print("   1. WRONG OBJECTIVE. Even with exact expectations, minimizing the Bellman error")
+    print(f"      lands at {_murms(Phi, w_be, Vg, mu):.5f} — much worse than semi-gradient TD's "
+          f"{_murms(Phi, w_td_run, Vg, mu):.5f}. Small")
+    print("      Bellman residual does not mean close to V; you can trade a lot of value")
+    print("      accuracy for a slightly more self-consistent (but wrong) function.")
+    print("   2. DOUBLE SAMPLING. The run lands at "
+          f"{_murms(Phi, w_rg_run, Vg, mu):.5f}, matching "
+          f"{_murms(Phi, w_rg_theory, Vg, mu):.5f} — NOT its own")
+    print("      ideal. delta appears TWICE in the gradient, so a single sampled s' gives a")
+    print("      biased product: E[delta * delta] = (E delta)^2 + Var(delta). The update")
+    print("      happily shrinks that variance term by FLATTENING v wherever the future is")
+    print("      uncertain. Fixing it needs two independent successors from the same state —")
+    print("      free in a simulator you can reset, impossible from a stream of experience.")
+    print("\n  So 'semi-gradient' is not a shortcut people apologize for. It converges faster,")
+    print("  it lands closer to V, and it needs only one sample per transition. Everything")
+    print("  from here — DQN, A2C, PPO, the value head in RLHF — is a semi-gradient method,")
+    print("  and `.detach()` on the target is where you will see it in torch.")
+    print("\n  The bill comes due in layer 5: semi-gradient TD is not descending on ANY fixed")
+    print("  objective, so nothing guarantees it converges at all. On-policy it does. Add")
+    print("  off-policy data and shared weights and it can diverge — the deadly triad.")
+
+
 def run_experiments():
-    exp_table_dies()
+    # exp_table_dies()
     # exp_fa_is_regression()
-    # (layers 3-6 to come)
+    exp_the_target()
+    # (layers 4-6 to come)
 
 
 @contextlib.contextmanager
